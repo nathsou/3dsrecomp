@@ -238,3 +238,9 @@ keep the Metal compiler out of gameplay:
   the system settings report. The region defaults to the game's own, from its icon's region lockout.
 - `RECOMP_SWKBD_TEXT`: what the software keyboard applet "types" (default: the game's initial text, else "Player").
 - `tools/disasm.py <gamedir> <addr> [count]` disassembles guest code.
+
+## License
+
+The recompiler, runtime and tools are licensed under the [European Union Public Licence v1.2](LICENSE) (EUPL-1.2).
+This covers this repository only: the games, and anything extracted or generated from them, remain their owners' and
+are not part of it.
