@@ -1,0 +1,13 @@
+data/
+generated/
+build/
+*.pyc
+__pycache__/
+.venv/
+save/
+.claude/
+system_archives/
+build-*/
+dumps/
+shots/
+games/*/vsprograms.bin
