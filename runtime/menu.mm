@@ -19,6 +19,7 @@
 #include "loader.h"
 #include "profile.h"
 #include "settings.h"
+#include "swkbd.h"
 
 namespace kernel {
 std::string save_root();  // (kernel.h clashes with MacTypes.h)
@@ -377,6 +378,195 @@ void put(const Text &t, float x, float y) {
     SDL_RenderTexture(ren, t.tex, nullptr, &d);
 }
 
+
+// ---- software keyboard (swkbd.h): a text field over the game while it waits for typed text
+swkbd::Request kb;
+bool kb_open = false;
+std::string kb_text, kb_edit;  // the text, and the input method's composition (not typed yet)
+SDL_FRect kb_ok_rc, kb_cancel_rc;
+
+std::vector<uint32_t> code_points(const std::string &s) {
+    std::vector<uint32_t> o;
+    for (size_t i = 0; i < s.size();) {
+        const unsigned char b = s[i];
+        const int n = b < 0x80 ? 0 : b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : -1;
+        if (n < 0 || i + n >= s.size() + (n ? 0 : 1)) {
+            i++;
+            continue;
+        }
+        uint32_t c = n ? b & (0x3F >> n) : b;
+        for (int k = 1; k <= n; k++) c = c << 6 | (s[i + k] & 0x3F);
+        o.push_back(c);
+        i += n + 1;
+    }
+    return o;
+}
+size_t utf16_len(const std::string &s) {
+    size_t n = 0;
+    for (uint32_t c : code_points(s)) n += c >= 0x10000 ? 2 : 1;
+    return n;
+}
+
+void kb_insert(const std::string &in) {
+    for (uint32_t c : code_points(in)) {
+        if (c == '\r') c = '\n';
+        if (c == '\n' && !kb.multiline) c = ' ';
+        if (c < 0x20 && c != '\n') continue;
+        if (kb.numpad && (c < '0' || c > '9')) continue;
+        if ((kb.no_at && c == '@') || (kb.no_percent && c == '%') || (kb.no_backslash && c == '\\')) continue;
+        if (kb.digits_limited && c >= '0' && c <= '9') {
+            int digits = 0;
+            for (char d : kb_text) digits += d >= '0' && d <= '9';
+            if (digits >= kb.max_digits) continue;
+        }
+        const size_t units = c >= 0x10000 ? 2 : 1;
+        if (kb.max_len && utf16_len(kb_text) + units > (size_t)kb.max_len) break;
+        char u[5] = {};
+        if (c < 0x80) u[0] = (char)c;
+        else if (c < 0x800) u[0] = (char)(0xC0 | c >> 6), u[1] = (char)(0x80 | (c & 0x3F));
+        else if (c < 0x10000) u[0] = (char)(0xE0 | c >> 12), u[1] = (char)(0x80 | (c >> 6 & 0x3F)), u[2] = (char)(0x80 | (c & 0x3F));
+        else u[0] = (char)(0xF0 | c >> 18), u[1] = (char)(0x80 | (c >> 12 & 0x3F)), u[2] = (char)(0x80 | (c >> 6 & 0x3F)), u[3] = (char)(0x80 | (c & 0x3F));
+        kb_text += u;
+    }
+}
+void kb_backspace() {
+    while (!kb_text.empty() && (kb_text.back() & 0xC0) == 0x80) kb_text.pop_back();
+    if (!kb_text.empty()) kb_text.pop_back();
+}
+bool kb_valid() {
+    const bool blank = kb_text.find_first_not_of(" \n") == std::string::npos;
+    switch (kb.valid) {
+    case 1: return !kb_text.empty();
+    case 2: return !blank;
+    case 3: return kb_text.empty() || !blank;
+    case 4: return !kb.max_len || utf16_len(kb_text) == (size_t)kb.max_len;
+    default: return true;
+    }
+}
+void kb_close(bool ok) {
+    if (ok && !kb_valid()) return;
+    if (!ok && !kb.can_cancel) return;
+    swkbd::finish(kb_text, ok);
+    kb_open = false;
+    kb_edit.clear();
+    SDL_StopTextInput(win);
+}
+
+bool kb_event(const SDL_Event &ev) {
+    switch (ev.type) {
+    case SDL_EVENT_TEXT_INPUT:
+        kb_insert(ev.text.text);
+        kb_edit.clear();
+        return true;
+    case SDL_EVENT_TEXT_EDITING:
+        kb_edit = ev.edit.text ? ev.edit.text : "";
+        return true;
+    case SDL_EVENT_KEY_DOWN: {
+        const SDL_Scancode k = ev.key.scancode;
+        const bool cmd = ev.key.mod & SDL_KMOD_GUI;
+        if (!kb_edit.empty()) return true;  // the input method has the keys
+        if (k == SDL_SCANCODE_RETURN || k == SDL_SCANCODE_KP_ENTER) {
+            if (kb.multiline && (ev.key.mod & SDL_KMOD_SHIFT)) kb_insert("\n");
+            else kb_close(true);
+        } else if (k == SDL_SCANCODE_ESCAPE) {
+            kb_close(false);
+        } else if (k == SDL_SCANCODE_BACKSPACE) {
+            if (cmd) kb_text.clear();
+            else kb_backspace();
+        } else if (cmd && k == SDL_SCANCODE_V) {
+            if (char *c = SDL_GetClipboardText()) {
+                kb_insert(c);
+                SDL_free(c);
+            }
+        } else if (k >= SDL_SCANCODE_F1 && k <= SDL_SCANCODE_F12) {
+            return false;  // diagnostics keep working
+        }
+        return true;
+    }
+    case SDL_EVENT_GAMEPAD_BUTTON_DOWN:
+        if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_EAST) kb_close(true);  // the 3DS's A position
+        if (ev.gbutton.button == SDL_GAMEPAD_BUTTON_SOUTH) kb_close(false);
+        return true;
+    case SDL_EVENT_MOUSE_BUTTON_DOWN: {
+        const float d = SDL_GetWindowPixelDensity(win);
+        const SDL_FPoint p{ev.button.x * d, ev.button.y * d};
+        if (SDL_PointInRectFloat(&p, &kb_ok_rc)) kb_close(true);
+        else if (kb.can_cancel && SDL_PointInRectFloat(&p, &kb_cancel_rc)) kb_close(false);
+        return true;
+    }
+    case SDL_EVENT_KEY_UP:
+    case SDL_EVENT_GAMEPAD_BUTTON_UP:
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+    case SDL_EVENT_MOUSE_MOTION:
+        return true;
+    default:
+        return false;
+    }
+}
+
+void kb_draw() {
+    int ow, oh;
+    SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+    const float k = std::clamp(std::min(ow / 640.0f, oh / 560.0f), 0.5f, 4.0f);
+    const SDL_Color white{255, 255, 255, 255}, grey{170, 174, 182, 255}, accent{255, 205, 64, 255};
+    fill(0, 0, ow, oh, {0, 0, 0, 110});
+    const float w = std::min(ow - 24 * k, 520 * k), x = (ow - w) / 2, pad = 18 * k;
+    const float field_h = 44 * k, h = pad * 2 + 24 * k + field_h + 14 * k + 34 * k;
+    const float y = std::max(8 * k, (oh - h) * 0.4f);
+    fill(x, y, w, h, {22, 25, 34, 240});
+    fill(x, y, w, 3 * k, accent);
+    float cy = y + pad;
+    const std::string hint = !kb.hint.empty() ? kb.hint : kb.numpad ? "Enter a number" : "Enter text";
+    put(text(hint, 15 * k, grey), x + pad, cy);
+    if (kb.max_len) {
+        const Text &c = text(std::to_string(utf16_len(kb_text)) + " / " + std::to_string(kb.max_len), 13 * k, grey);
+        put(c, x + w - pad - c.w, cy + 2 * k);
+    }
+    cy += 24 * k;
+    // the field, scrolled to keep the end of the text (where the caret is) in view
+    const SDL_FRect field{x + pad, cy, w - 2 * pad, field_h};
+    fill(field.x, field.y, field.w, field.h, {255, 255, 255, 22});
+    fill(field.x, field.y + field.h - 2 * k, field.w, 2 * k, accent);
+    std::string shown;
+    if (kb.password) {
+        for (size_t i = 0, n = code_points(kb_text).size(); i < n; i++) shown += "\u2022";
+    } else {
+        for (char c : kb_text) shown += c == '\n' ? std::string(" \u21b5 ") : std::string(1, c);
+    }
+    const float tx0 = field.x + 10 * k, avail = field.w - 20 * k;
+    const Text *t = shown.empty() ? nullptr : &text(shown, 22 * k, white);
+    const Text *e = kb_edit.empty() ? nullptr : &text(kb_edit, 22 * k, accent);
+    const float tw = (t ? t->w : 0) + (e ? e->w : 0);
+    const float tx = tx0 - std::max(0.0f, tw + 4 * k - avail);
+    const SDL_Rect clip{(int)field.x, (int)field.y, (int)field.w, (int)field.h};
+    SDL_SetRenderClipRect(ren, &clip);
+    const float th = 22 * k * 1.3f, ty = field.y + (field.h - th) / 2;
+    if (t) put(*t, tx, ty);
+    if (e) {
+        put(*e, tx + (t ? t->w : 0), ty);
+        fill(tx + (t ? t->w : 0), ty + e->h - 2 * k, e->w, 1 * k, accent);
+    }
+    if (SDL_GetTicks() / 530 % 2 == 0 || !kb_edit.empty()) fill(tx + tw + 1 * k, ty + 3 * k, 2 * k, th - 6 * k, white);
+    SDL_SetRenderClipRect(ren, nullptr);
+    // the input method's candidate window goes under the field (window coordinates)
+    const float d = SDL_GetWindowPixelDensity(win);
+    const SDL_Rect area{(int)(field.x / d), (int)(field.y / d), (int)(field.w / d), (int)(field.h / d)};
+    SDL_SetTextInputArea(win, &area, (int)((std::min(tx + tw, field.x + field.w) - field.x) / d));
+    cy += field_h + 14 * k;
+    // buttons: cancel on the left, confirm on the right, as on the 3DS
+    auto button = [&](const std::string &key, const std::string &label, float bx, bool right, bool enabled, SDL_FRect &rc) {
+        const Text &kt = text(key, 13 * k, grey), &lt = text(label, 17 * k, enabled ? (right ? accent : white) : grey, right);
+        const float bw = kt.w + lt.w + 30 * k, bh = 34 * k;
+        rc = {right ? bx - bw : bx, cy, bw, bh};
+        fill(rc.x, rc.y, rc.w, rc.h, {255, 255, 255, (Uint8)(enabled ? 26 : 10)});
+        put(kt, rc.x + 10 * k, rc.y + (bh - kt.h) / 2);
+        put(lt, rc.x + 20 * k + kt.w, rc.y + (bh - lt.h) / 2);
+    };
+    if (kb.can_cancel) button("Esc", kb.cancel.empty() ? "Cancel" : kb.cancel, x + pad, false, true, kb_cancel_rc);
+    else kb_cancel_rc = {};
+    button("Return", kb.ok.empty() ? "OK" : kb.ok, x + w - pad, true, kb_valid(), kb_ok_rc);
+}
+
 }  // namespace
 
 void init(SDL_Window *w, SDL_Renderer *r) {
@@ -400,7 +590,10 @@ void toggle() {
 
 void set_fps(float f) { fps = f; }
 
+bool keyboard_open() { return kb_open; }
+
 bool handle_event(const SDL_Event &ev) {
+    if (kb_open) return kb_event(ev);
     const bool key = ev.type == SDL_EVENT_KEY_DOWN, pad = ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN;
     if ((key && ev.key.scancode == SDL_SCANCODE_ESCAPE) || (pad && ev.gbutton.button == SDL_GAMEPAD_BUTTON_GUIDE)) {
         if (open_) pop();
@@ -457,6 +650,16 @@ bool handle_event(const SDL_Event &ev) {
 }
 
 void update() {
+    swkbd::Request r;
+    if (swkbd::pending(&r) && (!kb_open || r.serial != kb.serial)) {
+        kb = r;
+        kb_open = true;
+        kb_text.clear();
+        kb_edit.clear();
+        kb_insert(r.initial);
+        if (open_) toggle();  // the menu would pause the game
+        SDL_StartTextInput(win);
+    }
     if (!open_) return;
     // the left stick moves like the d-pad, with a repeat
     static Uint64 next;
@@ -494,6 +697,18 @@ void draw() {
         const Text &t = text(f, 13 * l.k, white, true);
         fill(8 * l.k, 8 * l.k, t.w + 12 * l.k, t.h + 6 * l.k, {0, 0, 0, 150});
         put(t, 14 * l.k, 11 * l.k);
+    }
+    if (kb_open) kb_draw();
+    // a reminder when the game's own keyboard comes up (profile "keyboard"): the Mac's keyboard types into it
+    static Uint64 typing_since;
+    if (!profile::keyboard_active()) typing_since = 0;
+    else if (!typing_since) typing_since = SDL_GetTicks();
+    if (typing_since && SDL_GetTicks() - typing_since < 5000 && !kb_open && !open_) {
+        const Text &t = text("Type with your keyboard   ·   Return confirms", 14 * l.k, white, true);
+        int ow, oh;
+        SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+        fill((ow - t.w) / 2 - 14 * l.k, 12 * l.k, t.w + 28 * l.k, t.h + 12 * l.k, {20, 22, 30, 215});
+        put(t, (ow - t.w) / 2, 18 * l.k);
     }
     if (open_) {
         int ow, oh;

@@ -315,6 +315,17 @@ static void log_romfs_read(u64 off) {
     }
 }
 
+// A RomFS read takes as long as on a 3DS (the game card's latency and speed, as measured for Citra on an old 3DS
+// and a 2DS: 94 ns per byte + 0.58 ms, at least 0.66 ms): the reading thread sleeps that long after the reply.
+// Games load in the background and expect the rest of the frame to go on meanwhile; an instant read can finish a
+// load before the code that started it has set up for its end (Animal Crossing: New Leaf's map process cleared
+// its own "ready" flag after a synchronous load, leaving the village's bottom screen blank and untouchable).
+// RECOMP_FS_DELAY=0 turns it off.
+static void romfs_read_delay(IPC &ipc, u32 len) {
+    static const bool on = !getenv("RECOMP_FS_DELAY") || atoi(getenv("RECOMP_FS_DELAY")) != 0;
+    if (on) sleep_current(std::max<u64>((u64)len * 94 + 582778, 663124), *ipc.lk);
+}
+
 static std::string archive_dir(u32 id, const LowPath &p) {
     std::string root = save_root();
     switch (id) {
@@ -379,6 +390,7 @@ struct FileSession : Service {
             ipc.set(2, (u32)n);
             ipc.set(3, (len << 4) | 0xC);
             ipc.set(4, dst);
+            if (romfs) romfs_read_delay(ipc, len);
             break;
         }
         case 0x0803: {  // Write(offset u64, size, flush, mapped buffer)

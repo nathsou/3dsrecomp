@@ -22,6 +22,11 @@
 //   show <icon> at <x> <y> [when <condition>]
 //   button tap <x> <y> [when <condition>]
 //       What the HUD action button (keyboard E, gamepad left stick click) does: tap the bottom screen there.
+//   keyboard [when <condition>]
+//       When the game's own keyboard is on the bottom screen: the Mac's keyboard then types by tapping its keys.
+//   key <characters | space | backspace | shift | enter> at <x> <y> [step <dx>]
+//       Where the keys are, in bottom-screen pixels (320x240): one named key, or a row of characters <dx> apart.
+//       A letter typed in upper case taps "shift" first; Return taps "enter".
 //
 // Positions are top-screen pixels (400x240); a negative x or y counts from the right or bottom edge.
 // Conditions: <value> <op> <number> [and ...], with op one of == != < <= > >= & (any bit set) !& (none set).
@@ -29,8 +34,10 @@
 // n frames (for writing profiles).
 #include "profile.h"
 
+#include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <map>
 #include <sstream>
 
 #include "kernel.h"
@@ -59,6 +66,8 @@ int hud_cond = -2;  // -2: no HUD, -1: always
 std::vector<Element> elems;
 std::vector<Icon> icon_list;
 std::vector<Button> buttons;
+int keyboard_cond = -2;  // -2: no keyboard
+std::map<std::string, std::pair<int, int>> keys;  // a character (UTF-8) or a named key -> bottom-screen pixel
 Focus cur_focus = FOCUS_NONE;
 int trace_every;
 u64 frames;
@@ -286,6 +295,31 @@ bool parse_line(const std::string &line, std::string &err) {
         buttons.push_back(b);
         return true;
     }
+    if (d == "keyboard") {
+        keyboard_cond = when(t, 1, err);
+        return keyboard_cond != -2;
+    }
+    if (d == "key") {
+        s64 x, y, step = 0;
+        if (t.size() < 5 || t[2] != "at" || !num(t[3], x) || !num(t[4], y) ||
+            (t.size() > 5 && (t.size() != 7 || t[5] != "step" || !num(t[6], step)))) {
+            err = "expected 'key <characters> at <x> <y> [step <dx>]'";
+            return false;
+        }
+        static const char *named[] = {"space", "backspace", "shift", "enter"};
+        if (std::find(std::begin(named), std::end(named), t[1]) != std::end(named)) {
+            keys[t[1]] = {(int)x, (int)y};
+            return true;
+        }
+        int n = 0;
+        for (size_t i = 0; i < t[1].size(); n++) {  // one key per UTF-8 character
+            size_t j = i + 1;
+            while (j < t[1].size() && ((u8)t[1][j] & 0xC0) == 0x80) j++;
+            keys[t[1].substr(i, j - i)] = {(int)(x + n * step), (int)y};
+            i = j;
+        }
+        return true;
+    }
     err = "unknown directive " + d;
     return false;
 }
@@ -406,6 +440,14 @@ bool cond(int i) { return i < 0 || (i < (int)conds.size() && conds[i].state); }
 bool value(int i, s64 &v) {
     if (i < 0 || i >= (int)values.size() || !values[i].ok) return false;
     v = values[i].v;
+    return true;
+}
+bool keyboard_active() { return keyboard_cond != -2 && (keyboard_cond == -1 || conds[keyboard_cond].state); }
+bool key(const std::string &k, int &x, int &y) {
+    auto it = keys.find(k);
+    if (it == keys.end()) return false;
+    x = it->second.first;
+    y = it->second.second;
     return true;
 }
 const Button *button() {

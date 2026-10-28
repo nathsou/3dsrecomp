@@ -18,9 +18,8 @@ naming the island, making a look-alike Mii (imported through the Mii selector, t
 profile, text-to-speech voice and personality), the island and the apartment, at 60 fps with music and voices
 (built with `-DGAME=tomodachi` from `data/tomodachi`). It needs the shared font and Mii data system archives
 (`tools/import_system_archives.py`). With the open-source replacement archives, Mii faces show as a red "no"
-placeholder; a real console's Mii data archive would be needed for the actual faces. Names typed on the software
-keyboard come from `RECOMP_SWKBD_TEXT` (default "Player"); StreetPass, SpotPass, QR codes and the camera are not
-supported.
+placeholder; a real console's Mii data archive would be needed for the actual faces. Names are typed with the
+Mac's keyboard (see [Typing](#typing)); StreetPass, SpotPass, QR codes and the camera are not supported.
 
 **Metroid: Samus Returns** (USA, `CTR-P-A9AE`, title 00040000001BB200) runs: title screen, file select, the
 story intro and the landing cutscene, then the first area of SR388 with Samus running, jumping, shooting, firing
@@ -35,7 +34,7 @@ a new game with the train ride (Rover's questions, the name and town name on the
 map choice), the arrival in town with Isabelle, the town hall, Main Street, Nook's Homes and placing the house
 with Tom Nook, at full speed with music and sound (built with `-DGAME=acnl` from `data/acnl`). Most of its code
 is in CRO modules (relocatable code loaded from the RomFS by `ldr:ro`), which the recompiler also translates:
-see [CRO modules](#cro-modules-ldrro). The town's map on the bottom screen does not show yet; saving was not
+see [CRO modules](#cro-modules-ldrro). The village's map and menus on the bottom screen work; saving was not
 reached in tests (the game allows it only after the first day's tutorial). amiibo, StreetPass, SpotPass, QR codes
 and online play are not supported: the services report nothing there.
 
@@ -140,6 +139,16 @@ stacked layouts, F3 cycles the internal
 resolution (auto, 1x to 4x; Metal), F12 writes the state of every game thread to the log (press it if a
 game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is there, or Cmd+Q).
 
+### Typing
+
+- When a game opens the 3DS's system keyboard (names in Tomodachi Life, ...), a text field appears over the
+  game: type with the Mac's keyboard (any language and input method, Cmd+V pastes), Return (or the gamepad's A)
+  confirms and Esc (B) cancels when the game allows it. The game's length limit and character filters apply.
+- Games that draw their own keyboard on the bottom screen (Animal Crossing: New Leaf's names and town name) can
+  be typed into too when their profile describes it: while that keyboard is up, the Mac's keyboard types by
+  tapping its keys (capitals use its Shift key; Backspace deletes, Return taps Confirm). The keys mapped to 3DS
+  buttons type instead of pressing buttons until the keyboard closes; the arrows and the gamepad still play.
+
 ### Playing on one screen
 
 In the "top screen only" and "bottom screen only" layouts (menu: Graphics):
@@ -158,7 +167,8 @@ In the "top screen only" and "bottom screen only" layouts (menu: Graphics):
 scene it is in, ...), which screen matters when, and the HUD built from them. The format is documented at the top
 of `runtime/profile.cpp`; it holds only addresses, numbers, RomFS paths and coordinates. The HUD's icons are
 read from the game's own files at run time (BCLIM textures in NARC or SARC archives, Yaz0-compressed or not).
-To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
+A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `key ...`, see
+[Typing](#typing)). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
 `RECOMP_PROFILE_TRACE=<n>` logs every value every n frames.
 
 ## How it works
@@ -237,6 +247,8 @@ constants by the recompiler. `tools/disasm.py` shows module code at slot address
   entirely over and over is left alone. Not upscaled: render-to-texture data (render targets and copies of
   them), cube and shadow maps, HILO8, textures over 1024x1024 and thin or tiny lookup tables (under 256 texels,
   or 8:1 and thinner); upscaled textures use at most 512 MiB.
+- The window is presented in step with the display's refresh (no tearing) at normal speed; `RECOMP_NOVSYNC=1`
+  turns that off. Above 100% speed presents never wait for the display.
 - The screens are drawn into the window with nearest filtering at integer magnifications, sharp bilinear
   filtering at other magnifications and linear filtering when the image is larger than its place in the window.
 - `GPU_THREADS=n` worker threads for the software backend.
@@ -273,8 +285,8 @@ keep the Metal compiler out of gameplay:
 ## Debugging aids
 
 - `RECOMP_VERBOSE=1|2` (or `-v`/`-vv`): kernel and IPC logs.
-- `RECOMP_INPUT` also takes host input for testing the frontend: `<frame>:KEY_<SDL key name>`,
-  `<frame>:MOUSE_DOWN@x/y` (`MOUSE_MOVE`, `MOUSE_UP`) and `<frame>:MOUSE_WHEEL@x/y/dy`, in layout coordinates.
+- `RECOMP_INPUT` also takes host input for testing the frontend: `<frame>:KEY_<SDL key name>`, typed text
+  `<frame>:TEXT_<text>` (no `,` or `:`), `<frame>:MOUSE_DOWN@x/y` (`MOUSE_MOVE`, `MOUSE_UP`) and `<frame>:MOUSE_WHEEL@x/y/dy`, in layout coordinates.
 - `RECOMP_TRACE=n`: log the first n dispatcher transitions.
 - `RECOMP_MEMDUMP=<frame>,...`: snapshots of guest memory at those frames (`mem_<frame>_<address>.bin`: the
   data/bss segment and every mapped region), for finding where a game keeps its state by diffing them.
@@ -306,7 +318,10 @@ keep the Metal compiler out of gameplay:
   is logged every 30 s.
 - `RECOMP_REGION` / `RECOMP_LANGUAGE`: the console region (0 JPN, 1 USA, 2 EUR, ...) and language (0 JP, 1 EN, ...)
   the system settings report. The region defaults to the game's own, from its icon's region lockout.
-- `RECOMP_SWKBD_TEXT`: what the software keyboard applet "types" (default: the game's initial text, else "Player").
+- `RECOMP_FS_DELAY=0`: RomFS reads return at once instead of taking as long as on a 3DS (the reading thread
+  sleeps for the game card's latency and transfer time, as games that load in the background expect).
+- `RECOMP_SWKBD_TEXT`: the system keyboard "types" this at once instead of asking (empty: the game's initial
+  text, else "Player"), for unattended tests.
 - `RECOMP_LIVE=<file>`: input for a running test, one command per line appended to the file while the game runs
   (`<buttons> <frames>` with the button names of `RECOMP_INPUT`, e.g. `A 6`, `CDOWN+B 60`, `T@160/120 8`, or
   `WAIT <frames>`); commands run one after another, each followed by a few released frames, and the log says when

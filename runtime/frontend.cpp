@@ -11,6 +11,7 @@
 #include <cmath>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -73,6 +74,7 @@ static int swapped_layout(int l) {
 // its own display; the main window then shows the top screen only
 static SDL_Window *window2;
 static SDL_Renderer *renderer2;
+static int vsync = 0;  // presents wait for the display's refresh (no tearing) at normal speed; off when sped up
 static SDL_Texture *tex_bottom2, *hi_bottom2;
 static int hb2w, hb2h;
 static u64 shown_ver[2];  // display image versions already uploaded (per screen)
@@ -178,7 +180,7 @@ void frontend_set_split(bool on) {
             return;
         }
         renderer2 = SDL_CreateRenderer(window2, nullptr);
-        SDL_SetRenderVSync(renderer2, 0);
+        SDL_SetRenderVSync(renderer2, vsync);
         SDL_SetRenderLogicalPresentation(renderer2, 320, 240, SDL_LOGICAL_PRESENTATION_LETTERBOX);
         tex_bottom2 = SDL_CreateTexture(renderer2, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 320, 240);
         SDL_SetWindowPosition(window2, x + ww + 16, y);  // beside the main window, unless a saved place exists
@@ -400,6 +402,31 @@ static int pip_drag;                               // 0 none, 1 moving, 2 resizi
 static float drag_dx, drag_dy, drag_ax, drag_ay;   // grab offset / the corner that stays put while resizing
 static bool pip_hover;
 static int hud_tap_x, hud_tap_y;
+// typing into a game's own keyboard (profile "keyboard" / "key"): characters become taps on its keys
+static bool typing;          // the game's keyboard is up: the Mac's keyboard types into it
+static std::deque<std::pair<int, int>> key_taps;
+static u64 key_tap_start;    // frame the first queued tap began
+static void type_key(const std::string &k) {
+    int x, y;
+    if (!profile::key(k, x, y)) return;
+    if (key_taps.empty()) key_tap_start = frame_count;
+    key_taps.push_back({x, y});
+}
+static void type_text(const std::string &s) {
+    for (size_t i = 0; i < s.size();) {
+        size_t j = i + 1;
+        while (j < s.size() && ((u8)s[j] & 0xC0) == 0x80) j++;
+        const std::string c = s.substr(i, j - i);
+        i = j;
+        int x, y;
+        if (c == " ") type_key("space");
+        else if (profile::key(c, x, y)) type_key(c);
+        else if (c.size() == 1 && isupper((u8)c[0]) && profile::key(std::string(1, (char)tolower(c[0])), x, y)) {
+            type_key("shift");
+            type_key(std::string(1, (char)tolower(c[0])));
+        }
+    }
+}
 
 static bool single_layout() { return !window2 && (layout == 1 || layout == 4); }
 static profile::Focus auto_focus() { return g_settings.auto_focus ? profile::focus() : profile::FOCUS_NONE; }
@@ -663,13 +690,15 @@ enum : u32 {
 // scripted input for testing: RECOMP_INPUT="frame:BUTTONS:duration,..." (BUTTONS like A+START; T@x/y touches
 // the bottom screen at pixel x, y)
 struct ScriptEntry { u64 frame, dur; u32 buttons; int cx, cy, tx = -1, ty = -1; };
-// host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...), and the
-// mouse in layout coordinates: "frame:MOUSE_DOWN@x/y" (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy"
+// host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...), typed text
+// ("frame:TEXT_<text>", for the software keyboard), and the mouse in layout coordinates: "frame:MOUSE_DOWN@x/y"
+// (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy"
 struct ScriptKey {
     u64 frame;
     SDL_Scancode key;
     SDL_EventType mouse = (SDL_EventType)0;
     float x = 0, y = 0, wheel = 0;
+    std::string text;
 };
 static std::vector<ScriptKey> script_keys;
 static std::vector<ScriptEntry> script;
@@ -689,6 +718,10 @@ static void parse_script() {
         std::string n = names;
         if (n.rfind("KEY_", 0) == 0) {
             script_keys.push_back({f, SDL_GetScancodeFromName(n.c_str() + 4)});
+            continue;
+        }
+        if (n.rfind("TEXT_", 0) == 0) {
+            script_keys.push_back({f, SDL_SCANCODE_UNKNOWN, (SDL_EventType)0, 0, 0, 0, n.substr(5)});
             continue;
         }
         if (n.rfind("MOUSE_", 0) == 0) {
@@ -730,21 +763,23 @@ static void parse_script() {
 
 static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
     const bool *k = SDL_GetKeyboardState(nullptr);
+    static const bool none[SDL_SCANCODE_COUNT] = {};
+    const bool *kb = typing ? none : k;  // keys type while the game's keyboard is up (the arrows still move)
     buttons = 0;
-    if (k[SDL_SCANCODE_X]) buttons |= BTN_A;
-    if (k[SDL_SCANCODE_Z]) buttons |= BTN_B;
-    if (k[SDL_SCANCODE_S]) buttons |= BTN_X;
-    if (k[SDL_SCANCODE_A]) buttons |= BTN_Y;
-    if (k[SDL_SCANCODE_Q]) buttons |= BTN_L;
-    if (k[SDL_SCANCODE_W]) buttons |= BTN_R;
-    if (k[SDL_SCANCODE_1]) buttons |= BTN_ZL;
-    if (k[SDL_SCANCODE_2]) buttons |= BTN_ZR;
-    if (k[SDL_SCANCODE_RETURN]) buttons |= BTN_START;
-    if (k[SDL_SCANCODE_BACKSPACE] || k[SDL_SCANCODE_RSHIFT]) buttons |= BTN_SELECT;
-    if (k[SDL_SCANCODE_I]) buttons |= BTN_UP;
-    if (k[SDL_SCANCODE_K]) buttons |= BTN_DOWN;
-    if (k[SDL_SCANCODE_J]) buttons |= BTN_LEFT;
-    if (k[SDL_SCANCODE_L]) buttons |= BTN_RIGHT;
+    if (kb[SDL_SCANCODE_X]) buttons |= BTN_A;
+    if (kb[SDL_SCANCODE_Z]) buttons |= BTN_B;
+    if (kb[SDL_SCANCODE_S]) buttons |= BTN_X;
+    if (kb[SDL_SCANCODE_A]) buttons |= BTN_Y;
+    if (kb[SDL_SCANCODE_Q]) buttons |= BTN_L;
+    if (kb[SDL_SCANCODE_W]) buttons |= BTN_R;
+    if (kb[SDL_SCANCODE_1]) buttons |= BTN_ZL;
+    if (kb[SDL_SCANCODE_2]) buttons |= BTN_ZR;
+    if (kb[SDL_SCANCODE_RETURN]) buttons |= BTN_START;
+    if (kb[SDL_SCANCODE_BACKSPACE] || k[SDL_SCANCODE_RSHIFT]) buttons |= BTN_SELECT;
+    if (kb[SDL_SCANCODE_I]) buttons |= BTN_UP;
+    if (kb[SDL_SCANCODE_K]) buttons |= BTN_DOWN;
+    if (kb[SDL_SCANCODE_J]) buttons |= BTN_LEFT;
+    if (kb[SDL_SCANCODE_L]) buttons |= BTN_RIGHT;
     int x = 0, y = 0;
     if (k[SDL_SCANCODE_LEFT]) x -= 1;
     if (k[SDL_SCANCODE_RIGHT]) x += 1;
@@ -790,6 +825,17 @@ static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16
             tx = (u16)std::clamp(e.tx, 0, 319);
             ty = (u16)std::clamp(e.ty, 0, 239);
         }
+    if (!touch && !key_taps.empty()) {  // typed keys: each tap held 6 frames, then 6 released (the game runs at 30 fps)
+        const u64 t = frame_count - key_tap_start;
+        if (t < 6) {
+            touch = true;
+            tx = (u16)std::clamp(key_taps.front().first, 0, 319);
+            ty = (u16)std::clamp(key_taps.front().second, 0, 239);
+        } else if (t >= 12) {
+            key_taps.pop_front();
+            key_tap_start = frame_count;
+        }
+    }
     if (!touch && frame_count < hud_tap_until) {  // the HUD button (profile: "button tap x y")
         touch = true;
         tx = (u16)std::clamp(hud_tap_x, 0, 319);
@@ -916,6 +962,12 @@ void frontend_run() {
                     me.button.y = wy;
                 }
                 SDL_PushEvent(&me);
+            } else if (k.frame == frame_count && !k.text.empty()) {
+                SDL_Event te{};
+                te.type = SDL_EVENT_TEXT_INPUT;
+                te.text.windowID = SDL_GetWindowID(window);
+                te.text.text = k.text.c_str();
+                SDL_PushEvent(&te);
             } else if (k.frame == frame_count) {
                 SDL_Event ke{};
                 ke.type = SDL_EVENT_KEY_DOWN;
@@ -939,6 +991,17 @@ void frontend_run() {
             if (ev.type == SDL_EVENT_WINDOW_MOVED || ev.type == SDL_EVENT_WINDOW_RESIZED)
                 store_geometry(SDL_GetWindowFromID(ev.window.windowID));
             if (menu::handle_event(ev)) continue;
+            if (typing && ev.type == SDL_EVENT_TEXT_INPUT) {
+                type_text(ev.text.text);
+                continue;
+            }
+            if (typing && ev.type == SDL_EVENT_KEY_DOWN) {
+                const SDL_Scancode sc = ev.key.scancode;
+                if (sc == SDL_SCANCODE_BACKSPACE) type_key("backspace");
+                if (sc == SDL_SCANCODE_RETURN || sc == SDL_SCANCODE_KP_ENTER) type_key("enter");
+                if ((sc < SDL_SCANCODE_F1 && sc != SDL_SCANCODE_TAB) || (sc >= SDL_SCANCODE_KP_DIVIDE && sc <= SDL_SCANCODE_KP_PERIOD))
+                    continue;  // a character (its text comes as SDL_EVENT_TEXT_INPUT), not a shortcut
+            }
             if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(ev.gdevice.which);
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F11) {  // the window being used
                 const bool second = window2 && SDL_GetKeyboardFocus() == window2;
@@ -988,6 +1051,11 @@ void frontend_run() {
         paused = menu::is_open();
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
         kernel::set_clock_speed((u32)g_settings.speed);
+        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC"); v != vsync) {
+            vsync = v;
+            SDL_SetRenderVSync(renderer, vsync);
+            if (renderer2) SDL_SetRenderVSync(renderer2, vsync);
+        }
         now = steady_clock::now();
         {
             u32 b;
@@ -995,13 +1063,19 @@ void frontend_run() {
             bool touch;
             u16 tx = 0, ty = 0;
             poll_input(b, cx, cy, touch, tx, ty);
-            if (paused) b = 0, cx = cy = 0, touch = false;
+            if (paused || menu::keyboard_open()) b = 0, cx = cy = 0, touch = false;
             {
                 std::lock_guard<std::mutex> lk(input_m);
                 input_now = {b, cx, cy, touch, tx, ty};
             }
             if (!paused) kernel::gsp_vblank();  // the game waits for VBlank, so it stops while the menu is open
             profile::update();
+            if (profile::keyboard_active() != typing) {
+                typing = !typing;
+                key_taps.clear();
+                if (typing) SDL_StartTextInput(window);
+                else if (!menu::keyboard_open()) SDL_StopTextInput(window);
+            }
             present();
             static const char *peek = getenv("RECOMP_PEEK");
             if (peek) {

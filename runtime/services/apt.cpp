@@ -2,6 +2,7 @@
 #include <deque>
 
 #include "../service.h"
+#include "../swkbd.h"
 #include "services.h"
 
 namespace kernel {
@@ -95,34 +96,121 @@ static std::vector<u8> mii_selector_result() {
     return r;
 }
 
-// Software keyboard (SwkbdState, 0x400 bytes): the user "types" RECOMP_SWKBD_TEXT (else the initial text, else
-// "Player"; digits for the numpad) and presses the confirm button. The text goes into the shared memory block
-// the application passed, as UTF-16 at offset 0.
-static void swkbd_run(std::vector<u8> &cfg, ObjPtr mem) {
-    if (cfg.size() < 0x14C) return;
-    auto rd32 = [&](size_t o) { u32 v; memcpy(&v, &cfg[o], 4); return v; };
-    auto wr32 = [&](size_t o, u32 v) { memcpy(&cfg[o], &v, 4); };
-    auto sm = std::dynamic_pointer_cast<SharedMem>(mem);
-    u32 type = rd32(0x00), buttons = rd32(0x04) + 1, max_len = cfg[0x20] | cfg[0x21] << 8;
-    std::u16string text;
-    if (const char *t = getenv("RECOMP_SWKBD_TEXT")) {
-        for (const char *c = t; *c; c++) text += (char16_t)(u8)*c;
-    } else if (sm && (s32)rd32(0x120) >= 0 && rd32(0x120) + 2 <= sm->size) {
-        for (u32 a = sm->backing + rd32(0x120); a + 2 <= sm->backing + sm->size && r16(a); a += 2) text += (char16_t)r16(a);
+// Software keyboard (SwkbdState, 0x400 bytes). The player types the text in the window (swkbd.h, drawn by
+// menu.mm) and the applet finishes when they confirm or cancel; with RECOMP_SWKBD_TEXT it "types" that at once
+// (tests). The text goes into the shared memory block the application passed, as UTF-16 at offset 0.
+static std::string utf8(const std::u16string &s) {
+    std::string o;
+    for (size_t i = 0; i < s.size(); i++) {
+        u32 c = s[i];
+        if (c >= 0xD800 && c < 0xDC00 && i + 1 < s.size() && s[i + 1] >= 0xDC00 && s[i + 1] < 0xE000)
+            c = 0x10000 + ((c - 0xD800) << 10) + (s[++i] - 0xDC00);
+        if (c < 0x80) o += (char)c;
+        else if (c < 0x800) o += (char)(0xC0 | c >> 6), o += (char)(0x80 | (c & 0x3F));
+        else if (c < 0x10000) o += (char)(0xE0 | c >> 12), o += (char)(0x80 | (c >> 6 & 0x3F)), o += (char)(0x80 | (c & 0x3F));
+        else o += (char)(0xF0 | c >> 18), o += (char)(0x80 | (c >> 12 & 0x3F)), o += (char)(0x80 | (c >> 6 & 0x3F)), o += (char)(0x80 | (c & 0x3F));
     }
-    if (text.empty()) text = type == 2 ? u"1" : u"Player";
+    return o;
+}
+static std::u16string utf16(const std::string &s) {
+    std::u16string o;
+    for (size_t i = 0; i < s.size();) {
+        u8 b = (u8)s[i];
+        int n = b < 0x80 ? 0 : b >= 0xF0 ? 3 : b >= 0xE0 ? 2 : b >= 0xC0 ? 1 : -1;
+        if (n < 0 || i + n >= s.size() + (n ? 0 : 1)) {
+            i++;
+            continue;
+        }
+        u32 c = n == 0 ? b : b & (0x3F >> n);
+        for (int k = 1; k <= n; k++) c = c << 6 | ((u8)s[i + k] & 0x3F);
+        i += n + 1;
+        if (c >= 0x10000) o += (char16_t)(0xD800 + ((c - 0x10000) >> 10)), o += (char16_t)(0xDC00 + ((c - 0x10000) & 0x3FF));
+        else o += (char16_t)c;
+    }
+    return o;
+}
+
+namespace {
+struct SwkbdPending {
+    u32 id = 0;
+    std::vector<u8> cfg;
+    ObjPtr mem;
+};
+std::mutex swkbd_m;  // guards the request the window reads (the rest is under the kernel lock)
+swkbd::Request swkbd_req;
+bool swkbd_active = false;
+SwkbdPending swkbd_wait;
+unsigned swkbd_serial = 0;
+}  // namespace
+
+// fills in the text and the button pressed (ok: the confirm button, else the cancel one)
+static void swkbd_result(std::vector<u8> &cfg, ObjPtr mem, std::u16string text, bool ok) {
+    auto wr32 = [&](size_t o, u32 v) { memcpy(&cfg[o], &v, 4); };
+    u32 buttons, max_len = cfg[0x20] | cfg[0x21] << 8;
+    memcpy(&buttons, &cfg[0x04], 4);
+    buttons += 1;
+    auto sm = std::dynamic_pointer_cast<SharedMem>(mem);
     if (max_len && text.size() > max_len) text.resize(max_len);
     if (sm && (text.size() + 1) * 2 <= sm->size) {
         for (size_t i = 0; i < text.size(); i++) w16(sm->backing + 2 * (u32)i, text[i]);
         w16(sm->backing + 2 * (u32)text.size(), 0);
     }
-    wr32(0x138, buttons >= 3 ? 5 : buttons == 2 ? 2 : 0);  // D2_CLICK2 / D1_CLICK1 / D0_CLICK: the confirm button
-    wr32(0x144, 0);                                         // text_offset
+    // D0_CLICK / D1_CLICK0, D1_CLICK1 / D2_CLICK0, D2_CLICK2: the left button cancels, the right one confirms
+    wr32(0x138, buttons >= 3 ? (ok ? 5 : 3) : buttons == 2 ? (ok ? 2 : 1) : 0);
+    wr32(0x144, 0);  // text_offset
     cfg[0x148] = (u8)text.size();
     cfg[0x149] = (u8)(text.size() >> 8);
     wr32(0x14C, 0);  // callback_result: OK
-    std::string ascii(text.begin(), text.end());
-    LOG("[apt] software keyboard: typed \"%s\"\n", ascii.c_str());
+    LOG("[apt] software keyboard: %s \"%s\"\n", ok ? "typed" : "cancelled", utf8(text).c_str());
+}
+
+// true if the applet finished (else it waits for the player: swkbd::finish)
+static bool swkbd_run(u32 id, std::vector<u8> &cfg, ObjPtr mem) {
+    if (cfg.size() < 0x14C) return true;
+    auto rd32 = [&](size_t o) { u32 v; memcpy(&v, &cfg[o], 4); return v; };
+    auto rd16s = [&](size_t o, size_t n) {
+        std::u16string s;
+        for (size_t i = 0; i < n; i++) {
+            char16_t c = (char16_t)(cfg[o + 2 * i] | cfg[o + 2 * i + 1] << 8);
+            if (!c) break;
+            s += c;
+        }
+        return s;
+    };
+    auto sm = std::dynamic_pointer_cast<SharedMem>(mem);
+    const u32 type = rd32(0x00), buttons = rd32(0x04) + 1, filters = rd32(0x18);
+    std::u16string initial;
+    if (sm && (s32)rd32(0x120) >= 0 && rd32(0x120) + 2 <= sm->size)
+        for (u32 a = sm->backing + rd32(0x120); a + 2 <= sm->backing + sm->size && r16(a); a += 2) initial += (char16_t)r16(a);
+    if (const char *t = getenv("RECOMP_SWKBD_TEXT")) {
+        std::u16string text = *t ? utf16(t) : initial;
+        if (text.empty()) text = type == 2 ? u"1" : u"Player";
+        swkbd_result(cfg, mem, text, true);
+        return true;
+    }
+    swkbd::Request r;
+    r.hint = utf8(rd16s(0x90, 65));
+    r.initial = utf8(initial);
+    r.ok = utf8(rd16s(0x26 + 34 * (std::min(buttons, 3u) - 1), 17));
+    r.cancel = buttons > 1 ? utf8(rd16s(0x26, 17)) : "";
+    r.can_cancel = buttons > 1;
+    r.max_len = cfg[0x20] | cfg[0x21] << 8;
+    r.max_digits = cfg[0x24] | cfg[0x25] << 8;
+    r.numpad = type == 2;
+    r.password = rd32(0x0C) != 0;
+    r.multiline = cfg[0x113] != 0;
+    r.valid = (int)rd32(0x08);
+    r.digits_limited = filters & 1;
+    r.no_at = filters & 2;
+    r.no_percent = filters & 4;
+    r.no_backslash = filters & 8;
+    LOG("[apt] software keyboard: waiting for the player (hint \"%s\", max %d)\n", r.hint.c_str(), r.max_len);
+    swkbd_wait = {id, cfg, mem};
+    std::lock_guard<std::mutex> g(swkbd_m);
+    r.serial = ++swkbd_serial;
+    swkbd_req = r;
+    swkbd_active = true;
+    return false;
 }
 
 static void applet_run(u32 id, std::vector<u8> buf, ObjPtr mem = nullptr) {
@@ -137,12 +225,40 @@ static void applet_run(u32 id, std::vector<u8> buf, ObjPtr mem = nullptr) {
         // buffer and clear the result fields the caller checks
         LOG("[apt] error applet: type %u code %08x\n", buf[0], *(u32 *)&buf[4]);
     } else if (kind == 0x01) {
-        swkbd_run(buf, mem);
+        if (!swkbd_run(id, buf, mem)) return;
     } else {
         LOG("[apt] library applet %x: finishing immediately\n", id);
     }
     send_parameter({id, 0x300, 10, nullptr, std::move(buf)});  // WakeupByExit
 }
+
+}  // namespace kernel
+
+bool swkbd::pending(Request *out) {
+    std::lock_guard<std::mutex> g(kernel::swkbd_m);
+    if (kernel::swkbd_active && out) *out = kernel::swkbd_req;
+    return kernel::swkbd_active;
+}
+
+void swkbd::finish(const std::string &text, bool ok) {
+    using namespace kernel;
+    Lock lk(kmutex);
+    {
+        std::lock_guard<std::mutex> g(swkbd_m);
+        if (!swkbd_active) return;
+        swkbd_active = false;
+    }
+    auto w = std::make_shared<SwkbdPending>(std::move(swkbd_wait));
+    swkbd_wait = {};
+    std::u16string t = utf16(text);
+    run_when_quiescent([w, t, ok] {
+        swkbd_result(w->cfg, w->mem, t, ok);
+        send_parameter({w->id, 0x300, 10, nullptr, std::move(w->cfg)});  // WakeupByExit
+    });
+    schedule_async();
+}
+
+namespace kernel {
 
 void apt_notify(u32 signal) {
     apt.notifications.push_back(signal);

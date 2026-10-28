@@ -1,0 +1,14 @@
+# Animal Crossing: New Leaf – Welcome amiibo (USA). Format: runtime/profile.cpp.
+
+value keyboard = u8 0x94cbea   # 1 while the game's keyboard (names, town name) is on the bottom screen
+
+# the keyboard's "ABC" page, bottom-screen pixels
+keyboard when keyboard == 1
+key 1234567890- at 15 78 step 25
+key qwertyuiop at 18 102 step 25
+key asdfghjkl:[] at 23 123 step 25
+key zxcvbnm,.'/ at 27 146 step 25
+key backspace at 295 78
+key shift at 85 167
+key space at 162 167
+key enter at 260 223           # Confirm

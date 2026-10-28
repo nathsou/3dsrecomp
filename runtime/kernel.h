@@ -173,6 +173,7 @@ void schedule_async();                 // (lock held) from a host thread: run so
 void run_when_quiescent(std::function<void()> fn);  // (lock held) run fn when no guest code is executing
 void reschedule(Lock &lk);             // (lock held, from a guest thread) yield to a higher priority thread
 void block_current(Lock &lk);          // (lock held) the current thread waits until resumed
+void sleep_current(u64 ns, Lock &lk);  // (lock held) the current thread sleeps for ns of guest time
 u64 now_ns();   // the guest clock: real time scaled by the game speed
 u64 real_ns();
 void set_clock_speed(u32 percent);

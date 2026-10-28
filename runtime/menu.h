@@ -6,6 +6,7 @@
 namespace menu {
 void init(SDL_Window *window, SDL_Renderer *renderer);
 bool is_open();
+bool keyboard_open();  // the game's software keyboard is up: the Mac's keyboard types into it (swkbd.h)
 void toggle();
 bool handle_event(const SDL_Event &ev);  // true if the menu used the event (the game does not see it)
 void update();                           // once per host frame: gamepad stick navigation

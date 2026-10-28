@@ -45,5 +45,7 @@ const std::vector<Icon> &icons();
 bool cond(int i);         // a condition's state this frame
 bool value(int i, s64 &v);  // a value this frame (false: its pointer chain was null)
 const Button *button();   // the HUD action button, if it applies now
+bool keyboard_active();   // the game's own keyboard is up ("keyboard when ...")
+bool key(const std::string &k, int &x, int &y);  // where a character or named key is on the bottom screen
 
 }  // namespace profile

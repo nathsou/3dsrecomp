@@ -229,6 +229,16 @@ static void yield_current(Lock &lk) {
     switch_from(cur, lk);
 }
 
+void sleep_current(u64 ns, Lock &lk) {
+    Thread *t = current_thread();
+    t->status = TStatus::WaitSleep;
+    u64 gen = t->wait_gen;
+    add_timeout(now_ns() + ns, [t, gen] {
+        if (t->wait_gen == gen && t->status == TStatus::WaitSleep) resume_thread(t);
+    });
+    block_current(lk);
+}
+
 // ---------------------------------------------------------------- wait objects
 void WaitObject::add_waiter(Thread *t) {
     if (std::find(waiters.begin(), waiters.end(), t) == waiters.end()) waiters.push_back(t);
@@ -627,16 +637,8 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
         break;
     case 0x0A: {  // SleepThread
         s64 ns = (s64)((u64)c->r[0] | ((u64)c->r[1] << 32));
-        if (ns <= 0) {
-            yield_current(lk);
-        } else {
-            t->status = TStatus::WaitSleep;
-            u64 gen = t->wait_gen;
-            add_timeout(now_ns() + (u64)ns, [t, gen] {
-                if (t->wait_gen == gen && t->status == TStatus::WaitSleep) resume_thread(t);
-            });
-            block_current(lk);
-        }
+        if (ns <= 0) yield_current(lk);
+        else sleep_current((u64)ns, lk);
         break;
     }
     case 0x0B: {
