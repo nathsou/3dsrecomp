@@ -58,10 +58,12 @@ static void write_fb(const std::string &path, u32 paddr, u32 width, u32 height, 
 }
 
 // the Metal backend's high-resolution image of a framebuffer, if it has one
-static void write_hires(const std::string &path, u32 fb_paddr) {
+static void write_hires(const std::string &path, u32 fb_paddr, u32 stride = 0, u32 lines = 0) {
     const u32 *px;
     int w, h;
-    if (!gpu::get_display_image_for(fb_paddr, &px, &w, &h)) return;
+    if (!gpu::get_display_image_for(fb_paddr, stride, lines, &px, &w, &h) &&
+        !gpu::get_display_image_for(fb_paddr, 0, 0, &px, &w, &h))
+        return;
     write_png(path.c_str(), (u32)w, (u32)h, px);
     fprintf(stderr, "wrote %s (%dx%d)\n", path.c_str(), w, h);
 }
@@ -196,7 +198,7 @@ int main(int argc, char **argv) {
             if (sscanf(line, "%*s %x %u %u %x %x", &a, &w, &h, &s, &fm) == 5) {
                 std::string name = presents == 0 ? out : out_name(out, "_" + std::to_string(presents));
                 write_fb(name, a, w, h, s, fm);
-                write_hires(out_name(name.substr(0, name.rfind('.')), "_hires"), a);
+                write_hires(out_name(name.substr(0, name.rfind('.')), "_hires"), a, s, h);
                 presents++;
             }
             continue;

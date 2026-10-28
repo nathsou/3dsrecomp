@@ -27,7 +27,99 @@ static void ensure_shm() {
     hid.shm->backing = mem::hle_alloc(0x1000);
 }
 
+// RECOMP_LIVE=<file>: input for a running test, one command per line appended to the file while the game runs
+// ("<buttons> <frames>", buttons as in RECOMP_INPUT: A, B, A+B, CUP, CDOWN+B, T@x/y...; "WAIT <frames>"). Commands
+// run one after the other for that many VBlanks, each followed by a few released frames; the log says when each
+// starts. A line "DUMP" writes the state of every thread to the log at once.
+namespace {
+struct LiveCmd {
+    u32 buttons = 0;
+    int cx = 0, cy = 0, tx = -1, ty = -1, frames = 0;
+};
+struct Live {
+    FILE *f = nullptr;
+    std::string partial;
+    std::vector<LiveCmd> queue;
+    size_t next = 0;
+    u64 until = 0;  // (VBlanks)
+    bool gap = false;
+    LiveCmd cur;
+    bool active = false;
+} live;
+
+LiveCmd parse_live(const std::string &line) {
+    LiveCmd c;
+    char names[128] = {};
+    int n = 0;
+    if (sscanf(line.c_str(), "%127s %d", names, &n) < 1) return c;
+    c.frames = n > 0 ? n : 1;
+    std::string s = names;
+    std::vector<std::string> parts;
+    for (size_t p = 0; p <= s.size();) {
+        size_t e = s.find('+', p);
+        if (e == std::string::npos) e = s.size();
+        parts.push_back(s.substr(p, e - p));
+        p = e + 1;
+    }
+    static const std::pair<const char *, u32> btns[] = {
+        {"A", 1 << 0}, {"B", 1 << 1}, {"SELECT", 1 << 2}, {"START", 1 << 3}, {"DRIGHT", 1 << 4}, {"DLEFT", 1 << 5},
+        {"DUP", 1 << 6}, {"DDOWN", 1 << 7}, {"R", 1 << 8}, {"L", 1 << 9}, {"X", 1 << 10}, {"Y", 1 << 11},
+        {"ZL", 1 << 14}, {"ZR", 1 << 15}};
+    for (auto &p : parts) {
+        for (auto &[name, bit] : btns)
+            if (p == name) c.buttons |= bit;
+        if (p == "CUP") c.cy = 155;
+        if (p == "CDOWN") c.cy = -155;
+        if (p == "CLEFT") c.cx = -155;
+        if (p == "CRIGHT") c.cx = 155;
+        if (p.rfind("T@", 0) == 0) sscanf(p.c_str() + 2, "%d/%d", &c.tx, &c.ty);
+    }
+    return c;
+}
+
+void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
+    static const char *path = getenv("RECOMP_LIVE");
+    if (!path) return;
+    if (!live.f) live.f = fopen(path, "r");
+    if (!live.f) return;
+    char buf[512];
+    clearerr(live.f);
+    while (fgets(buf, sizeof buf, live.f)) {
+        live.partial += buf;
+        if (live.partial.back() != '\n') break;
+        std::string line = live.partial.substr(0, live.partial.size() - 1);
+        live.partial.clear();
+        if (line == "DUMP") dump_threads();  // right away: the state of every thread in the log
+        else if (!line.empty()) live.queue.push_back(parse_live(line));
+    }
+    if (g_frame >= live.until) {
+        if (live.active) {
+            live.active = false;
+            live.until = g_frame + 4;  // released for a few frames
+            return;
+        }
+        if (live.next >= live.queue.size()) return;
+        live.cur = live.queue[live.next++];
+        live.until = g_frame + live.cur.frames;
+        live.active = true;
+        LOG("[live] command %zu starts (%d frames)\n", live.next, live.cur.frames);
+    }
+    if (!live.active) return;
+    buttons |= live.cur.buttons;
+    if (live.cur.cx || live.cur.cy) {
+        cx = (s16)live.cur.cx;
+        cy = (s16)live.cur.cy;
+    }
+    if (live.cur.tx >= 0) {
+        touch = true;
+        tx = (u16)live.cur.tx;
+        ty = (u16)live.cur.ty;
+    }
+}
+}  // namespace
+
 void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty) {
+    live_input(buttons, cx, cy, touch, tx, ty);
     Lock lk(kmutex);
     if (!hid.shm) return;
     u32 b = hid.shm->backing;

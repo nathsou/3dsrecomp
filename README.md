@@ -30,6 +30,15 @@ the four on the GPU: on an M4 Pro the automatic resolution settles at 2x in game
 where it runs at full speed at about 85% of one core. amiibo, StreetPass and the New 3DS extras (faster CPU,
 extended memory) are not used: the runtime presents an old 3DS, which the game supports.
 
+**Animal Crossing: New Leaf – Welcome amiibo** (USA, `CTR-P-EAAE`, title 0004000000198E00) runs: title screen,
+a new game with the train ride (Rover's questions, the name and town name on the software keyboard, the town
+map choice), the arrival in town with Isabelle, the town hall, Main Street, Nook's Homes and placing the house
+with Tom Nook, at full speed with music and sound (built with `-DGAME=acnl` from `data/acnl`). Most of its code
+is in CRO modules (relocatable code loaded from the RomFS by `ldr:ro`), which the recompiler also translates:
+see [CRO modules](#cro-modules-ldrro). The town's map on the bottom screen does not show yet; saving was not
+reached in tests (the game allows it only after the first day's tutorial). amiibo, StreetPass, SpotPass, QR codes
+and online play are not supported: the services report nothing there.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
@@ -126,9 +135,31 @@ working directory is what the Homebrew Launcher gives it. The SD card is `save/s
 
 F11 toggles fullscreen, F2 cycles the screen layout (stacked, top screen only, side by side, large top with a small bottom, bottom screen
 only, stacked with the bottom screen first; the window takes the layout's shape and the mouse touches the bottom
-screen wherever it is), F3 cycles the internal
+screen wherever it is), Tab (or a click of the gamepad's right stick) swaps the screens in the single-screen and
+stacked layouts, F3 cycles the internal
 resolution (auto, 1x to 4x; Metal), F12 writes the state of every game thread to the log (press it if a
 game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is there, or Cmd+Q).
+
+### Playing on one screen
+
+In the "top screen only" and "bottom screen only" layouts (menu: Graphics):
+- **Other screen in a corner**: the hidden screen appears small in a corner for a few seconds whenever its
+  picture changes a lot (a dialog, a menu), or always. Clicking it touches the bottom screen; while the pointer is
+  over it, a tab next to it moves it and a handle (or the scroll wheel) resizes it.
+- **Automatic screen**: games with a profile (below) switch to the screen that matters, e.g. the bottom screen on
+  menus that are played there. Tab shows the other screen until the game moves on.
+- **Extra HUD**: games with a profile get the bottom screen's information during play (stored item, star coins,
+  ...) drawn over the top screen with the game's own icons; E (or a click of the gamepad's left stick) uses the
+  stored item by tapping the bottom screen where the game expects it.
+
+### Game profiles
+
+`games/<title id>/profile.txt` describes, for one game, values in its memory (lives, the stored item, which
+scene it is in, ...), which screen matters when, and the HUD built from them. The format is documented at the top
+of `runtime/profile.cpp`; it holds only addresses, numbers, RomFS paths and coordinates. The HUD's icons are
+read from the game's own files at run time (BCLIM textures in NARC or SARC archives, Yaz0-compressed or not).
+To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
+`RECOMP_PROFILE_TRACE=<n>` logs every value every n frames.
 
 ## How it works
 
@@ -139,7 +170,8 @@ game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is ther
     instructions) and lower each one to C. Guest registers become C locals; flags are separate 0/1 locals.
   - `gen.py` discovers functions (entry point, `bl` targets, pointers in data/rodata/literal pools,
     pc-relative code pointers, RVCT init arrays), resolves jump tables (`ldr pc, [pc, rX, lsl #2]`,
-    `add pc, pc, rX, lsl #2`, and GCC's byte tables `ldr[s]b rX, [table, rY]` + `add pc, pc, rX, lsl #2`) and
+    `add pc, pc, rX, lsl #2`, GCC's byte tables `ldr[s]b rX, [table, rY]` + `add pc, pc, rX, lsl #2`, and
+    RVCT's Thumb tables of byte/halfword offsets after `add rX, pc` / `ldrb rX, [rX, #k]` / `add pc, rX`) and
     emits one C function per guest function. `udf` traps (`__builtin_trap`) count as code, not data. Calls are C calls followed by
     a check that the callee returned where expected; returns to anywhere else unwind to a dispatcher that
     resumes at the right instruction (every call return site is a resumable entry). Tail branches and
@@ -148,11 +180,12 @@ game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is ther
 - `runtime/` replaces the 3DS:
   - `core.cpp`: a 4 GiB host reservation mirrors the guest address space (`g_mem + addr`), the dispatcher.
   - `kernel.cpp`: handles, threads (one host pthread per guest thread, but a single runner at a time with
-    strict priority scheduling like the 3DS application core), events, mutexes, semaphores, timers, address
+    strict priority scheduling like the 3DS application core; when an interrupt readies a higher-priority
+    thread, the running one gives way at its next loop branch), events, mutexes, semaphores, timers, address
     arbiters, shared memory, memory management, and the SVC interface.
   - `service.cpp` + `services/`: IPC to HLE services: srv, APT, fs (RomFS from `romfs.bin`, saves in host
     folders), gsp::Gpu (interrupt relay queue, GX command queue, framebuffers), hid, cfg, dsp, ptm, ac, frd,
-    and stubs for the rest.
+    ldr:ro (CRO modules, below), and stubs for the rest.
   - `gpu/`: the PICA200 GPU, either on **Metal** (default) or in a multithreaded **software** rasterizer that
     is the reference implementation. With Metal, vertex programs are translated to compute kernels, one
     per program and set of bool/int uniforms (`shader_msl_spec()`: the uniform-dependent ifs, calls and loop
@@ -166,6 +199,21 @@ game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is ther
   - `audio/`: HLE of the DSP audio firmware, output through SDL3.
   - `frontend.cpp`: SDL3 window, input, VBlank pacing.
 
+### CRO modules (ldr:ro)
+
+Some games keep most of their code in CRO modules: relocatable files in the RomFS (`*.cro`, with `static.crs`
+describing the main program's exports and imports) that the game reads into its heap and hands to `ldr:ro`,
+which relocates and links them; where they land changes from run to run. Recompiled code needs fixed addresses,
+so `tools/recomp/cro.py` gives every module a fixed *slot* (from 0x40000000, in name order, listed in the
+generated `guest_cros[]`), links all modules there for the analysis and recompiles their code with the program.
+At run time `runtime/services/ro.cpp` implements the loader (rebasing the header tables, internal relocations,
+imports and exports by name, index and segment offset, the auto-link list, fix levels, unload and unlink) with
+one change: each module's code and read-only data are copied to its slot and relocated against it, so every code
+pointer the game ever sees (relocations, exports, return addresses) is a slot address the recompiled code knows.
+Its .data and .bss stay where the game put them. Words the loader patches at run time (relocation targets in
+modules, and the main program's words that static.crs imports point at module symbols) are never folded as
+constants by the recompiler. `tools/disasm.py` shows module code at slot addresses.
+
 ## Graphics options
 
 - `GPU_BACKEND=metal|sw` (default `metal`).
@@ -177,6 +225,18 @@ game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is ther
   should fit; heavy games (Metroid: Samus Returns) settle at 2x on an M4 Pro, others keep 4x.
 - `GPU_MSAA=1|2|4|8`: multisample anti-aliasing of the Metal render targets (default 4).
 - `GPU_ANISO=1..16`: anisotropic filtering of the textures the game filters linearly with mipmaps (default 16).
+- `GPU_TEX_FILTER=0|1|2`: texture upscaling (default 0, off; `gpu::set_texture_filter` at run time). 1 (Sharp)
+  is an edge-directed 2x pass in the spirit of xBR, applied twice for 4x: hard steps stay crisp, diagonal and
+  curved staircases become straight edges, gradients and anti-aliased edges are interpolated. 2 (Smooth) is an
+  edge-adaptive Lanczos-2 resampler in the spirit of FSR1's EASU (kernel stretched along edges, clamped to the
+  nearest texels): smooth curves and crisp edges, best for anti-aliased art such as NSMB2's tiles. Both run as
+  Metal compute kernels (`runtime/gpu/texfilter.mm`) once per decoded texture, 4x above internal scale 2 (else
+  2x), mix colours weighted by alpha (no dark fringes at cut-outs), follow the texture's wrap mode (no seams on
+  tiled textures) and keep the game's mip levels below the upscaled ones. A texture the game rewrites in parts
+  (NSMB2's tile atlas with its animated coins and ? blocks) only has the changed 8x8 tiles redone; one rewritten
+  entirely over and over is left alone. Not upscaled: render-to-texture data (render targets and copies of
+  them), cube and shadow maps, HILO8, textures over 1024x1024 and thin or tiny lookup tables (under 256 texels,
+  or 8:1 and thinner); upscaled textures use at most 512 MiB.
 - The screens are drawn into the window with nearest filtering at integer magnifications, sharp bilinear
   filtering at other magnifications and linear filtering when the image is larger than its place in the window.
 - `GPU_THREADS=n` worker threads for the software backend.
@@ -198,7 +258,7 @@ keep the Metal compiler out of gameplay:
   compiled in the background on first use while the CPU shades those draws, so nothing is skipped.
 - Pipelines the list misses are recorded in `<saves>/shadercache/<title id>.bin` (prebuilt in the background
   on later launches) and compiled in the background the first time; their draws are skipped for those few
-  frames. `GPU_SYNC_SHADERS=1` compiles them on the spot instead (the old behaviour). Vertex programs the list
+  frames, and the screen keeps showing the previous complete frame meanwhile. `GPU_SYNC_SHADERS=1` compiles them on the spot instead (the old behaviour). Vertex programs the list
   misses (`<saves>/shadercache/<title id>.vs.bin`) are compiled in the background too, the CPU shading their
   draws meanwhile, so nothing is skipped.
 - To extend a game's lists, play with fresh saves and merge the caches:
@@ -213,9 +273,18 @@ keep the Metal compiler out of gameplay:
 ## Debugging aids
 
 - `RECOMP_VERBOSE=1|2` (or `-v`/`-vv`): kernel and IPC logs.
+- `RECOMP_INPUT` also takes host input for testing the frontend: `<frame>:KEY_<SDL key name>`,
+  `<frame>:MOUSE_DOWN@x/y` (`MOUSE_MOVE`, `MOUSE_UP`) and `<frame>:MOUSE_WHEEL@x/y/dy`, in layout coordinates.
 - `RECOMP_TRACE=n`: log the first n dispatcher transitions.
+- `RECOMP_MEMDUMP=<frame>,...`: snapshots of guest memory at those frames (`mem_<frame>_<address>.bin`: the
+  data/bss segment and every mapped region), for finding where a game keeps its state by diffing them.
 - `RECOMP_DUMP=<frame>`: dump that frame's GX work (memory + operations) for the GPU replay tool.
-- `RECOMP_SHOT=<n>`: write both screens as PPM every n frames. `RECOMP_FRAMES=<n>`: quit after n frames.
+- `RECOMP_SPEED=<percent>`: game speed for this run (the menu's Game speed, up to 2000%). The game's clock
+  (timers, sleeps, the system tick) runs at the same pace, so scripted runs reach the same point on the same
+  frame at any speed the Mac keeps up with: 400% plays SM3DL's intro into World 1-1 in 35 s instead of 135 s.
+  Above about 500% the game falls behind (audio emulation, most likely) and scripts drift.
+- `RECOMP_SHOT=<n>`: write both screens as PPM every n frames (from frame `RECOMP_SHOT_FROM`, if set).
+  `RECOMP_FRAMES=<n>`: quit after n frames.
   `RECOMP_WINSHOT=<f1,f2,...>`: the whole window (menu included) at those frames.
 - `RECOMP_INPUT="frame:BUTTONS:duration,..."`: scripted input (e.g. `600:START:10,900:A:5`; `T@x/y` touches the
   bottom screen at pixel x, y, e.g. `700:T@160/222:6`).
@@ -232,12 +301,20 @@ keep the Metal compiler out of gameplay:
   of World 1-1, which is how levels past 1-1 are tested without a completed save.
 - `RECOMP_ROMFS_REPLACE="<path>=<host file>,..."`: serve a file from the Mac in place of a RomFS file (mods,
   edited levels for tests).
-- If a game submits no GPU work for 5 s, the log records the state of every thread (`[diag]`); outside
-  `RECOMP_STATS` runs a stats line is logged every 30 s.
+- If a game submits no GPU work for 5 s, the log records the state of every thread (`[diag]`), each with the
+  chain of game functions it is in (`in <innermost> < <caller> < ...`); outside `RECOMP_STATS` runs a stats line
+  is logged every 30 s.
 - `RECOMP_REGION` / `RECOMP_LANGUAGE`: the console region (0 JPN, 1 USA, 2 EUR, ...) and language (0 JP, 1 EN, ...)
   the system settings report. The region defaults to the game's own, from its icon's region lockout.
 - `RECOMP_SWKBD_TEXT`: what the software keyboard applet "types" (default: the game's initial text, else "Player").
-- `tools/disasm.py <gamedir> <addr> [count]` disassembles guest code.
+- `RECOMP_LIVE=<file>`: input for a running test, one command per line appended to the file while the game runs
+  (`<buttons> <frames>` with the button names of `RECOMP_INPUT`, e.g. `A 6`, `CDOWN+B 60`, `T@160/120 8`, or
+  `WAIT <frames>`); commands run one after another, each followed by a few released frames, and the log says when
+  each starts. A line `DUMP` writes the state of every thread to the log. With `RECOMP_SHOT`, this drives long
+  explorations step by step without replaying a script from boot.
+- A jump to a null function pointer stops with the registers in the log (instead of trying to recompile it), and
+  `RECOMP_WATCH` reports which code touched its page before a fatal error.
+- `tools/disasm.py <gamedir> <addr> [count] [thumb]` disassembles guest code (including CRO modules).
 
 ## License
 

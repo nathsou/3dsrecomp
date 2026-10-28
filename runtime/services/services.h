@@ -12,10 +12,13 @@ void register_gsp();
 void register_hid();
 void register_dsp();
 void register_misc();
+void register_ro();
 
 std::shared_ptr<SharedMem> load_shared_font();
 // a file of a system archive (system_archives/<title id>.romfs), empty if missing
 std::vector<u8> system_archive_file(u64 tid, const std::string &path);
+// a file of the game's RomFS by path ("/LayoutData/x.szs"), empty if missing
+std::vector<u8> romfs_file(const std::string &path);
 void apt_notify(u32 signal);
 
 // gsp

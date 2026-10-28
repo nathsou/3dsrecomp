@@ -494,6 +494,11 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
 void transfer_convert(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 flags);
 // a display transfer completed: remember high-resolution sources of framebuffers
 void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+// texture filter (set_texture_filter): textures in guest memory holding GPU output (render-to-texture) are
+// not upscaled. Both do nothing while no filter is on. metal_gpu_made: [paddr, paddr+size) holds GPU output
+// (call after metal_guest_read); metal_note_gpu_output: a transfer or copy of GPU output wrote it.
+bool metal_gpu_made(u32 paddr, u32 size);
+void metal_note_gpu_output(u32 paddr, u32 size);
 // deferred draws (vertex.cpp): draws are recorded and processed in parallel at batch flush
 bool vtx_jobs_pending();
 void vtx_finish_jobs();
@@ -559,6 +564,9 @@ u64 hash_bytes(const u8 *p, size_t n);
 // timing statistics (GPU_STATS=1)
 extern bool g_stats, g_trace;
 extern double g_t_shade, g_t_setup, g_t_flush;
+// texture decoding (texture.cpp), for RECOMP_STATS (the Metal backend logs and resets them)
+extern double g_tex_decode_ms;
+extern u32 g_tex_decodes;
 double now_ms();
 
 }  // namespace gpu

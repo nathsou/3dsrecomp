@@ -47,10 +47,22 @@ void settings_load() {
     num("show_fps", s.show_fps);
     num("clock_offset", s.clock_offset);
     num("auto_backup", s.auto_backup);
+    num("pip", s.pip);
+    num("pip_corner", s.pip_corner);
+    num("pip_x", s.pip_x);
+    num("pip_y", s.pip_y);
+    num("pip_size", s.pip_size);
+    num("auto_focus", s.auto_focus);
+    num("hud", s.hud);
+    num("tex_filter", s.tex_filter);
     s.scale = std::clamp(s.scale, 0, 4);
     s.layout = std::max(s.layout, 0);  // (the frontend clamps it to its layouts)
     s.speed = std::clamp(s.speed, 25, 400);
     s.volume = std::clamp(s.volume, 0, 100);
+    s.pip = std::clamp(s.pip, 0, 2);
+    s.pip_corner = std::clamp(s.pip_corner, 0, 3);
+    s.pip_size = std::clamp(s.pip_size, 15, 80);
+    s.hud = std::clamp(s.hud, 0, 2);
     // the GPU backend reads these once at startup; an environment variable given at launch wins
     setenv("GPU_MSAA", std::to_string(s.msaa).c_str(), 0);
     setenv("GPU_ANISO", std::to_string(s.aniso).c_str(), 0);
@@ -65,6 +77,9 @@ void settings_save() {
       << "\nwindow=" << s.geom[0] << ',' << s.geom[1] << ',' << s.geom[2] << ',' << s.geom[3]
       << "\nwindow2=" << s.geom2[0] << ',' << s.geom2[1] << ',' << s.geom2[2] << ',' << s.geom2[3] << "\nspeed=" << s.speed << "\nvolume=" << s.volume
       << "\nshow_fps=" << s.show_fps << "\nclock_offset=" << s.clock_offset << "\nauto_backup=" << s.auto_backup
+      << "\npip=" << s.pip << "\npip_corner=" << s.pip_corner << "\npip_x=" << s.pip_x << "\npip_y=" << s.pip_y
+      << "\npip_size=" << s.pip_size << "\nauto_focus=" << s.auto_focus << "\nhud=" << s.hud
+      << "\ntex_filter=" << s.tex_filter
       << "\n";
 }
 

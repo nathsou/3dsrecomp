@@ -20,6 +20,8 @@
 #include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
+#include "hud.h"
+#include "profile.h"
 #include "menu.h"
 #include "services/services.h"
 #include "settings.h"
@@ -37,7 +39,7 @@ static std::condition_variable wake_cv;
 static bool wake_flag;
 static SDL_Gamepad *pad;
 static int scale = 2;
-static u32 shot_frame = 0;
+static u32 shot_frame = 0, shot_from = 0;  // RECOMP_SHOT every n frames, from RECOMP_SHOT_FROM
 static u64 frame_count = 0;
 static u64 game_frames = 0;  // new top-screen images (the game's frame rate)
 static std::atomic<bool> paused;  // the menu is open: no VBlank, no audio frames, no input
@@ -57,6 +59,16 @@ static const ScreenLayout layouts[] = {
 };
 constexpr int kLayouts = sizeof layouts / sizeof layouts[0];
 static int layout;
+// Tab / right-stick click: the same layout with the other screen (single-screen and stacked layouts)
+static int swapped_layout(int l) {
+    switch (l) {
+    case 1: return 4;
+    case 4: return 1;
+    case 0: return 5;
+    case 5: return 0;
+    default: return l;
+    }
+}
 // separate windows (the menu's Graphics page): the bottom screen in its own window, so each screen can go on
 // its own display; the main window then shows the top screen only
 static SDL_Window *window2;
@@ -130,13 +142,18 @@ void frontend_init() {
     SDL_SetTextureScaleMode(tex_top, SDL_SCALEMODE_LINEAR);
     SDL_SetTextureScaleMode(tex_bottom, SDL_SCALEMODE_LINEAR);
     if (const char *s = getenv("RECOMP_SHOT")) shot_frame = (u32)atoi(s);
+    if (const char *s = getenv("RECOMP_SHOT_FROM")) shot_from = (u32)atoi(s);
+    // RECOMP_SPEED=<percent>: game speed for this run (tests: e.g. 400 plays intros four times faster)
+    if (const char *s = getenv("RECOMP_SPEED")) g_settings.speed = std::clamp(atoi(s), 25, 2000);
     gpu::init();
     audio::init();
     if (gpu::scale()) scale_mode = gpu::scale_is_auto() ? 0 : gpu::scale();
     if (scale_mode == 0 && g_settings.scale) frontend_set_scale_mode(g_settings.scale);
+    if (g_settings.tex_filter && !getenv("GPU_TEX_FILTER")) gpu::set_texture_filter(g_settings.tex_filter);
     audio::set_volume(g_settings.volume / 100.0f);
     menu::init(window, renderer);
     if (g_settings.split) frontend_set_split(true);
+    profile::load();
 }
 
 // ---- what the in-game menu changes (runtime/menu.mm)
@@ -326,7 +343,7 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hir
     kernel::FramebufferInfo f = kernel::gsp_framebuffer(screen);
     int width = screen ? 320 : 400;
     const u32 fb = f.valid ? mem::vaddr_to_paddr(f.addr_left) : 0;
-    const u64 ver = !fb ? 0 : gpu::use_display_image(fb, hires ? shown[screen] : 0, [&](const u32 *img, int w, int h) {
+    const u64 ver = !fb ? 0 : gpu::use_display_image(fb, f.stride, screen ? 320 : 400, hires ? shown[screen] : 0, [&](const u32 *img, int w, int h) {
         if (!hires || w != hw || h != hh) {
             if (hires) SDL_DestroyTexture(hires);
             hires = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
@@ -362,8 +379,197 @@ static void write_window_shot(SDL_Renderer *r, const char *prefix) {
     SDL_DestroySurface(s);
 }
 
+// ---- where the screens go. In the single-screen layouts the focused screen fills the window and the other one
+// can show in a corner (picture in picture): always, or for a few seconds whenever its picture changes a lot. With
+// automatic focus, the game's profile picks the focused screen (Tab flips it until the profile's choice changes).
+struct Placement {
+    SDL_FRect top{}, bottom{};  // w 0: not shown
+    int pip = -1;               // the screen in the corner (-1: none)
+    float alpha = 1;            // the corner screen's opacity
+};
+static Placement placement;
+static int manual_flip;                                  // Tab while the profile picks the screen
+static profile::Focus flip_for = profile::FOCUS_NONE;   // the profile's choice when Tab was pressed
+static Uint64 pip_active_until;
+static float pip_alpha;
+static u64 hud_tap_until;  // the HUD button's tap on the bottom screen lasts until this frame
+// moving and resizing the corner screen with the mouse: a grip tab (move) and a handle (resize) appear next to it
+// while the pointer is over it; the scroll wheel resizes it too
+static SDL_FRect pip_rect, pip_grip, pip_handle;  // this frame's, in canvas units (w 0: none)
+static int pip_drag;                               // 0 none, 1 moving, 2 resizing
+static float drag_dx, drag_dy, drag_ax, drag_ay;   // grab offset / the corner that stays put while resizing
+static bool pip_hover;
+static int hud_tap_x, hud_tap_y;
+
+static bool single_layout() { return !window2 && (layout == 1 || layout == 4); }
+static profile::Focus auto_focus() { return g_settings.auto_focus ? profile::focus() : profile::FOCUS_NONE; }
+
+// 0 top, 1 bottom
+static int focused_screen() {
+    const profile::Focus f = auto_focus();
+    if (f != flip_for) {
+        manual_flip = 0;
+        flip_for = f;
+    }
+    int s = layout == 4 ? 1 : 0;
+    if (f == profile::FOCUS_TOP || f == profile::FOCUS_BOTH) s = 0;
+    if (f == profile::FOCUS_BOTTOM) s = 1;
+    return s ^ manual_flip;
+}
+
+// whether a screen's picture changed a lot since the last frame (40x30 cells of luminance)
+static bool screen_changed(int screen) {
+    static float prev[40 * 30];
+    static int prev_screen = -1;
+    static u32 buf[400 * 240];
+    const int w = screen ? 320 : 400;
+    convert_fb(kernel::gsp_framebuffer(screen), w, buf);
+    float cur[40 * 30] = {};
+    for (int y = 0; y < 240; y += 2)
+        for (int x = 0; x < w; x += 2) {
+            const u32 p = buf[y * w + x];
+            cur[(y * 30 / 240) * 40 + x * 40 / w] += (float)((p & 255) * 2 + (p >> 8 & 255) * 5 + (p >> 16 & 255)) / 8;
+        }
+    const float cell = (w / 40.0f / 2) * (240 / 30.0f / 2);
+    int changed = 0;
+    for (int i = 0; i < 40 * 30; i++) {
+        cur[i] /= cell;
+        changed += std::fabs(cur[i] - prev[i]) > 10;
+    }
+    const bool first = prev_screen != screen;
+    memcpy(prev, cur, sizeof prev);
+    prev_screen = screen;
+    return !first && changed > 40 * 30 * 8 / 100;
+}
+
+static void place_screens() {
+    const ScreenLayout &l = layouts[shown_layout()];
+    placement = {l.top, l.bottom, -1, 1};
+    if (!single_layout()) return;
+    const int main = focused_screen(), other = main ^ 1;
+    auto fit = [&](int screen) {
+        const float sw = screen ? 320 : 400, k = std::min(l.w / sw, l.h / 240.0f);
+        return SDL_FRect{(l.w - sw * k) / 2, (l.h - 240 * k) / 2, sw * k, 240 * k};
+    };
+    (main ? placement.bottom : placement.top) = fit(main);
+    (other ? placement.bottom : placement.top) = {};
+    // the corner screen
+    const Uint64 now = SDL_GetTicks();
+    if (g_settings.pip == 1 && screen_changed(other)) pip_active_until = now + 3000;
+    const float ph = std::min(l.h * g_settings.pip_size / 100.0f, l.w * 240.0f / (other ? 320 : 400)),
+                pw = ph * (other ? 320 : 400) / 240.0f, m = l.h * 0.025f;
+    const int c = g_settings.pip_corner;
+    SDL_FRect r{c == 1 || c == 3 ? m : l.w - pw - m, c >= 2 ? l.h - ph - m : m, pw, ph};
+    if (g_settings.pip_x >= 0) {
+        r.x = std::clamp(g_settings.pip_x * l.w / 1000.0f, 0.0f, l.w - pw);
+        r.y = std::clamp(g_settings.pip_y * l.h / 1000.0f, 0.0f, l.h - ph);
+    }
+    // the grip tab and the resize handle go on the side facing the middle of the window
+    const bool below = r.y + r.h / 2 < l.h / 2, left = r.x + r.w / 2 > l.w / 2;
+    const float gh = std::max(l.h * 0.05f, 6.0f), gw = std::min(r.w * 0.4f, gh * 5);
+    pip_rect = r;
+    pip_grip = {r.x + (r.w - gw) / 2, below ? r.y + r.h : r.y - gh, gw, gh};
+    pip_handle = {left ? r.x - gh : r.x + r.w, below ? r.y + r.h : r.y - gh, gh, gh};
+    float mx, my, lx = -1, ly = -1;
+    if (SDL_GetMouseFocus() == window) {
+        SDL_GetMouseState(&mx, &my);
+        SDL_RenderCoordinatesFromWindow(renderer, mx, my, &lx, &ly);
+    }
+    auto in = [&](const SDL_FRect &q) { return lx >= q.x && lx < q.x + q.w && ly >= q.y && ly < q.y + q.h; };
+    pip_hover = pip_drag || (pip_alpha > 0.5f && (in(r) || in(pip_grip) || in(pip_handle)));
+    const bool want = g_settings.pip == 2 || auto_focus() == profile::FOCUS_BOTH || pip_hover ||
+                      (g_settings.pip == 1 && now < pip_active_until);
+    pip_alpha = std::clamp(pip_alpha + (want ? 0.12f : -0.08f), 0.0f, 1.0f);
+    if (pip_alpha <= 0) {
+        pip_rect = pip_grip = pip_handle = {};
+        return;
+    }
+    (other ? placement.bottom : placement.top) = r;
+    placement.pip = other;
+    placement.alpha = pip_alpha;
+}
+
+// the mouse moving or resizing the corner screen; true if the event was used
+static bool pip_mouse(const SDL_Event &ev) {
+    if (window2 || placement.pip < 0) {
+        pip_drag = 0;
+        return false;
+    }
+    const ScreenLayout &l = layouts[shown_layout()];
+    float lx = 0, ly = 0;
+    auto at = [&](float x, float y) { SDL_RenderCoordinatesFromWindow(renderer, x, y, &lx, &ly); };
+    auto in = [&](const SDL_FRect &q) { return q.w && lx >= q.x && lx < q.x + q.w && ly >= q.y && ly < q.y + q.h; };
+    const float aspect = pip_rect.h > 0 ? pip_rect.w / pip_rect.h : 4.0f / 3;
+    auto store = [&](float x, float y, float h) {
+        const float w = h * aspect;
+        x = std::clamp(x, 0.0f, l.w - w);
+        y = std::clamp(y, 0.0f, l.h - h);
+        g_settings.pip_x = (int)std::lround(x * 1000 / l.w);
+        g_settings.pip_y = (int)std::lround(y * 1000 / l.h);
+        g_settings.pip_size = std::clamp((int)std::lround(h * 100 / l.h), 15, 80);
+    };
+    switch (ev.type) {
+    case SDL_EVENT_MOUSE_BUTTON_DOWN:
+        if (ev.button.button != SDL_BUTTON_LEFT || SDL_GetWindowFromID(ev.button.windowID) != window) return false;
+        at(ev.button.x, ev.button.y);
+        if (in(pip_grip) || (placement.pip == 0 && in(pip_rect))) {  // (the top screen takes no touches)
+            pip_drag = 1;
+            drag_dx = lx - pip_rect.x;
+            drag_dy = ly - pip_rect.y;
+            return true;
+        }
+        if (in(pip_handle)) {
+            pip_drag = 2;  // the opposite corner stays put
+            drag_ax = pip_handle.x < pip_rect.x ? pip_rect.x + pip_rect.w : pip_rect.x;
+            drag_ay = pip_handle.y < pip_rect.y ? pip_rect.y + pip_rect.h : pip_rect.y;
+            return true;
+        }
+        return false;
+    case SDL_EVENT_MOUSE_MOTION:
+        if (!pip_drag) return false;
+        at(ev.motion.x, ev.motion.y);
+        if (pip_drag == 1) {
+            store(lx - drag_dx, ly - drag_dy, pip_rect.h);
+        } else {
+            const float h = std::clamp(std::max(std::fabs(ly - drag_ay), std::fabs(lx - drag_ax) / aspect), l.h * 0.15f, l.h * 0.8f);
+            store(lx < drag_ax ? drag_ax - h * aspect : drag_ax, ly < drag_ay ? drag_ay - h : drag_ay, h);
+        }
+        return true;
+    case SDL_EVENT_MOUSE_BUTTON_UP:
+        if (!pip_drag || ev.button.button != SDL_BUTTON_LEFT) return false;
+        pip_drag = 0;
+        settings_save();
+        return true;
+    case SDL_EVENT_MOUSE_WHEEL: {  // resize around the middle
+        at(ev.wheel.mouse_x, ev.wheel.mouse_y);
+        if (!(in(pip_rect) || in(pip_grip) || in(pip_handle)) || ev.wheel.y == 0) return false;
+        const float h = std::clamp(pip_rect.h * (1 + 0.06f * ev.wheel.y), l.h * 0.15f, l.h * 0.8f);
+        store(pip_rect.x + (pip_rect.w - h * aspect) / 2, pip_rect.y + (pip_rect.h - h) / 2, h);
+        settings_save();
+        return true;
+    }
+    }
+    return false;
+}
+
+// a screenshot is due at frame n (RECOMP_SHOT / RECOMP_WINSHOT)
+static bool shot_due(u64 n) {
+    static const char *winshot = getenv("RECOMP_WINSHOT");
+    if (shot_frame && n >= shot_from && n % shot_frame == 0) return true;
+    return winshot && (std::string(",") + winshot + ",").find("," + std::to_string(n) + ",") != std::string::npos;
+}
+
 static void present() {
     static u32 top[400 * 240], bottom[320 * 240];
+    // faster than the 3DS: draw at most every 12 ms (a display shows no more), except the frames being captured
+    static auto last_drawn = steady_clock::now();
+    const auto t = steady_clock::now();
+    if (g_settings.speed > 100 && t - last_drawn < milliseconds(12) && !shot_due(frame_count + 1)) {
+        frame_count++;
+        g_frame = frame_count;
+        return;
+    }
+    last_drawn = t;
     static SDL_Texture *hi_top, *hi_bottom;
     static int htw, hth, hbw, hbh;
     SDL_Texture *t_top = upload_screen(renderer, 0, hi_top, htw, hth, tex_top, top);
@@ -381,22 +587,55 @@ static void present() {
     }
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
-    const ScreenLayout &l = layouts[shown_layout()];
+    place_screens();
+    const Placement &pl = placement;
     const float f = present_factor();
-    if (l.top.w) {
-        set_filter(t_top, l.top.w * f, t_top->w);
-        SDL_RenderTexture(renderer, t_top, nullptr, &l.top);
+    auto draw = [&](int screen) {
+        const SDL_FRect &d = screen ? pl.bottom : pl.top;
+        SDL_Texture *t = screen ? t_bottom : t_top;
+        if (!d.w || !t) return;
+        const bool corner = pl.pip == screen;
+        if (corner) {  // a thin dark frame
+            const float b = std::max(1.0f, d.h * 0.012f);
+            const SDL_FRect fr{d.x - b, d.y - b, d.w + 2 * b, d.h + 2 * b};
+            SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+            SDL_SetRenderDrawColorFloat(renderer, 0, 0, 0, 0.7f * pl.alpha);
+            SDL_RenderFillRect(renderer, &fr);
+            SDL_SetTextureAlphaModFloat(t, pl.alpha);
+        }
+        set_filter(t, d.w * f, t->w);
+        SDL_RenderTexture(renderer, t, nullptr, &d);
+        if (corner) SDL_SetTextureAlphaModFloat(t, 1);
+    };
+    // the corner screen goes over the main one
+    draw(pl.pip == 0 ? 1 : 0);
+    draw(pl.pip == 0 ? 0 : 1);
+    if (pl.pip >= 0 && pip_hover) {  // grip tab (three bars) and resize handle (a diagonal)
+        SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+        SDL_SetRenderDrawColorFloat(renderer, 0.1f, 0.1f, 0.12f, 0.85f * pl.alpha);
+        SDL_RenderFillRect(renderer, &pip_grip);
+        SDL_RenderFillRect(renderer, &pip_handle);
+        SDL_SetRenderDrawColorFloat(renderer, 1, 1, 1, 0.8f * pl.alpha);
+        const SDL_FRect &g = pip_grip, &h = pip_handle;
+        for (int i = 1; i <= 3; i++) {
+            const SDL_FRect bar{g.x + g.w * 0.3f, g.y + g.h * i / 4 - g.h * 0.05f, g.w * 0.4f, std::max(g.h * 0.1f, 1.0f)};
+            SDL_RenderFillRect(renderer, &bar);
+        }
+        for (float t = 0.25f; t <= 0.75f; t += 0.02f) {
+            const SDL_FRect dot{h.x + h.w * t - 0.5f, h.y + h.h * (1 - t) - 0.5f, std::max(h.w * 0.1f, 1.0f),
+                                std::max(h.h * 0.1f, 1.0f)};
+            SDL_RenderFillRect(renderer, &dot);
+        }
     }
-    if (l.bottom.w) {
-        set_filter(t_bottom, l.bottom.w * f, t_bottom->w);
-        SDL_RenderTexture(renderer, t_bottom, nullptr, &l.bottom);
-    }
+    // the HUD over the top screen: the bottom screen's information when it is out of sight (or always)
+    const bool bottom_seen = window2 || (pl.bottom.w && (pl.pip != 1 || pl.alpha > 0.5f));
+    if (pl.top.w && pl.pip != 0 && (g_settings.hud == 2 || (g_settings.hud == 1 && !bottom_seen))) hud::draw(renderer, pl.top);
     menu::draw();
     write_window_shot(renderer, "window");
     SDL_RenderPresent(renderer);
     frame_count++;
     g_frame = frame_count;
-    if (shot_frame && frame_count % shot_frame == 0) {
+    if (shot_frame && frame_count >= shot_from && frame_count % shot_frame == 0) {
         convert_fb(kernel::gsp_framebuffer(0), 400, top);
         convert_fb(kernel::gsp_framebuffer(1), 320, bottom);
         char name[64];
@@ -407,7 +646,7 @@ static void present() {
         const u32 *img;
         int w, h;
         kernel::FramebufferInfo f = kernel::gsp_framebuffer(0);
-        if (f.valid && gpu::get_display_image_for(mem::vaddr_to_paddr(f.addr_left), &img, &w, &h)) {
+        if (f.valid && gpu::get_display_image_for(mem::vaddr_to_paddr(f.addr_left), f.stride, 400, &img, &w, &h)) {
             snprintf(name, sizeof name, "shot_top_hires_%06llu.ppm", (unsigned long long)frame_count);
             write_ppm(name, img, w, h);
         }
@@ -424,8 +663,14 @@ enum : u32 {
 // scripted input for testing: RECOMP_INPUT="frame:BUTTONS:duration,..." (BUTTONS like A+START; T@x/y touches
 // the bottom screen at pixel x, y)
 struct ScriptEntry { u64 frame, dur; u32 buttons; int cx, cy, tx = -1, ty = -1; };
-// host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...)
-struct ScriptKey { u64 frame; SDL_Scancode key; };
+// host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...), and the
+// mouse in layout coordinates: "frame:MOUSE_DOWN@x/y" (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy"
+struct ScriptKey {
+    u64 frame;
+    SDL_Scancode key;
+    SDL_EventType mouse = (SDL_EventType)0;
+    float x = 0, y = 0, wheel = 0;
+};
 static std::vector<ScriptKey> script_keys;
 static std::vector<ScriptEntry> script;
 static void parse_script() {
@@ -444,6 +689,16 @@ static void parse_script() {
         std::string n = names;
         if (n.rfind("KEY_", 0) == 0) {
             script_keys.push_back({f, SDL_GetScancodeFromName(n.c_str() + 4)});
+            continue;
+        }
+        if (n.rfind("MOUSE_", 0) == 0) {
+            ScriptKey k{f, SDL_SCANCODE_UNKNOWN};
+            const size_t at = n.find('@');
+            const std::string kind = n.substr(6, at == std::string::npos ? std::string::npos : at - 6);
+            k.mouse = kind == "DOWN" ? SDL_EVENT_MOUSE_BUTTON_DOWN : kind == "UP" ? SDL_EVENT_MOUSE_BUTTON_UP
+                    : kind == "WHEEL"  ? SDL_EVENT_MOUSE_WHEEL        : SDL_EVENT_MOUSE_MOTION;
+            if (at != std::string::npos) sscanf(n.c_str() + at + 1, "%f/%f/%f", &k.x, &k.y, &k.wheel);
+            script_keys.push_back(k);
             continue;
         }
         auto has = [&](const char *k) { return n.find(k) != std::string::npos; };
@@ -535,6 +790,11 @@ static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16
             tx = (u16)std::clamp(e.tx, 0, 319);
             ty = (u16)std::clamp(e.ty, 0, 239);
         }
+    if (!touch && frame_count < hud_tap_until) {  // the HUD button (profile: "button tap x y")
+        touch = true;
+        tx = (u16)std::clamp(hud_tap_x, 0, 319);
+        ty = (u16)std::clamp(hud_tap_y, 0, 239);
+    }
     if (!touch && (mb & SDL_BUTTON_LMASK) && window2 && SDL_GetMouseFocus() == window2) {
         float lx, ly;  // the bottom screen's own window
         SDL_RenderCoordinatesFromWindow(renderer2, mx, my, &lx, &ly);
@@ -543,11 +803,11 @@ static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16
             tx = (u16)lx;
             ty = (u16)ly;
         }
-    } else if (!touch && (mb & SDL_BUTTON_LMASK) && SDL_GetMouseFocus() == window) {
+    } else if (!touch && !pip_drag && (mb & SDL_BUTTON_LMASK) && SDL_GetMouseFocus() == window) {
         float lx, ly;
         SDL_RenderCoordinatesFromWindow(renderer, mx, my, &lx, &ly);
-        const SDL_FRect &b = layouts[shown_layout()].bottom;  // touch: the mouse on the bottom screen, wherever it is
-        if (b.w && lx >= b.x && lx < b.x + b.w && ly >= b.y && ly < b.y + b.h) {
+        const SDL_FRect &b = placement.bottom;  // touch: the mouse on the bottom screen, wherever it is
+        if (b.w && (placement.pip != 1 || placement.alpha > 0.5f) && lx >= b.x && lx < b.x + b.w && ly >= b.y && ly < b.y + b.h) {
             touch = true;
             tx = (u16)std::clamp((int)((lx - b.x) * 320 / b.w), 0, 319);
             ty = (u16)std::clamp((int)((ly - b.y) * 240 / b.h), 0, 239);
@@ -625,9 +885,38 @@ void frontend_run() {
             std::this_thread::sleep_until(next_vblank);
             continue;
         }
+        // faster than the 3DS: the next VBlank waits until the game has finished its frame (for up to one 3DS
+        // frame), so it never falls behind and plays the same at any speed
+        if (g_settings.speed > 100 && !paused && now < next_vblank + nanoseconds(16715000) &&
+            (kernel::guest_busy() || kernel::gsp_gx_pending())) {
+            std::this_thread::sleep_for(microseconds(100));
+            continue;
+        }
         // host events once per frame (pumping the macOS event loop is not free)
         for (auto &k : script_keys)
-            if (k.frame == frame_count) {
+            if (k.frame == frame_count && k.mouse) {
+                float wx, wy;
+                SDL_RenderCoordinatesToWindow(renderer, k.x, k.y, &wx, &wy);
+                SDL_Event me{};
+                me.type = k.mouse;
+                if (k.mouse == SDL_EVENT_MOUSE_WHEEL) {
+                    me.wheel.windowID = SDL_GetWindowID(window);
+                    me.wheel.y = k.wheel;
+                    me.wheel.mouse_x = wx;
+                    me.wheel.mouse_y = wy;
+                } else if (k.mouse == SDL_EVENT_MOUSE_MOTION) {
+                    me.motion.windowID = SDL_GetWindowID(window);
+                    me.motion.x = wx;
+                    me.motion.y = wy;
+                } else {
+                    me.button.windowID = SDL_GetWindowID(window);
+                    me.button.button = SDL_BUTTON_LEFT;
+                    me.button.down = k.mouse == SDL_EVENT_MOUSE_BUTTON_DOWN;
+                    me.button.x = wx;
+                    me.button.y = wy;
+                }
+                SDL_PushEvent(&me);
+            } else if (k.frame == frame_count) {
                 SDL_Event ke{};
                 ke.type = SDL_EVENT_KEY_DOWN;
                 ke.key.scancode = k.key;
@@ -664,6 +953,25 @@ void frontend_run() {
                 frontend_set_layout(g_settings.layout);
                 settings_save();
             }
+            if (!window2 && ((ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_TAB && !ev.key.repeat) ||
+                             (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && ev.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK))) {
+                if (single_layout() && auto_focus() != profile::FOCUS_NONE) {
+                    manual_flip ^= 1;  // the profile picks the screen: look at the other one for now
+                    pip_alpha = 0;
+                } else if (const int l = swapped_layout(layout); l != layout) {
+                    g_settings.layout = l;
+                    frontend_set_layout(l);
+                    settings_save();
+                }
+            }
+            if ((ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_E && !ev.key.repeat) ||
+                (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && ev.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK))
+                if (const profile::Button *b = profile::button()) {  // the HUD button: a tap on the bottom screen
+                    hud_tap_x = b->tx;
+                    hud_tap_y = b->ty;
+                    hud_tap_until = frame_count + 6;
+                }
+            if (pip_mouse(ev)) continue;
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F3) {
                 cycle_scale();
                 g_settings.scale = scale_mode > 0 ? scale_mode : 0;
@@ -679,6 +987,7 @@ void frontend_run() {
         menu::update();
         paused = menu::is_open();
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
+        kernel::set_clock_speed((u32)g_settings.speed);
         now = steady_clock::now();
         {
             u32 b;
@@ -692,6 +1001,7 @@ void frontend_run() {
                 input_now = {b, cx, cy, touch, tx, ty};
             }
             if (!paused) kernel::gsp_vblank();  // the game waits for VBlank, so it stops while the menu is open
+            profile::update();
             present();
             static const char *peek = getenv("RECOMP_PEEK");
             if (peek) {
@@ -701,6 +1011,10 @@ void frontend_run() {
                 if (v != last) LOG("[peek] %08x = %08x\n", a, v);
                 last = v;
             }
+            // RECOMP_MEMDUMP="f1,f2,...": guest memory snapshots (mem_<frame>_<address>.bin) for finding game state
+            static const char *memdump = getenv("RECOMP_MEMDUMP");
+            if (memdump && (std::string(",") + memdump + ",").find("," + std::to_string(frame_count) + ",") != std::string::npos)
+                kernel::dump_memory(("mem_" + std::to_string(frame_count)).c_str());
             if (max_frames && frame_count >= max_frames) {
                 if (getenv("RECOMP_THREADS")) kernel::dump_threads();
                 watch_report();

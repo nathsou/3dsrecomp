@@ -142,7 +142,7 @@ class Analyzer:
     def jump_table(self, i, th):
         """Targets of a recognised switch (list of keys), or None."""
         if th:
-            return None
+            return self.thumb_table(i)
         w = i.word
         a = i.addr
         kind = None
@@ -188,6 +188,71 @@ class Analyzer:
                     if e is None or (e >> 24) != 0xEA:
                         break
         return targets if targets else None
+
+    def thumb_table(self, i):
+        """RVCT's Thumb switch on a table of byte (or halfword) offsets right after the jump:
+            cmp rI, #n ; bhs default ; movs rX, rI ; add rX, pc ; ldrb rX, [rX, #k] ; adds rX, rX, rX ; add pc, rX
+        (the halfword form indexes with `lsls rX, rI, #1` and loads with ldrh)."""
+        img = self.img
+        a = i.addr
+        hw = img.read16(a)
+        if hw is None or (hw & 0xFF87) != 0x4487:
+            return None
+        rx = (hw >> 3) & 15
+        if rx > 7:
+            return None
+        h = [img.read16(a - 2 * k) for k in range(1, 5)]
+        if None in h:
+            return None
+        if h[0] not in (0x1800 | rx << 6 | rx << 3 | rx, 0x0040 | rx << 3 | rx):  # adds rX, rX, rX / lsls rX, rX, #1
+            return None
+        if (h[1] & 0xF83F) == (0x7800 | rx << 3 | rx):
+            size, k = 1, (h[1] >> 6) & 31
+        elif (h[1] & 0xF83F) == (0x8800 | rx << 3 | rx):
+            size, k = 2, ((h[1] >> 6) & 31) * 2
+        else:
+            return None
+        if h[2] != (0x4478 | rx):  # add rX, pc
+            return None
+        if size == 1 and (h[3] & 0xFFC7) == rx:  # movs rX, rI
+            ri = (h[3] >> 3) & 7
+        elif size == 2 and (h[3] & 0xFFC7) == (0x0040 | rx):  # lsls rX, rI, #1
+            ri = (h[3] >> 3) & 7
+        else:
+            return None
+        n = None
+        for back in range(5, 14):
+            p = img.read16(a - 2 * back)
+            if p is None:
+                break
+            if (p & 0xFF00) == (0x2800 | ri << 8):  # cmp rI, #n
+                q = img.read16(a - 2 * back + 2)
+                # the bhs/bcs to the default case (possibly a few instructions later)
+                for f in range(a - 2 * back + 2, a - 8, 2):
+                    q = img.read16(f)
+                    if q is not None and (q & 0xFF00) == 0xD200:
+                        n = p & 0xFF
+                        break
+                break
+        if not n:
+            return None
+        tbase = a - 2 + k  # rX = idx + (address of `add rX, pc`) + 4
+        targets = []
+        for idx in range(n):
+            if size == 1:
+                s = img.seg_of(tbase + idx)
+                if s is None:
+                    return None
+                v = s.data[tbase + idx - s.addr]
+            else:
+                v = img.read16(tbase + 2 * idx)
+                if v is None:
+                    return None
+            t = a + 4 + 2 * v
+            if not img.in_text(t):
+                return None
+            targets.append(t | 1)
+        return targets
 
     @staticmethod
     def is_trap(i):
@@ -313,9 +378,15 @@ class Analyzer:
                 if i.reads_pc_lit is not None:
                     lits.add(i.reads_pc_lit & ~3)
         out = set()
+        for text in img.texts:
+            self.gap_scan(text, cov, lits, out)
+        return out
+
+    def gap_scan(self, text, cov, lits, out):
+        img = self.img
         prev_end = False
-        for off in range(0, img.text.size, 4):
-            a = img.text.addr + off
+        for off in range(0, text.size, 4):
+            a = text.addr + off
             if a in cov:
                 i = self.cache.get(a)
                 prev_end = i is not None and not i.falls_through and i.kind != 'b'
@@ -330,7 +401,6 @@ class Analyzer:
             if prev_end and w is not None and (w & 0xFFFF4000) == 0xE92D4000:
                 out.add(a)
             prev_end = False
-        return out
 
     def plausible_entry(self, key):
         th = key & 1
@@ -347,9 +417,15 @@ class Analyzer:
         img = self.img
         queue = [img.entry]
         self.funcs[img.entry] = True
+        for e in img.extra_entries:  # CRO OnLoad / OnExit / OnUnresolved
+            if self.decode(e & ~1, e & 1) is not None:
+                self.funcs[e] = True
+                queue.append(e)
         candidates = set()
         # pointers in data/rodata into text
-        for s in (img.rodata, img.data):
+        for s in img.segments:
+            if s in img.texts:
+                continue
             d = s.data
             for off in range(0, len(d) - 3, 4):
                 v = struct.unpack_from('<I', d, off)[0]
@@ -577,6 +653,12 @@ class Emitter:
             t = i.target
             if (t | th) in an.funcs and t != (key & ~1):
                 body.append('SO(); __attribute__((musttail)) return %s(c, 0);' % fname(t | th))
+            elif t <= i.addr:
+                # a loop: give way if an interrupt readied a higher-priority thread (a busy wait for that
+                # thread would otherwise never end; the 3DS kernel preempts)
+                body.append('if (__builtin_expect(rt_preempt_flag, 0)) { SO(); c->pc = 0x%xu; rt_preempt(c); SI(); } '
+                            'goto L_%x;' % (t | th, t))
+                self.stats['loop_checks'] += 1
             else:
                 body.append('goto L_%x;' % t)
         elif i.kind == CALL and i.target not in an.funcs:
@@ -706,6 +788,13 @@ class Emitter:
                 f.write('  {0x%xu, %s, %d},\n' % (addr, fn, k))
                 cnt += 1
             f.write('};\nconst u32 guest_entry_count = %d;\n' % cnt)
+            cros = self.an.img.cros
+            if cros:
+                # the slots the runtime's ldr:ro moves each CRO module's code to (tools/recomp/cro.py)
+                f.write('\nconst GuestCro guest_cros[] = {\n')
+                for m in cros.mods:
+                    f.write('  {"%s", 0x%xu, 0x%xu},\n' % (m.name, m.base, m.slot_size()))
+                f.write('};\nconst u32 guest_cro_count = %d;\n' % len(cros.mods))
         files.append(os.path.join(self.outdir, 'table.c'))
         return files
 

@@ -184,10 +184,10 @@ void gsp_process_gx() {
             irqs.push_back(DMA);
             break;
         case 0x01: {  // SubmitGpuCommandList(addr, size, flags)
-            u64 t0 = now_ns();
+            u64 t0 = real_ns();
             gpu::process_command_list(va2pa(c[1]), c[2]);
             gx_stats.cmdlists++;
-            gx_stats.gpu_ns += now_ns() - t0;
+            gx_stats.gpu_ns += real_ns() - t0;
             irqs.push_back(P3D);
             break;
         }

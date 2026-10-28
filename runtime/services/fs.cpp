@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <map>
+#include <mutex>
 
 #include "../loader.h"
 #include "../service.h"
@@ -274,6 +275,33 @@ static void build_romfs_index() {
     std::sort(romfs_index.begin(), romfs_index.end(), [](auto &a, auto &b) { return a.off < b.off; });
 }
 
+// a RomFS file by path ("/LayoutData/x.szs"), empty if missing (host side: HUD icons)
+static std::mutex romfs_mtx;
+static bool open_romfs() {
+    std::lock_guard<std::mutex> lk(romfs_mtx);
+    if (romfs_fd >= 0) return true;
+    const int fd = open((g_game.dir + "/romfs.bin").c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    struct stat st;
+    fstat(fd, &st);
+    romfs_size = (u64)st.st_size;
+    romfs_fd = fd;
+    build_romfs_index();
+    return true;
+}
+
+std::vector<u8> romfs_file(const std::string &path) {
+    if (!open_romfs()) return {};
+    std::lock_guard<std::mutex> lk(romfs_mtx);
+    for (const auto &f : romfs_index)
+        if (f.path == path) {
+            std::vector<u8> d(f.size);
+            if (pread(romfs_fd, d.data(), f.size, (off_t)f.off) != (ssize_t)f.size) return {};
+            return d;
+        }
+    return {};
+}
+
 static void log_romfs_read(u64 off) {
     if (!g_verbose) return;
     auto it = std::upper_bound(romfs_index.begin(), romfs_index.end(), off,
@@ -499,13 +527,7 @@ struct FsUser : Service {
             VLOG("[fs] system archive file %s\n", a->host.c_str());
         } else if (a->romfs) {
             // binary path: [type, ...]; type 0 = the RomFS
-            if (romfs_fd < 0) {
-                romfs_fd = open((g_game.dir + "/romfs.bin").c_str(), O_RDONLY);
-                struct stat st;
-                fstat(romfs_fd, &st);
-                romfs_size = (u64)st.st_size;
-                build_romfs_index();
-            }
+            open_romfs();
             fs->romfs = true;
             fs->base = 0;
             fs->size = romfs_size;

@@ -112,6 +112,7 @@ struct Thread : WaitObject {
     u32 entry = 0;
     std::condition_variable cv;
     std::thread host;
+    unsigned mach = 0;  // host thread's Mach port (thread dumps sample its stack for the guest call chain)
     u64 ready_seq = 0;
     // waiting
     std::vector<std::shared_ptr<WaitObject>> wait_objs;
@@ -172,13 +173,18 @@ void schedule_async();                 // (lock held) from a host thread: run so
 void run_when_quiescent(std::function<void()> fn);  // (lock held) run fn when no guest code is executing
 void reschedule(Lock &lk);             // (lock held, from a guest thread) yield to a higher priority thread
 void block_current(Lock &lk);          // (lock held) the current thread waits until resumed
-u64 now_ns();
+u64 now_ns();   // the guest clock: real time scaled by the game speed
+u64 real_ns();
+void set_clock_speed(u32 percent);
 u64 system_tick();
 void add_timeout(u64 deadline_ns, std::function<void()> fn);  // (lock held) run fn (lock held) at deadline
 
 std::shared_ptr<Event> make_event(ResetType rt, const char *name);
 void svc_dispatch(CPU *c, u32 imm);
 void dump_threads();
+void dump_memory(const char *prefix);  // RECOMP_MEMDUMP
+bool guest_readable(u32 addr, u32 size);
+bool guest_busy();  // a guest thread is running (not all waiting)  // mapped and readable (host-side reads of game state)
 
 struct BootInfo {
     u32 entry;

@@ -39,15 +39,17 @@ void set_trust_invalidations(bool trust);
 bool save_state(const char *path);
 bool load_state(const char *path);
 
-// High-resolution display (Metal backend, GPU_SCALE > 1). If the framebuffer at fb_paddr was last
-// written by a display transfer from a GPU render target (and not modified since), returns an
+// High-resolution display (Metal backend, GPU_SCALE > 1). If the framebuffer at fb_paddr (`lines` rows of 240
+// pixels, `stride` bytes apart; 0: any) was last written by a display transfer from a GPU render target (and not
+// modified since; the transfer's output may start before it), returns an
 // upright RGBA8 image (bytes R,G,B,A) of it at the internal resolution: top screen
 // 400*scale x 240*scale, bottom 320*scale x 240*scale. The pointer stays valid until the next call
 // from the same thread. Safe to call from another thread than the one driving the GPU.
-bool get_display_image_for(u32 fb_paddr, const u32 **rgba, int *w, int *h);
+bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h);
 // Without the copy: calls fn(rgba, w, h) under the image lock if the image at fb_paddr is not the one
 // with version `have`; returns the version of the image there (0: none).
-u64 use_display_image(u32 fb_paddr, u64 have, const std::function<void(const u32 *, int, int)> &fn);
+u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
+                      const std::function<void(const u32 *, int, int)> &fn);
 // Same, for the most recent display transfer to screen 0 (top, 400 lines) or 1 (bottom, 320).
 bool get_display_image(int screen, const u32 **rgba, int *w, int *h);
 // Internal resolution scale of the Metal backend (1-4), changeable while running from any thread (it
@@ -56,4 +58,10 @@ bool get_display_image(int screen, const u32 **rgba, int *w, int *h);
 void set_scale(int s);
 int scale();
 bool scale_is_auto();
+// Texture filter of the Metal backend (0 off, else a texture upscaler: gpu/texfilter.mm), changeable while
+// running from any thread (the GPU thread applies it at the next draw, rebuilding its textures).
+// GPU_TEX_FILTER=<mode> sets it at start.
+void set_texture_filter(int mode);
+int texture_filter_count();
+const char *texture_filter_name(int mode);
 }  // namespace gpu

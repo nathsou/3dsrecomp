@@ -15,7 +15,9 @@
 #include <vector>
 
 #include "audio_iface.h"
+#include "gpu_iface.h"
 #include "loader.h"
+#include "profile.h"
 #include "settings.h"
 
 namespace kernel {
@@ -224,6 +226,14 @@ std::vector<Row> rows(Page p) {
         r.push_back({"Texture filtering", s.aniso > 1 ? std::to_string(s.aniso) + "× anisotropic" : "Standard",
                      s.aniso != aniso_at_launch ? "Applies after a restart." : "",
                      [&s](int d) { cycle(s.aniso, {1, 2, 4, 8, 16}, d); }});
+        if (gpu::texture_filter_count() > 1)
+            r.push_back({"Upscale textures", gpu::texture_filter_name(s.tex_filter),
+                         "Sharpens the game's small textures: Sharp for crisp cartoon edges, Smooth for softer art.",
+                         [&s](int d) {
+                             const int n = gpu::texture_filter_count();
+                             s.tex_filter = (s.tex_filter + d + n) % n;
+                             gpu::set_texture_filter(s.tex_filter);
+                         }});
         r.push_back({"Separate windows", s.split ? "One per screen" : "Off",
                      "Put each screen on its own display; F11 makes the window you are in fullscreen.", [&s](int) {
                          s.split = !s.split;
@@ -235,6 +245,35 @@ std::vector<Row> rows(Page p) {
                          s.layout = (s.layout + d + n) % n;
                          frontend_set_layout(s.layout);
                      }});
+        {
+            static const std::vector<std::string> pip_names = {"Off", "When it changes", "Always"},
+                                                   corners = {"Top right", "Top left", "Bottom right", "Bottom left"},
+                                                   hud_names = {"Off", "When the bottom screen is hidden", "Always"};
+            r.push_back({"Other screen in a corner", pip_names[s.pip],
+                         "In the single-screen layouts. Tab swaps the screens; click the corner to touch it.",
+                         [&s](int d) { cycle(s.pip, {0, 1, 2}, d); }});
+            if (s.pip) {
+                r.push_back({"Position", s.pip_x >= 0 ? "Where you dragged it" : corners[s.pip_corner],
+                             "Drag the tab next to it to move it; drag its handle or scroll over it to resize it.",
+                             [&s](int d) {
+                                 if (s.pip_x >= 0) s.pip_x = s.pip_y = -1;  // back to a corner
+                                 else cycle(s.pip_corner, {0, 1, 2, 3}, d);
+                             }});
+                r.push_back({"Size", std::to_string(s.pip_size) + "%", "Of the window's height.",
+                             [&s](int d) { s.pip_size = std::clamp(s.pip_size + d * 5, 15, 80); }});
+            }
+            r.push_back({"Automatic screen", profile::has_focus_rules() ? onoff(s.auto_focus) : "Not for this game",
+                         profile::has_focus_rules() ? "In the single-screen layouts, shows the screen the game needs "
+                                                      "(such as the bottom one on menus that use it)."
+                                                    : "",
+                         profile::has_focus_rules() ? std::function<void(int)>([&s](int) { s.auto_focus = !s.auto_focus; })
+                                                    : nullptr});
+            if (profile::has_hud())
+                r.push_back({"Extra HUD", hud_names[s.hud],
+                             "What the bottom screen shows during play, over the top screen. E (or a left stick click) "
+                             "uses the stored item.",
+                             [&s](int d) { cycle(s.hud, {0, 1, 2}, d); }});
+        }
         r.push_back({"Fullscreen", onoff(s.fullscreen), "", [&s](int) {
                          s.fullscreen = !s.fullscreen;
                          frontend_set_fullscreen(s.fullscreen);

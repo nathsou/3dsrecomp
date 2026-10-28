@@ -35,6 +35,12 @@ typedef struct {
     u32 entry;
 } GuestEntry;
 
+// A CRO module's fixed slot: where ldr:ro puts its code so the recompiled code finds it (tools/recomp/cro.py)
+typedef struct {
+    const char *name;
+    u32 base, size;
+} GuestCro;
+
 extern u8 *g_mem;  // 4 GiB host reservation mirroring the guest address space
 #define MEMBASE g_mem
 
@@ -51,6 +57,10 @@ typedef u64 __attribute__((aligned(1), may_alias)) u64_u;
 
 void rt_dispatch(CPU *c, u32 unused);
 void rt_svc(CPU *c, u32 imm);
+// Set by the host when a thread with a higher priority than the running one became ready (an interrupt woke it):
+// generated code checks it on backward branches and calls rt_preempt, the way the 3DS kernel preempts a busy loop.
+extern volatile u32 rt_preempt_flag;
+void rt_preempt(CPU *c);
 void rt_undefined(CPU *c, u32 addr, u32 word);
 
 static inline u32 F2U(float f) { u32 u; memcpy(&u, &f, 4); return u; }

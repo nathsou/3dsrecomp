@@ -1,0 +1,67 @@
+# Metroid: Samus Returns (USA)
+#
+# During play the top screen has no HUD at all: energy, ammo, the Aeion gauge, the selected ability, the DNA
+# count and the Metroids left are all on the bottom screen, so the HUD below carries them.
+#
+# Icons: gui/textures/*.bctex are NOT BCLIM/SARC. A .bctex is a 0x80-byte "MTXT" header followed by a CTPK
+# (CTR texture package) at file offset 0x80; texturehud.bctex holds one 512x256 RGBA8 texture (PICA200 8x8
+# Morton tiles, bytes A,B,G,R, first tile row = top of the image). The rects are the game's own sprite-sheet
+# entries (gui/scripts/sprites_texturehud.lc: UPixelOffset/VPixelOffset/UPixelScale/VPixelScale), in pixels
+# from the top-left of that image.
+
+# --- game state -------------------------------------------------------------------------------------------
+# 0x76f314: the GameManager. +0xfc: reference to the player entity (null on the title, file select and
+# intro story; the entity then survives area changes). +0x1840: 1 while the pause/map menu is open.
+value player = u32 0x76f314 > 0xfc
+value paused = u8 0x76f314 > 0x1840
+
+# Player entity (ref +8) -> component array (+0x44): [7] SPECIALENERGY, [9] ABILITY, [14] LIFE.
+value energy = f32 0x76f314 > 0xfc > 0x8 > 0x44 > 0x38 > 0x38
+value energy_max = f32 0x76f314 > 0xfc > 0x8 > 0x44 > 0x38 > 0x34
+value aeion = f32 0x76f314 > 0xfc > 0x8 > 0x44 > 0x1c > 0x34
+value aeion_max = f32 0x76f314 > 0xfc > 0x8 > 0x44 > 0x1c > 0x30
+# The selected Aeion ability's class (its vtable), absent when none is selected yet:
+# 0x6d57f4 Scan Pulse, 0x6d47e0 Lightning Armor, 0x6d11f4 Beam Burst, 0x6d9bd0 Phase Drift.
+value ability = u32 0x76f314 > 0xfc > 0x8 > 0x44 > 0x24 > 0x48 > 0x0
+
+# The bottom-screen HUD object (GameManager +0x17fc: reference, +8: object) and the numbers it shows.
+value missiles = f32 0x76f314 > 0x17fc > 0x8 > 0x1c8
+value missiles_max = f32 0x76f314 > 0x17fc > 0x8 > 0x1d4
+value super_missiles = f32 0x76f314 > 0x17fc > 0x8 > 0x1f0
+value super_missiles_max = f32 0x76f314 > 0x17fc > 0x8 > 0x1fc
+value power_bombs = f32 0x76f314 > 0x17fc > 0x8 > 0x218
+value power_bombs_max = f32 0x76f314 > 0x17fc > 0x8 > 0x224
+value dna = f32 0x76f314 > 0x17fc > 0x8 > 0x350
+value metroids_left = f32 0x76f314 > 0x17fc > 0x8 > 0x3a4
+# HUD mode: 1 while the bottom screen shows the idle emblem (landing cutscene), 2 while the HUD is up.
+value hud_mode = u32 0x76f314 > 0x17fc > 0x8 > 0x134
+
+# --- screens ----------------------------------------------------------------------------------------------
+focus bottom when player != 0 and paused == 1
+focus top when player != 0
+# title, file select (touch list), intro story (pictures on top, text below)
+focus both when player == 0
+
+# --- HUD --------------------------------------------------------------------------------------------------
+hud when player != 0 and paused == 0 and hud_mode == 2
+
+icon energy_tank /gui/textures/texturehud.bctex rect 244 122 14 21
+icon missile /gui/textures/texturehud.bctex rect 494 89 8 11 scale 1.5
+icon super_missile /gui/textures/texturehud.bctex rect 499 78 13 11 scale 1.5
+icon power_bomb /gui/textures/texturehud.bctex rect 498 67 12 11 scale 1.5
+icon aeion /gui/textures/texturehud.bctex rect 176 0 17 13
+icon scan_pulse /gui/textures/texturehud.bctex rect 411 61 15 15
+icon lightning_armor /gui/textures/texturehud.bctex rect 411 109 15 15
+icon beam_burst /gui/textures/texturehud.bctex rect 411 77 15 15
+icon phase_drift /gui/textures/texturehud.bctex rect 411 93 15 15
+icon dna /gui/textures/texturehud.bctex rect 135 146 15 18
+icon metroid /gui/textures/texturehud.bctex rect 214 143 20 22
+
+counter energy_tank energy at 4 4
+counter missile missiles at 64 8
+counter super_missile super_missiles at 114 8 when super_missiles_max > 0
+counter power_bomb power_bombs at 166 8 when power_bombs_max > 0
+pick ability at 4 30 0x6d57f4=scan_pulse 0x6d47e0=lightning_armor 0x6d11f4=beam_burst 0x6d9bd0=phase_drift
+counter aeion aeion at 24 31 when ability > 0
+counter dna dna at -62 4
+counter metroid metroids_left at -62 26

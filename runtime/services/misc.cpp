@@ -305,7 +305,7 @@ void register_misc() {
     register_service(std::make_shared<Ir>("ir:USER"));
     register_service(std::make_shared<Ir>("ir:u"));
     register_service(std::make_shared<Y2r>("y2r:u"));
-    for (const char *n : {"news:u", "cam:u", "ldr:ro", "soc:U", "ssl:C", "http:C", "nwm::UDS", "dlp:FKCL", "dlp:SRVR",
+    for (const char *n : {"news:u", "cam:u", "soc:U", "ssl:C", "http:C", "nwm::UDS", "dlp:FKCL", "dlp:SRVR",
                           "pxi:dev", "act:u", "am:app", "nim:aoc", "qtm:u", "csnd:SND"})
         register_service(std::make_shared<Generic>(n));
 }
@@ -318,6 +318,7 @@ void register_all_services() {
     register_hid();
     register_dsp();
     register_misc();
+    register_ro();
 }
 
 // ---- shared system font (APT GetSharedFont): the BCFNT from system archive 0004009B00014002, LZ11-decompressed

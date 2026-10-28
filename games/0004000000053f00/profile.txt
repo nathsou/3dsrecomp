@@ -1,0 +1,55 @@
+# Super Mario 3D Land (EUR 0004000000053f00): screen focus rules and a top-screen HUD.
+# Every value hangs off the global at 0x3e23c4 (the game's system object). Its chain
+# > 0x14 > 0x1c > 0x90 > 0x1b0 is the game-data holder; from there
+#   > 0x24  the current play state (stage name, stage id, coins, stock item, star coins)
+#   > 0x20  the save-file table ([+4] = 3 file records of 0x60 bytes, [+8] = current file index)
+
+# play state
+value stage = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0x20  # stage name (char *): 0 on the world map and in cutscenes, 0x3ae764 ("TitleStage") on the title / file select
+value stageid = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0x24  # -1 on the world map, 1 in World 1-1
+value coins = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0  # coins collected in this level (the game's top-screen counter)
+value item = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 8  # stock item in a level: 0 none 1 mushroom 2 fire flower 3 leaf 4 statue leaf 5 boomerang flower 6 P-wing
+# star coins: byte +0xc+i = coin i taken in this life, byte +0xf+i = coin i kept by a checkpoint (either one: collected)
+value starcoin0 = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xc  # bit 0: +0xc, bit 24: +0xf
+value starcoin1 = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xd  # bit 0: +0xd, bit 24: +0x10
+value starcoin2 = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xe  # bit 0: +0xe, bit 24: +0x11
+# save file
+value file = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 8  # current file: 0 A, 1 B, 2 C
+value livesA = s16 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0x3e
+value livesB = s16 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0x9e
+value livesC = s16 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0xfe
+# scenes
+value mapgone = u32 0x3e23c4 > 0x5c  # 0 on the world map (non-zero on the title, in cutscenes and in levels)
+value paused = u32 0x3e23c4 > 0x50 > 0x1c > 0x30  # 1 while a level's pause menu (on the bottom screen) is open
+
+focus bottom when stage == 0x3ae764                 # title "Press A", file select, first-boot dialogs
+focus bottom when stage != 0 and paused == 1        # pause menu: Continue / Select Course / Quit
+focus top when stage != 0                           # in a level (also Toad houses)
+focus both when stage == 0 and mapgone == 0         # world map: 3D map on top, course list on the bottom
+
+hud when stage != 0 and stage != 0x3ae764
+
+# icons: PictureFont20.bcfnt holds the bottom-screen HUD pictures as font glyphs (4 sheets of 32x256 RGBA4,
+# one 30x31 cell every 32 pixels); rects are in the sheets stacked vertically (sheet i at y = 256 i)
+icon starcoin /LocalizedData/EuEnglish/LayoutData/Font.szs:PictureFont20.bcfnt rect 0 480 30 31 scale 0.8
+icon nostarcoin /LocalizedData/EuEnglish/LayoutData/Font.szs:PictureFont20.bcfnt rect 0 512 30 31 scale 0.8
+icon mario /LocalizedData/EuEnglish/LayoutData/Font.szs:PictureFont20.bcfnt rect 0 544 30 31 scale 0.8
+icon pwing /LocalizedData/EuEnglish/LayoutData/Font.szs:PictureFont20.bcfnt rect 0 672 30 31
+icon leaf /LocalizedData/EuEnglish/LayoutData/Font.szs:PictureFont20.bcfnt rect 0 704 30 31
+icon fireflower /LocalizedData/EuEnglish/LayoutData/Font.szs:PictureFont20.bcfnt rect 0 736 30 31
+icon mushroom /LayoutData/CameraMenu.szs:timg/MyItemIcon.bclim scale 0.5
+
+# top-centre row, between the game's coin counter (top left) and timer (top right)
+pick item at 112 2 1=mushroom 2=fireflower 3=leaf 4=leaf 6=pwing
+show starcoin at 150 4 when starcoin0 & 0x01000001
+show nostarcoin at 150 4 when starcoin0 !& 0x01000001
+show starcoin at 176 4 when starcoin1 & 0x01000001
+show nostarcoin at 176 4 when starcoin1 !& 0x01000001
+show starcoin at 202 4 when starcoin2 & 0x01000001
+show nostarcoin at 202 4 when starcoin2 !& 0x01000001
+counter mario livesA at 234 4 when file == 0
+counter mario livesB at 234 4 when file == 1
+counter mario livesC at 234 4 when file == 2
+
+# the stock item button in the middle of the bottom screen
+button tap 160 128 when stage != 0 and stage != 0x3ae764 and item > 0

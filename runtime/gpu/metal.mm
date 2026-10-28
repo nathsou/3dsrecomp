@@ -21,6 +21,7 @@
 #include <unordered_map>
 
 #include "gpu/pica.h"
+#include "gpu/texfilter.h"
 #include "loader.h"
 
 extern std::string g_save_base;
@@ -384,6 +385,7 @@ struct GRT {
     bool synced = false;     // GPU copy corresponds to guest memory as hashed below
     u64 hash = 0;
     bool gpu_newer = false;  // depth/stencil changes not yet written to guest memory
+    u32 skipped = 0;         // draws left out since its last display transfer (pipelines still compiling)
 };
 std::vector<std::unique_ptr<GRT>> rts;
 
@@ -583,8 +585,25 @@ void wait_cb(id<MTLCommandBuffer> cb, const char *why, u32 addr) {
     if (t > 0.05) LOG("gpu metal: waited %.2f ms for the GPU (%s %08x)\n", t, why, addr);
 }
 
+// Before writing a target back: the guest memory must still hold what it held when the GPU copy took over. A
+// game that freed a target and reused its memory (heap objects, other buffers) has written it since, and on the
+// 3DS those later CPU writes land on top of what the GPU drew: the guest's bytes win, the GPU copy is dropped.
+bool guest_kept(GRT &r) {
+    if (hash_bytes(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
+    static int logged;
+    if (logged < 8 || g_stats) {
+        logged++;
+        LOG("gpu metal: %s target %08x (%ux%u) was rewritten by the game since it was drawn; not written back\n",
+            r.depth ? "depth" : "colour", r.addr, r.w, r.h);
+    }
+    r.gpu_newer = false;
+    r.synced = false;
+    return false;
+}
+
 // write a colour target's GPU contents back to guest memory (box-filtered to 1x)
 void write_back_color(GRT &r) {
+    if (!guest_kept(r)) return;
     ensure_buffer(stage_color, (size_t)r.w * r.h * 4);
     id<MTLCommandBuffer> cb = new_cb();
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -605,6 +624,7 @@ void write_back_color(GRT &r) {
 
 // write a depth target's GPU contents back to guest memory (top-left sample of each pixel)
 void write_back_depth(GRT &r) {
+    if (!guest_kept(r)) return;
     const u32 W = r.w * S, H = r.h * S;
     ensure_buffer(stage_depth, (size_t)W * H * 4);
     ensure_buffer(stage_stencil, (size_t)W * H);
@@ -642,23 +662,301 @@ void write_back_depth(GRT &r) {
 }
 
 // ---------------------------------------------------------------- textures and samplers
+// Decoded textures as Metal textures, by guest address and layout. With a texture filter (set_texture_filter,
+// GPU_TEX_FILTER) the 2D textures the game samples are upscaled once per decoded content by compute kernels
+// (gpu/texfilter.mm): level 0 is the upscaled image, the next levels down to the original size are reduced from
+// it, and the game's own levels follow (its level l is level l + ul), so get_sampler shifts the LOD clamps.
 struct MTex {
     u64 hash = 0;
     id<MTLTexture> tex;
+    int req = 0;               // texture filter requested when it was made (0: none)
+    u32 ul = 0;                // log2 of the upscale factor (0: not upscaled)
+    u32 wraps = 0;             // wrap modes of the neighbourhood it was upscaled with
+    size_t bytes = 0;          // GPU memory of an upscaled texture (with src and mid)
+    u64 last_use = 0;          // flush_no
+    u32 changes = 0;           // content changes seen
+    u64 win_start = 0;         // complete re-upscales since win_start (flush_no): textures the game keeps
+    u32 win_changes = 0;       // rewriting completely (video) are no longer upscaled
+    // A texture the game has rewritten (animated tiles in an atlas) keeps what its upscaled image was made
+    // from, so that the next updates only redo the 8x8 tiles that changed.
+    id<MTLTexture> src, mid;   // level 0 as decoded; the sharp filter's 2x image (at 4x)
+    std::vector<u32> prev;     // level 0 as decoded (CPU copy, compared with the new contents)
 };
 std::unordered_map<std::string, MTex> tex_cache;
+std::atomic<int> want_filter{0};  // set_texture_filter (any thread), applied by the GX thread at the next flush
+int tf_mode = 0;
+u64 flush_no = 0;
+size_t tf_bytes = 0;                      // upscaled textures' memory
+constexpr size_t kTfBudget = 512u << 20;  // beyond: least recently used ones evicted, else no more upscaling
+id<MTLCommandBuffer> tf_cb;               // this flush's upscaling work, committed before its draws
+u32 st_uploads = 0, st_upscaled = 0, st_partial = 0, st_tiles = 0;  // RECOMP_STATS
+double st_upload_ms = 0, st_upscale_ms = 0, st_upscale_gpu = 0;      // st_upscale_gpu: under busy_mtx
 
-id<MTLTexture> get_texture(const TexEntry *e) {
+// Guest memory holding GPU output (render targets, or transfer / copy outputs made from them, as long as the
+// bytes are unchanged): render-to-texture, not upscaled. Only tracked while a texture filter is on.
+struct GpuOut {
+    u32 addr, size;
+    u64 hash;
+};
+std::deque<GpuOut> gpu_outs;
+bool gpu_made(u32 addr, u32 size) {
+    auto ov = [](u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; };
+    for (auto &r : rts)
+        if (ov(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_bytes(pptr(r->addr), rt_bytes(*r)) == r->hash))
+            return true;
+    for (const GpuOut &g : gpu_outs)
+        if (ov(g.addr, g.size, addr, size) && hash_bytes(pptr(g.addr), g.size) == g.hash) return true;
+    return false;
+}
+void note_gpu_out(u32 addr, u32 size) {
+    if (!pptr(addr) || !pptr(addr + size - 1)) return;
+    for (auto it = gpu_outs.begin(); it != gpu_outs.end(); ++it)
+        if (it->addr == addr) {
+            gpu_outs.erase(it);
+            break;
+        }
+    gpu_outs.push_back({addr, size, hash_bytes(pptr(addr), size)});
+    if (gpu_outs.size() > 64) gpu_outs.pop_front();
+}
+
+// upscale factor of a texture (0: not upscaled): 4x at internal scales above 2, else 2x, up to 1024x1024;
+// never lookup / gradient tables (thin or tiny) or HILO8 (vectors, not colours)
+u32 tf_factor(const TexEntry *e) {
+    const u32 w = e->w, h = e->h, n = w * h;
+    if (e->fmt == 6 || n < 256 || w >= 8 * h || h >= 8 * w || n > 1024 * 1024) return 0;
+    return S > 2 ? 4 : 2;
+}
+u32 tf_wrap(u32 wrap) { return wrap == 2 || wrap == 6 || wrap == 7 ? 1 : wrap == 3 ? 2 : 0; }
+
+void tf_drop_all() {
+    tex_cache.clear();
+    tf_bytes = 0;
+}
+
+void tf_cb_begin() {
+    if (tf_cb) return;
+    tf_cb = new_cb();
+    if (log_timing)
+        [tf_cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+            std::lock_guard<std::mutex> lk(busy_mtx);
+            st_upscale_gpu += c.GPUEndTime - c.GPUStartTime;
+        }];
+}
+
+// The 8x8 tiles of an image (w x h texels) that differ between prev and cur, grown by one tile (the filters
+// read up to 3 texels around: tiles next to a changed one change too; across the edges when the texture
+// repeats), one rectangle per tile in rc (the kernels dispatch a grid of the largest one per rectangle);
+// copies them from cur to prev. Returns the number of tiles.
+u32 changed_tiles(std::vector<u32> &prev, const std::vector<u32> &cur, u32 w, u32 h, u32 wraps,
+                  std::vector<TfRect> &rc) {
+    const u32 tw = w / 8, th = h / 8;
+    std::vector<u8> d((size_t)tw * th), g((size_t)tw * th);
+    bool any = false;
+    for (u32 ty = 0; ty < th; ty++)
+        for (u32 tx = 0; tx < tw; tx++)
+            for (u32 y = 0; y < 8; y++) {
+                const size_t o = (size_t)(ty * 8 + y) * w + tx * 8;
+                if (memcmp(&prev[o], &cur[o], 32)) {
+                    d[ty * tw + tx] = 1;
+                    any = true;
+                    break;
+                }
+            }
+    if (!any) return 0;
+    const bool rs = (wraps & 3) == 1, rt = (wraps >> 2) == 1;
+    for (u32 ty = 0; ty < th; ty++)
+        for (u32 tx = 0; tx < tw; tx++) {
+            if (!d[ty * tw + tx]) continue;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int x = (int)tx + dx, y = (int)ty + dy;
+                    if (x < 0 || x >= (int)tw) {
+                        if (!rs) continue;
+                        x = (x + tw) % tw;
+                    }
+                    if (y < 0 || y >= (int)th) {
+                        if (!rt) continue;
+                        y = (y + th) % th;
+                    }
+                    g[y * tw + x] = 1;
+                }
+        }
+    u32 n = 0;
+    for (u32 ty = 0; ty < th; ty++)
+        for (u32 tx = 0; tx < tw;) {
+            if (!g[ty * tw + tx]) {
+                tx++;
+                continue;
+            }
+            u32 e = tx;
+            while (e < tw && g[ty * tw + e]) e++;
+            for (u32 x = tx; x < e; x++) rc.push_back({x * 8, ty * 8, 8, 8});
+            for (u32 y = 0; y < 8; y++) {
+                const size_t o = (size_t)(ty * 8 + y) * w + tx * 8;
+                memcpy(&prev[o], &cur[o], (e - tx) * 32);
+            }
+            n += e - tx;
+            tx = e;
+        }
+    return n;
+}
+
+// up: the unit sampling it, if it may be upscaled (2D / projected textures); *ul: log2 of the upscale factor
+id<MTLTexture> get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 *ul = nullptr) {
+    if (ul) *ul = 0;
     if (!e || e->lv.empty() || e->lv[0].data.empty()) return nil;
     char key[64];
     snprintf(key, sizeof key, "%08x:%u:%u:%u:%u", e->addr, e->w, e->h, e->fmt, e->levels);
     MTex &m = tex_cache[key];
-    if (m.tex && m.hash == e->hash) return m.tex;
+    const int want = up ? tf_mode : 0;
+    if (m.tex && m.hash == e->hash && m.req == want) {
+        m.last_use = flush_no;
+        if (ul) *ul = m.ul;
+        return m.tex;
+    }
+    const double t0 = log_timing ? now_ms() : 0;
+    const bool changed = m.tex && m.hash != e->hash;
+    if (changed) m.changes++;
+    m.last_use = flush_no;
     u32 nl = 0;
     while (nl < e->lv.size() && !e->lv[nl].data.empty() && e->lv[nl].w >= 1) nl++;
+    u32 f = want ? tf_factor(e) : 0;
+    const u32 u = f == 4 ? 2 : f == 2 ? 1 : 0;
+    const u32 wraps = up ? tf_wrap(up->wrap_s) | tf_wrap(up->wrap_t) << 2 : 0;
+    const u32 w = e->w, h = e->h;
+
+    // an upscaled texture of which only some tiles changed: redo those
+    if (changed && f && m.req == want && m.ul == u && m.wraps == wraps && m.src && nl == 1 && m.prev.size() == (size_t)w * h) {
+        std::vector<TfRect> rc;
+        const u32 nt = changed_tiles(m.prev, e->lv[0].data, w, h, wraps, rc);
+        if (nt * 2 <= (w / 8) * (h / 8)) {
+            if (nt) {
+                tf_cb_begin();
+                size_t total = 0;
+                for (const TfRect &r : rc) total += (size_t)r.w * r.h * 4;
+                id<MTLBuffer> sb = pool_get(total, tf_cb);
+                id<MTLBlitCommandEncoder> be = [tf_cb blitCommandEncoder];
+                size_t off = 0;
+                for (const TfRect &r : rc) {
+                    u8 *dp = (u8 *)sb.contents + off;
+                    for (u32 y = 0; y < r.h; y++)
+                        memcpy(dp + (size_t)y * r.w * 4, &e->lv[0].data[(size_t)(r.y + y) * w + r.x], r.w * 4);
+                    [be copyFromBuffer:sb sourceOffset:off sourceBytesPerRow:r.w * 4 sourceBytesPerImage:(size_t)r.w * r.h * 4
+                            sourceSize:MTLSizeMake(r.w, r.h, 1) toTexture:m.src destinationSlice:0 destinationLevel:0
+                     destinationOrigin:MTLOriginMake(r.x, r.y, 0)];
+                    off += (size_t)r.w * r.h * 4;
+                }
+                [be endEncoding];
+                texfilter_encode(dev, tf_cb, tf_mode, m.src, m.tex, m.mid, f, wraps & 3, wraps >> 2, rc.data(), (u32)rc.size());
+                be = [tf_cb blitCommandEncoder];
+                for (const TfRect &r : rc)  // the game's level 0
+                    [be copyFromTexture:m.src sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(r.x, r.y, 0)
+                             sourceSize:MTLSizeMake(r.w, r.h, 1) toTexture:m.tex destinationSlice:0 destinationLevel:u
+                      destinationOrigin:MTLOriginMake(r.x, r.y, 0)];
+                [be endEncoding];
+            }
+            m.hash = e->hash;
+            if (ul) *ul = u;
+            if (log_timing) {
+                st_partial++;
+                st_tiles += nt;
+                st_upscale_ms += now_ms() - t0;
+            }
+            return m.tex;
+        }
+    }
+
+    if (changed) {
+        if (flush_no - m.win_start > 600) {
+            m.win_start = flush_no;
+            m.win_changes = 0;
+        }
+        m.win_changes++;
+    }
+    tf_bytes -= m.bytes;
+    m.bytes = 0;
+    m.ul = 0;
+    m.req = want;
+    m.wraps = wraps;
+    m.hash = e->hash;
+    m.src = m.mid = nil;
+    m.prev.clear();
+    m.prev.shrink_to_fit();
+    if (f && (m.win_changes > 6 || gpu_made(e->addr, e->size))) f = 0;
+    // rewritten before: keep what partial updates need
+    const bool keep = f && m.changes > 0 && nl == 1;
+    size_t bytes = 0;
+    for (u32 l = 0; l < nl + u; l++) bytes += (size_t)std::max(1u, (w * f) >> l) * std::max(1u, (h * f) >> l) * 4;
+    if (keep) bytes += (size_t)w * h * 4 * (tf_mode == kTexFilterSharp && f == 4 ? 5 : 1);
+    if (f && tf_bytes + bytes > kTfBudget) {
+        for (auto it = tex_cache.begin(); it != tex_cache.end();)
+            if (it->second.bytes && it->second.last_use + 120 < flush_no) {
+                tf_bytes -= it->second.bytes;
+                it = tex_cache.erase(it);
+            } else {
+                ++it;
+            }
+        if (tf_bytes + bytes > kTfBudget) f = 0;
+    }
+    if (f) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                     width:w * f
+                                                                                    height:h * f
+                                                                                 mipmapped:YES];
+        d.mipmapLevelCount = nl + u;
+        d.storageMode = MTLStorageModePrivate;  // GPU layout: these are large, sampled a lot
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        id<MTLTexture> t = [dev newTextureWithDescriptor:d];
+        // the decoded texture, upscaled from and copied below the upscaled levels
+        MTLTextureDescriptor *sd = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                      width:w
+                                                                                     height:h
+                                                                                  mipmapped:nl > 1];
+        if (nl > 1) sd.mipmapLevelCount = nl;
+        sd.storageMode = MTLStorageModeShared;
+        sd.usage = MTLTextureUsageShaderRead;
+        id<MTLTexture> src = [dev newTextureWithDescriptor:sd];
+        for (u32 l = 0; l < nl; l++) {
+            const TexImage &im = e->lv[l];
+            if (!im.w || !im.h) continue;
+            [src replaceRegion:MTLRegionMake2D(0, 0, im.w, im.h) mipmapLevel:l withBytes:im.data.data()
+                   bytesPerRow:im.w * 4];
+        }
+        id<MTLTexture> mid = keep && tf_mode == kTexFilterSharp && f == 4 ? texfilter_new_mid(dev, w, h) : nil;
+        tf_cb_begin();
+        if (t && src && texfilter_encode(dev, tf_cb, tf_mode, src, t, mid, f, wraps & 3, wraps >> 2)) {
+            id<MTLBlitCommandEncoder> be = [tf_cb blitCommandEncoder];
+            for (u32 l = 0; l < nl; l++) {
+                const TexImage &im = e->lv[l];
+                if (!im.w || !im.h) continue;
+                [be copyFromTexture:src sourceSlice:0 sourceLevel:l sourceOrigin:MTLOriginMake(0, 0, 0)
+                         sourceSize:MTLSizeMake(im.w, im.h, 1) toTexture:t destinationSlice:0 destinationLevel:l + u
+                  destinationOrigin:MTLOriginMake(0, 0, 0)];
+            }
+            [be endEncoding];
+            m.tex = t;
+            m.ul = u;
+            m.bytes = bytes;
+            tf_bytes += bytes;
+            if (keep) {
+                m.src = src;
+                m.mid = mid;
+                m.prev = e->lv[0].data;
+            }
+            if (ul) *ul = u;
+            if (log_timing) {
+                st_upscaled++;
+                st_upscale_ms += now_ms() - t0;
+            }
+            return m.tex;
+        }
+        want_filter = tf_mode = 0;  // no kernels: filter off
+        m.req = 0;
+        m.bytes = 0;
+    }
     MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
-                                                                                 width:e->w
-                                                                                height:e->h
+                                                                                 width:w
+                                                                                height:h
                                                                              mipmapped:nl > 1];
     if (nl > 1) d.mipmapLevelCount = nl;
     d.storageMode = MTLStorageModeShared;
@@ -669,7 +967,10 @@ id<MTLTexture> get_texture(const TexEntry *e) {
         [m.tex replaceRegion:MTLRegionMake2D(0, 0, im.w, im.h) mipmapLevel:l withBytes:im.data.data()
                  bytesPerRow:im.w * 4];
     }
-    m.hash = e->hash;
+    if (log_timing) {
+        st_uploads++;
+        st_upload_ms += now_ms() - t0;
+    }
     return m.tex;
 }
 
@@ -683,23 +984,34 @@ MTLSamplerAddressMode addr_mode(u32 wrap) {
     default: return MTLSamplerAddressModeClampToEdge;  // border modes are emulated in the shader
     }
 }
-id<MTLSamplerState> get_sampler(const TexUnitState &tu, u32 levels) {
-    const u64 key = (u64)aniso << 22 | (u64)tu.mag_linear | (u64)tu.min_linear << 1 | (u64)tu.mip_linear << 2 | (u64)tu.wrap_s << 3 |
+// ul: log2 of the texture's upscale factor (its first ul levels come before the game's level 0)
+id<MTLSamplerState> get_sampler(const TexUnitState &tu, u32 levels, u32 ul = 0) {
+    const u64 key = (u64)ul << 28 | (u64)aniso << 22 | (u64)tu.mag_linear | (u64)tu.min_linear << 1 | (u64)tu.mip_linear << 2 | (u64)tu.wrap_s << 3 |
                     (u64)tu.wrap_t << 6 | (u64)levels << 9 | (u64)(tu.min_level & 15) << 14 |
                     (u64)(tu.max_level & 15) << 18;
     auto it = sampler_cache.find(key);
     if (it != sampler_cache.end()) return it->second;
+    const u32 glevels = levels - ul;  // the game's
     MTLSamplerDescriptor *d = [MTLSamplerDescriptor new];
     d.magFilter = tu.mag_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
     d.minFilter = tu.min_linear ? MTLSamplerMinMagFilterLinear : MTLSamplerMinMagFilterNearest;
-    d.mipFilter = levels > 1 ? (tu.mip_linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest)
-                             : MTLSamplerMipFilterNotMipmapped;
+    d.mipFilter = glevels > 1 ? (tu.mip_linear ? MTLSamplerMipFilterLinear : MTLSamplerMipFilterNearest)
+                              : MTLSamplerMipFilterNotMipmapped;
+    d.lodMinClamp = (float)tu.min_level;
+    d.lodMaxClamp = glevels > 1 ? (float)std::max(tu.min_level, tu.max_level) : 0.0f;
+    if (ul) {
+        // upscaled: what the game magnifies may now be minified (LOD 0..ul), so the minification filter follows
+        // the magnification one; the game's levels moved down by ul
+        if (tu.mag_linear) d.minFilter = MTLSamplerMinMagFilterLinear;
+        d.mipFilter = glevels > 1 && !tu.mip_linear ? MTLSamplerMipFilterNearest : MTLSamplerMipFilterLinear;
+        if (!tu.mag_linear && !tu.min_linear) d.mipFilter = MTLSamplerMipFilterNearest;
+        d.lodMinClamp = tu.min_level > 0 ? (float)(tu.min_level + ul) : 0.0f;
+        d.lodMaxClamp += (float)ul;
+    }
     d.sAddressMode = addr_mode(tu.wrap_s);
     d.tAddressMode = addr_mode(tu.wrap_t);
-    d.lodMinClamp = (float)tu.min_level;
-    d.lodMaxClamp = levels > 1 ? (float)std::max(tu.min_level, tu.max_level) : 0.0f;
     // anisotropic filtering where the game asked for linear minification of a mipmapped texture
-    if (aniso > 1 && tu.min_linear && levels > 1) d.maxAnisotropy = aniso;
+    if (aniso > 1 && tu.min_linear && glevels > 1) d.maxAnisotropy = aniso;
     id<MTLSamplerState> s = [dev newSamplerStateWithDescriptor:d];
     sampler_cache[key] = s;
     return s;
@@ -1150,7 +1462,8 @@ std::string gen_fs(const DrawState &ds) {
 // shipped list's fragment shaders ahead of time into shaders.metallib (functions named after a hash of
 // their MSL source, so a stale library is never used for a changed generator), and all known pipelines are
 // created on background threads at startup. A pipeline never seen before is compiled in the background
-// and its draws are skipped until it is ready (GPU_SYNC_SHADERS=1 compiles it on the spot instead).
+// and its draws are skipped until it is ready (GPU_SYNC_SHADERS=1 compiles it on the spot instead); the screen
+// keeps the previous image while a frame lacks draws.
 constexpr u32 kKeyMagic = 0x59454B50;  // "PKEY"
 constexpr u32 kKeyVersion = 1;         // bump when fs_key() changes
 
@@ -1827,6 +2140,9 @@ id<MTLDepthStencilState> get_dss(const DrawState &ds) {
 // ---------------------------------------------------------------- display images
 struct DisplayImage {
     u32 out_addr = 0, out_size = 0;
+    u32 out_w = 0, out_bpp = 0, hs = 0, vs = 0;  // output rows' pixels and bytes per pixel; downscaling shifts
+    u32 scale = 1;                               // internal scale the image was made at
+    bool incomplete = false;                     // some draws were left out (the screen keeps the last image)
     u64 out_hash = 0;  // guest framebuffer bytes the image corresponds to
     int screen = -1;
     u32 w = 0, h = 0;
@@ -1884,7 +2200,7 @@ void finalize(PendingXfer &op) {
     const u32 nb = rt_bytes(r);
     xfer_scratch.resize(nb);
     linear_to_guest_color(r, (const u32 *)op.lin.contents, xfer_scratch.data());
-    if (op.rt_writeback) {
+    if (op.rt_writeback && guest_kept(r)) {
         memcpy(pptr(r.addr), xfer_scratch.data(), nb);
         r.hash = hash_bytes(xfer_scratch.data(), nb);
     }
@@ -1892,6 +2208,7 @@ void finalize(PendingXfer &op) {
                      op.flags);
     texcache_invalidate(op.out_paddr, op.out_size);
     rts_overwritten(op.out_paddr, op.out_size);
+    if (tf_mode) note_gpu_out(op.out_paddr, op.out_size);
     lin_free.push_back(op.lin);
     std::lock_guard<std::mutex> lk(disp_mtx);
     auto it = displays.find(op.out_paddr);
@@ -1990,6 +2307,7 @@ bool metal_init() {
     dump_shaders = getenv("GPU_DUMP_SHADERS") != nullptr;
     eager_writeback = getenv("GPU_METAL_EAGER") != nullptr;
     log_timing = getenv("RECOMP_STATS") != nullptr;
+    if (const char *tf = getenv("GPU_TEX_FILTER")) set_texture_filter(atoi(tf));
     active = true;
     LOG("gpu: Metal backend on %s, internal scale %s%u, MSAA %ux, anisotropic filtering %ux\n", dev.name.UTF8String,
         scale_fixed ? "" : "auto, now ", S, MS, aniso);
@@ -2079,6 +2397,7 @@ void apply_scale(u32 ns) {
         disp_free.clear();  // display image buffers of the old size
     }
     LOG("gpu metal: internal scale %u -> %u\n", S, ns);
+    if (tf_mode && (S > 2) != (ns > 2)) tf_drop_all();  // upscale factors follow the scale (tf_factor)
     S = ns;
 }
 }  // namespace
@@ -2087,6 +2406,17 @@ void set_scale(int s) { want_scale = (u32)std::clamp(s, 1, 4); }
 int scale() { return active ? (int)(want_scale.load() ? want_scale.load() : S) : 0; }
 bool scale_is_auto() { return active && !scale_fixed; }
 float busy() { return active ? busy_frac.load() : 0; }
+
+void set_texture_filter(int mode) { want_filter = std::clamp(mode, 0, (int)kTexFilterCount - 1); }
+int texture_filter_count() { return kTexFilterCount; }
+const char *texture_filter_name(int mode) {
+    static const char *const names[kTexFilterCount] = {"Off", "Sharp", "Smooth"};
+    return mode >= 0 && mode < kTexFilterCount ? names[mode] : "?";
+}
+bool metal_gpu_made(u32 paddr, u32 size) { return active && tf_mode && size && gpu_made(paddr, size); }
+void metal_note_gpu_output(u32 paddr, u32 size) {
+    if (active && tf_mode && size) note_gpu_out(paddr, size);
+}
 
 void metal_flush(const RTConfig &rt, const MBatch &mb) {
     if (!active || mb.empty() || !rt.color_addr || !pptr(rt.color_addr)) return;
@@ -2098,6 +2428,13 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
     const double t0 = g_stats ? now_ms() : 0;
     flushes++;
     if (const u32 ws = want_scale.load(); ws && ws != S) apply_scale(ws);
+    if (const int wf = want_filter.load(); wf != tf_mode) {
+        LOG("gpu metal: texture filter %s -> %s\n", texture_filter_name(tf_mode), texture_filter_name(wf));
+        tf_mode = wf;
+        tf_drop_all();
+        gpu_outs.clear();
+    }
+    flush_no++;
     @autoreleasepool {
         id<MTLCommandBuffer> cb = new_cb();
         GRT &col = get_rt(rt.color_addr, rt.w, rt.h, rt.color_fmt, false);
@@ -2258,7 +2595,10 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             const DrawState &ds = *seg.ds;
             if (ds.skip || ds.shadow_mode || ds.gas) continue;
             id<MTLRenderPipelineState> ps = get_pipeline(ds);
-            if (!ps) continue;
+            if (!ps) {
+                col.skipped++;
+                continue;
+            }
             if (ds.need_tex[3] && !warned_proctex) {
                 LOG("gpu metal: procedural textures are not supported (texture 3 reads as 0)\n");
                 warned_proctex = true;
@@ -2377,7 +2717,10 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                 for (int k = 0; k < 3; k++) {
                     const TexUnitState &t = ds.tex[k];
                     if (!ds.need_tex[k] || t.null_tex) continue;
-                    id<MTLTexture> tex = get_texture(t.face[0]);
+                    // upscaling (texture filter): 2D and projected textures only (not cube or shadow maps)
+                    const bool up = tf_mode && (k != 0 || t.type == 0 || t.type == 3);
+                    u32 ul = 0;
+                    id<MTLTexture> tex = get_texture(t.face[0], up ? &t : nullptr, &ul);
                     if (!tex) {
                         // missing texture data: bind a 1x1 black texture
                         static id<MTLTexture> black;
@@ -2391,7 +2734,10 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                         tex = black;
                     }
                     [re setFragmentTexture:tex atIndex:k];
-                    [re setFragmentSamplerState:get_sampler(t, (u32)tex.mipmapLevelCount) atIndex:k];
+                    [re setFragmentSamplerState:get_sampler(t, (u32)tex.mipmapLevelCount, ul) atIndex:k];
+                    // the LOD bias of a texture without mipmaps does nothing on the PICA (games leave any value);
+                    // upscaled, it has levels: no bias then, or a positive one would pick the original level
+                    if (ul && tex.mipmapLevelCount == ul + 1) u.bias[k] = 0;
                     if (k == 0 && (t.type == 1 || t.type == 4))
                         for (int f = 1; f < 6; f++) {
                             id<MTLTexture> ft = get_texture(t.face[f]);
@@ -2405,6 +2751,10 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         }
         [re endEncoding];
         const double t1 = g_stats ? now_ms() : 0;
+        if (tf_cb) {  // texture upscaling, before the draws that sample the results
+            [tf_cb commit];
+            tf_cb = nil;
+        }
         [cb commit];  // no wait: write-back happens when something reads the target
         if (wrote_color) col.gpu_newer = true;
         if (dep && wrote_depth) dep->gpu_newer = true;
@@ -2438,6 +2788,20 @@ void metal_poll() {
                     b * 1000 / ((t - last) / 1000), S, MS, (unsigned long long)flushes.exchange(0),
                     (unsigned long long)vs_passes.exchange(0), (unsigned long long)vs_dispatches.exchange(0),
                     (unsigned long long)vs_verts.exchange(0));
+            if (log_timing) {
+                double ug;
+                {
+                    std::lock_guard<std::mutex> lk(busy_mtx);
+                    ug = st_upscale_gpu;
+                    st_upscale_gpu = 0;
+                }
+                LOG("[gpu] textures: %u decoded in %.2f ms, %u uploaded in %.2f ms; filter %s: %u upscaled + %u updated "
+                    "(%u tiles) in %.2f ms (GPU %.2f ms), %zu MiB\n",
+                    g_tex_decodes, g_tex_decode_ms, st_uploads, st_upload_ms, texture_filter_name(tf_mode), st_upscaled,
+                    st_partial, st_tiles, st_upscale_ms, ug * 1000, tf_bytes >> 20);
+                g_tex_decodes = st_uploads = st_upscaled = st_partial = st_tiles = 0;
+                g_tex_decode_ms = st_upload_ms = st_upscale_ms = 0;
+            }
             last = t;
         }
     }
@@ -2544,7 +2908,8 @@ void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u3
 
 // new display image entry for out_paddr (lock held), replacing any image the output overlaps; the
 // buffers of finished images go back to disp_free (those of unfinished ones when they finish)
-DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_h0, u32 w, u32 h) {
+DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, u32 w, u32 h) {
+    const u32 out_h0 = out_dims >> 16;
     for (auto it = displays.begin(); it != displays.end();) {
         if (overlaps(it->second.out_addr, it->second.out_size, out_paddr, out_size)) {
             if (!it->second.cb && disp_free.size() < 6) disp_free.push_back(it->second.buf);
@@ -2558,6 +2923,11 @@ DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_h0, u32 w, u32 h)
     d.out_size = out_size;
     d.w = w;
     d.h = h;
+    d.hs = ((flags >> 24) & 3) ? 1 : 0;
+    d.vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
+    d.out_w = (out_dims & 0xffff) >> d.hs;
+    d.out_bpp = pixel_bytes((flags >> 12) & 7);
+    d.scale = S;
     d.version = ++disp_version;
     d.screen = out_h0 == 400 ? 0 : out_h0 == 320 ? 1 : -1;
     if (d.screen >= 0) last_screen_addr[d.screen] = out_paddr;
@@ -2603,9 +2973,11 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     op->out_size = out_size;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
-        DisplayImage &d = new_display(out_paddr, out_size, out_dims >> 16, rows, TW);
+        DisplayImage &d = new_display(out_paddr, out_size, out_dims, flags, rows, TW);
         d.cb = op->cb;
         d.buf = op->disp;
+        d.incomplete = src->skipped > 0;
+        src->skipped = 0;
     }
     pending.push_back(std::move(op));
     return true;
@@ -2642,36 +3014,87 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     const u32 hs = ((flags >> 24) & 3) ? 1 : 0, vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
     const u32 out_size = (out_w0 >> hs) * (out_h0 >> vs) * pixel_bytes((flags >> 12) & 7);
     std::lock_guard<std::mutex> lk(disp_mtx);
-    DisplayImage &d = new_display(out_paddr, out_size, out_h0, rows, TW);
+    DisplayImage &d = new_display(out_paddr, out_size, out_dims, flags, rows, TW);
     d.out_hash = hash_bytes(pptr(out_paddr), out_size);
     d.cb = nil;
     d.buf = buf;
+    d.incomplete = src->skipped > 0;
+    src->skipped = 0;
 }
 
-bool get_display_image_for(u32 fb_paddr, const u32 **rgba, int *w, int *h) {
+namespace {
+// The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes
+// apart) may start inside a display transfer's output, e.g. NSMB2 transfers 256x416 and shows rows 16 to 415.
+// The image's x runs along the output rows, its y backwards along each row's pixels. (disp_mtx held)
+struct DisplayView {
+    const DisplayImage *d = nullptr;
+    u32 x0 = 0, y0 = 0, w = 0, h = 0;
+    u64 key = 0;  // changes with the image or the part shown
+};
+bool find_view(u32 fb, u32 stride, u32 lines, DisplayView &v) {
+    for (const auto &[addr, d] : displays) {
+        if (fb < d.out_addr || fb >= d.out_addr + d.out_size) continue;
+        const u32 row_bytes = d.out_w * d.out_bpp;
+        if (!row_bytes || (stride && stride != row_bytes)) return false;
+        const u32 off = fb - d.out_addr, r0 = off / row_bytes, c0 = off % row_bytes / d.out_bpp;
+        const u32 fx = d.scale << d.vs, fy = d.scale << d.hs;  // image pixels per output row / pixel
+        if (c0 + 240 > d.out_w || (r0 + lines) * fx > d.w || (c0 + 240) * fy > d.h) return false;
+        v.d = &d;
+        v.x0 = r0 * fx;
+        v.w = lines * fx;
+        v.y0 = d.h - (c0 + 240) * fy;
+        v.h = 240 * fy;
+        v.key = d.version << 20 ^ off;
+        return true;
+    }
+    return false;
+}
+// calls fn with the view's pixels (rows of v.w), copied out of the image only when it is a part of it
+void with_view(const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
+    if (v.d->cb) [v.d->cb waitUntilCompleted];
+    const u32 *px = (const u32 *)v.d->buf.contents;
+    if (v.x0 == 0 && v.y0 == 0 && v.w == v.d->w && v.h == v.d->h) {
+        fn(px, (int)v.w, (int)v.h);
+        return;
+    }
+    thread_local std::vector<u32> part;
+    part.resize((size_t)v.w * v.h);
+    for (u32 y = 0; y < v.h; y++) memcpy(&part[(size_t)y * v.w], px + (size_t)(v.y0 + y) * v.d->w + v.x0, v.w * 4);
+    fn(part.data(), (int)v.w, (int)v.h);
+}
+}  // namespace
+
+bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h) {
     thread_local std::vector<u32> out;
     std::lock_guard<std::mutex> lk(disp_mtx);
-    auto it = displays.find(fb_paddr);
-    if (it == displays.end()) return false;
-    const DisplayImage &d = it->second;
-    if (d.cb) [d.cb waitUntilCompleted];
-    const u32 *px = (const u32 *)d.buf.contents;
-    out.assign(px, px + (size_t)d.w * d.h);
+    DisplayView v;
+    if (!find_view(fb_paddr, stride, lines, v)) return false;
+    with_view(v, [&](const u32 *px, int vw, int vh) {
+        out.assign(px, px + (size_t)vw * vh);
+        *w = vw;
+        *h = vh;
+    });
     *rgba = out.data();
-    *w = (int)d.w;
-    *h = (int)d.h;
     return true;
 }
 
-u64 use_display_image(u32 fb_paddr, u64 have, const std::function<void(const u32 *, int, int)> &fn) {
+u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
+                      const std::function<void(const u32 *, int, int)> &fn) {
     std::lock_guard<std::mutex> lk(disp_mtx);
-    auto it = displays.find(fb_paddr);
-    if (it == displays.end()) return 0;
-    const DisplayImage &d = it->second;
-    if (d.version == have) return have;
-    if (d.cb) [d.cb waitUntilCompleted];
-    fn((const u32 *)d.buf.contents, (int)d.w, (int)d.h);
-    return d.version;
+    DisplayView v;
+    if (!find_view(fb_paddr, stride, lines, v)) return 0;
+    if (v.key == have) return have;
+    // a frame drawn while new pipelines were compiling lacks those draws (often most of the scene: a flash of
+    // the clear colour); keep showing the last image instead, for a few frames at most
+    static int held[2];
+    int &h = held[lines == 400 ? 0 : 1];
+    if (v.d->incomplete && have && h < 6) {
+        h++;
+        return have;
+    }
+    h = 0;
+    with_view(v, fn);
+    return v.key;
 }
 
 bool get_display_image(int screen, const u32 **rgba, int *w, int *h) {
@@ -2681,7 +3104,7 @@ bool get_display_image(int screen, const u32 **rgba, int *w, int *h) {
         if (screen < 0 || screen > 1 || !last_screen_addr[screen]) return false;
         addr = last_screen_addr[screen];
     }
-    return get_display_image_for(addr, rgba, w, h);
+    return get_display_image_for(addr, 0, screen ? 320 : 400, rgba, w, h);
 }
 
 }  // namespace gpu

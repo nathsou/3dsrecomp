@@ -16,6 +16,7 @@ cp "$D/exheader.bin" "$D/code.bin" "$D/info.json" "$OUT/Contents/Resources/game/
 # shipped pipeline and vertex program lists and their precompiled shaders
 TID=$(python3 -c "import json;print(json.load(open('$D/info.json'))['program_id'])")
 [ -f "games/$TID/pipelines.bin" ] && cp "games/$TID/pipelines.bin" "$OUT/Contents/Resources/game/"
+[ -f "games/$TID/profile.txt" ] && cp "games/$TID/profile.txt" "$OUT/Contents/Resources/game/"
 [ -f "games/$TID/vsprograms.bin" ] && cp "games/$TID/vsprograms.bin" "$OUT/Contents/Resources/game/"
 [ -f "$B/shaders.metallib" ] && cp "$B/shaders.metallib" "$OUT/Contents/Resources/"
 # app icon from the game's SMDH

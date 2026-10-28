@@ -107,10 +107,12 @@ void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u3
     // from a render target the GPU is still drawing: finished asynchronously
     if (metal_defer_transfer(in_paddr, out_paddr, in_dims, out_dims, flags, out_w * out_h * obpp)) return;
     metal_guest_read(in_paddr, in_w * in_h * ibpp);
+    const bool from_gpu = metal_gpu_made(in_paddr, in_w * in_h * ibpp);
     metal_guest_prewrite(out_paddr, out_w * out_h * obpp);
     transfer_convert(src, dst, in_dims, out_dims, flags);
     texcache_invalidate(out_paddr, out_w * out_h * obpp);
     metal_guest_written(out_paddr, out_w * out_h * obpp);
+    if (from_gpu) metal_note_gpu_output(out_paddr, out_w * out_h * obpp);
     metal_display_transfer(in_paddr, out_paddr, in_dims, out_dims, flags);
 }
 
@@ -134,6 +136,7 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     if (!in_width || !out_width) return;
     const u32 out_total = size / out_width * (out_width + out_gap) + out_width;
     metal_guest_read(in_paddr, size / in_width * (in_width + in_gap) + in_width);
+    const bool from_gpu = metal_gpu_made(in_paddr, size / in_width * (in_width + in_gap) + in_width);
     metal_guest_prewrite(out_paddr, out_total);
     u32 ri = in_width, ro = out_width;
     while (remaining) {
@@ -155,6 +158,7 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     }
     texcache_invalidate(out_paddr, out_total);
     metal_guest_written(out_paddr, out_total);
+    if (from_gpu) metal_note_gpu_output(out_paddr, out_total);
 }
 
 }  // namespace gpu

@@ -20,6 +20,14 @@ struct Settings {
     bool show_fps = false;  // frame rate counter in the corner
     s64 clock_offset = 0;   // seconds added to the Mac's clock for the 3DS clock
     bool auto_backup = true;  // copy the save into backups/ at each launch (the last 5 are kept)
+    // single-screen layouts
+    int pip = 1;              // the other screen in a corner: 0 off, 1 while it changes, 2 always
+    int pip_corner = 0;       // 0 top right, 1 top left, 2 bottom right, 3 bottom left
+    int pip_x = -1, pip_y = -1;  // where it was dragged: its top left in thousandths of the window (-1: the corner)
+    int pip_size = 38;        // its height in percent of the window's
+    bool auto_focus = true;   // the game's profile picks the screen (e.g. the bottom one on world maps)
+    int hud = 1;              // the profile's HUD over the top screen: 0 off, 1 when the bottom screen is hidden, 2 always
+    int tex_filter = 0;       // texture upscaling (gpu::texture_filter_name)
 };
 
 extern Settings g_settings;

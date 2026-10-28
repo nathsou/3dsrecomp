@@ -1,0 +1,57 @@
+# New Super Mario Bros. 2 (USA, 000400000007ae00)
+
+# Current scene: the profile id of the running scene (the scene manager's "current" field; the u16 just before
+# it, 0x5ee930, is the pending request and reads 0xffff between transitions).
+#   4 StartUp (first-boot / system dialogs), 5 TitleMenu (title, solo/co-op, file select, options),
+#   6 OpeningDemo, 16 Course (a level), 17 CourseIn ("World 1-1 / lives" card), 18 CourseSelect (world map),
+#   19 GameOver; 7-15 Coin Rush, shop, StreetPass and error scenes.
+value scene = u16 0x5ee932
+
+# The play scene's game info (a heap object; the global pointer is null outside levels).
+value course = u32 0x5e61e8
+value lives = s32 0x5e61e8 > 0x80
+value coins = s32 0x5e61e8 > 0x8c          # 0-99 coin counter (already on the top screen)
+value score = s32 0x5e61e8 > 0xb4          # the score shown on the bottom screen
+value course_coins = s32 0x5e61e8 > 0x178  # coins collected in this attempt (bottom screen, next to "Best")
+value star0 = s8 0x5e61e8 > 0xb8           # star coins of this level: -1 not collected, else the player (0/1)
+value star1 = s8 0x5e61e8 > 0xb9
+value star2 = s8 0x5e61e8 > 0xba
+value item = u8 0x5e61e8 > 0xdf            # stored item, player 1: 9 none, 0 mushroom, 1 fire flower, 2 star,
+                                           # 4 mini mushroom, 6 leaf, 7 gold flower, 8 white leaf
+# The same game info kept between levels (copied back when a level ends; stale during a level).
+value saved_lives = s32 0x5e6130 > 0x34
+value saved_item = u8 0x5e6130 > 0x93
+
+focus bottom when scene == 4
+focus bottom when scene == 5
+focus top when scene == 6
+focus top when scene == 16
+focus top when scene == 17
+focus both when scene == 18
+
+hud when scene == 16 and course != 0
+
+icon mushroom /Layout/StockIcon.arc:timg/tt_Kinoko_00.bclim scale 0.5
+icon fireflower /Layout/StockIcon.arc:timg/tt_FireFlower_00.bclim scale 0.5
+icon star /Layout/StockIcon.arc:timg/ft_Star_00.bclim scale 0.5
+icon mini /Layout/StockIcon.arc:timg/tt_MameKinoko_00.bclim scale 0.5
+icon leaf /Layout/StockIcon.arc:timg/tt_Konoha_00.bclim scale 0.5
+icon goldflower /Layout/StockIcon.arc:timg/tt_GoldenFlower_00.bclim scale 0.5
+icon itembox /Layout/MapSceneTop.arc:timg/ft_StockItemBase_00.bclim
+icon starcoin /Layout/MapSceneTop.arc:timg/ft_StarCoinGet_00.bclim scale 0.75
+icon nostarcoin /Layout/MapSceneTop.arc:timg/ft_StarCoinNo_00.bclim scale 0.75
+icon mario /Layout/PlaySceneMarioIcon.arc:timg/tt_IconMario_00.bclim scale 0.75
+
+# The top screen already shows the coin counter (top left) and the timer (top right).
+show starcoin at 4 28 when star0 >= 0
+show nostarcoin at 4 28 when star0 < 0
+show starcoin at 28 28 when star1 >= 0
+show nostarcoin at 28 28 when star1 < 0
+show starcoin at 52 28 when star2 >= 0
+show nostarcoin at 52 28 when star2 < 0
+counter mario lives at -78 28
+show itembox at 180 2
+pick item at 184 6 0=mushroom 1=fireflower 2=star 3=mushroom 4=mini 5=mushroom 6=leaf 7=goldflower 8=leaf
+
+# The stored-item box on the bottom screen (x 192-304, y 92-202): a tap uses the item.
+button tap 248 146 when scene == 16 and course != 0

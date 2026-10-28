@@ -17,6 +17,7 @@ int g_verbose;
 static std::mutex log_mutex;
 static FILE *log_file;
 void (*g_fatal_hook)(const char *msg);
+void watch_report();
 
 u64 g_frame;
 
@@ -56,6 +57,7 @@ void rt_fatal(const char *fmt, ...) {
             fflush(log_file);
         }
     }
+    watch_report();  // (RECOMP_WATCH) who touched the watched page before the failure
     if (g_fatal_hook) g_fatal_hook(msg);
     _exit(1);
 }
@@ -193,6 +195,9 @@ static const GuestEntry *dispatch_miss(CPU *c) {
         fclose(f);
     }
     LOG("[lazy] no code at %08x (lr=%08x)\n", addr, c->r[14]);
+    if (addr < mem::CODE_BASE)  // a null (or near-null) function pointer: nothing to recompile
+        FATAL("jump to %08x (lr=%08x sp=%08x r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x)\n", addr, c->r[14], c->r[13],
+              c->r[0], c->r[1], c->r[2], c->r[3], c->r[4]);
     if (lazy_compile(addr) || ((addr & 1) && lazy_compile(addr & ~1u))) {
         if (auto e = lazy_lookup(addr)) return e;
     }

@@ -1,6 +1,8 @@
 // Kernel objects, scheduler and SVCs.
 #include "kernel.h"
 
+#include <dlfcn.h>
+#include <mach/mach.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -8,6 +10,7 @@
 #include <chrono>
 #include <set>
 
+#include "loader.h"
 #include "service.h"
 
 namespace kernel {
@@ -56,11 +59,30 @@ std::shared_ptr<Event> make_event(ResetType rt, const char *name) {
 }
 
 // ---------------------------------------------------------------- time
-u64 now_ns() {
+u64 real_ns() {
     return (u64)std::chrono::duration_cast<std::chrono::nanoseconds>(
                std::chrono::steady_clock::now().time_since_epoch())
         .count();
 }
+
+// The guest clock (timers, timeouts, the system tick): real time scaled by the game speed, so at any speed the
+// game sees as much time pass per VBlank as on the 3DS
+static std::mutex clock_m;
+static u64 clock_vbase, clock_rbase;  // guest and real time at the last speed change
+static u32 clock_pct = 100;
+
+u64 now_ns() {
+    std::lock_guard<std::mutex> lk(clock_m);
+    const u64 r = real_ns();
+    if (!clock_rbase) clock_vbase = clock_rbase = r;
+    return clock_vbase + (r - clock_rbase) * clock_pct / 100;
+}
+
+static u64 to_real(u64 guest_ns) {
+    std::lock_guard<std::mutex> lk(clock_m);
+    return guest_ns * 100 / clock_pct;
+}
+
 
 u64 system_tick() {
     u64 ns = now_ns() - boot_ns;
@@ -75,6 +97,18 @@ struct TimeoutQueue {
     std::thread th;
 };
 static TimeoutQueue tq;
+
+void set_clock_speed(u32 pct) {
+    const u64 v = now_ns();
+    {
+        std::lock_guard<std::mutex> lk(clock_m);
+        if (pct == clock_pct || !pct) return;
+        clock_vbase = v;
+        clock_rbase = real_ns();
+        clock_pct = pct;
+    }
+    tq.cv.notify_one();  // pending timeouts now fall due at another real time
+}
 
 void add_timeout(u64 deadline, std::function<void()> fn) {
     tq.q.emplace(deadline, std::move(fn));
@@ -91,7 +125,7 @@ static void timeout_thread() {
         u64 t = tq.q.begin()->first;
         u64 n = now_ns();
         if (t > n) {
-            tq.cv.wait_for(lk, std::chrono::nanoseconds(t - n));
+            tq.cv.wait_for(lk, std::chrono::nanoseconds(to_real(t - n)));
             continue;
         }
         auto fn = std::move(tq.q.begin()->second);
@@ -147,7 +181,10 @@ static std::vector<std::function<void()>> deferred_work;
 
 void run_when_quiescent(std::function<void()> fn) {
     if (!running) fn();
-    else deferred_work.push_back(std::move(fn));
+    else {
+        deferred_work.push_back(std::move(fn));
+        rt_preempt_flag = 1;  // (a guest loop may be polling what fn updates)
+    }
 }
 
 static void flush_deferred() {
@@ -159,7 +196,12 @@ static void flush_deferred() {
 }
 
 void schedule_async() {
-    if (running) return;
+    if (running) {
+        // the running thread keeps the CPU until its next SVC unless it is told to give way
+        Thread *best = best_ready();
+        if (best && best->priority < running->priority) rt_preempt_flag = 1;
+        return;
+    }
     flush_deferred();
     Thread *next = best_ready();
     if (!next) return;
@@ -302,6 +344,7 @@ std::shared_ptr<Thread> create_thread(u32 entry, u32 arg, u32 stack_top, s32 pri
     pthread_attr_setstacksize(&attr, 64 << 20);
     pthread_t pt;
     if (pthread_create(&pt, &attr, thread_main, t.get())) FATAL("pthread_create failed\n");
+    t->mach = pthread_mach_thread_np(pt);
     pthread_detach(pt);
     if (start) make_ready(t.get());
     return t;
@@ -357,6 +400,18 @@ static const Region *find_region(u32 a) {
     --it;
     if (a < it->second.base + it->second.size) return &it->second;
     return nullptr;
+}
+
+bool guest_busy() {
+    Lock lk(kmutex);
+    return running != nullptr;
+}
+
+bool guest_readable(u32 a, u32 size) {
+    if (a >= g_game.text_addr && a + size <= g_game.data_addr + g_game.data_size + g_game.bss_size) return true;
+    Lock lk(kmutex);
+    const Region *r = find_region(a);
+    return r && (r->perm & 1) && a + size <= r->base + r->size;
 }
 
 // linear heap allocator: first fit over free ranges
@@ -951,12 +1006,65 @@ void svc_dispatch(CPU *c, u32 imm) {
     svc_locked(c, imm, lk);
 }
 
+// The guest functions (f_<address>) on a thread's host stack, innermost first: a thread that spins without SVCs
+// shows only a stale pc otherwise, and a waiting one shows where it waits from.
+static std::string guest_backtrace(Thread *t) {
+    if (!t->mach || pthread_mach_thread_np(pthread_self()) == t->mach) return "";
+    u64 pcs[64];
+    int n = 0;
+    if (thread_suspend(t->mach) != KERN_SUCCESS) return "";
+    arm_thread_state64_t st;
+    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
+    if (thread_get_state(t->mach, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
+        pcs[n++] = arm_thread_state64_get_pc(st);
+        pcs[n++] = arm_thread_state64_get_lr(st);
+        u64 fp = arm_thread_state64_get_fp(st);
+        // frame records are {previous fp, return address}; stop at anything that does not look like one
+        for (int i = 0; i < 60 && fp && !(fp & 7) && n < 64; i++) {
+            u64 *rec = (u64 *)fp;
+            pcs[n++] = rec[1];
+            if (rec[0] <= fp) break;
+            fp = rec[0];
+        }
+    }
+    thread_resume(t->mach);
+    std::string out;
+    const void *last = nullptr;
+    for (int i = 0; i < n; i++) {
+        Dl_info di;
+        if (!dladdr((void *)(pcs[i] & 0x0000FFFFFFFFFFFFull), &di) || !di.dli_sname) continue;
+        if (strncmp(di.dli_sname, "f_", 2) || di.dli_saddr == last) continue;
+        last = di.dli_saddr;
+        out += out.empty() ? " in " : " < ";
+        out += di.dli_sname + 2;
+    }
+    return out;
+}
+
+// Debugging (RECOMP_MEMDUMP): the data/bss segment and every mapped region, one file each
+// (<prefix>_<address>.bin), for diffing snapshots taken at different moments
+void dump_memory(const char *prefix) {
+    Lock lk(kmutex);
+    auto put = [&](u32 base, u32 size) {
+        char name[256];
+        snprintf(name, sizeof name, "%s_%08x.bin", prefix, base);
+        if (FILE *f = fopen(name, "wb")) {
+            fwrite(gptr(base), 1, size, f);
+            fclose(f);
+        }
+    };
+    put(g_game.data_addr, g_game.data_size + g_game.bss_size);
+    for (auto &[base, r] : regions)
+        if (r.perm & 1) put(base, r.size);
+}
+
 void dump_threads() {
     Lock lk(kmutex);
     static const char *st[] = {"ready", "running", "wait-sync", "sleep", "wait-arb", "dormant", "dead"};
     for (auto &t : threads) {
         std::string w;
         for (auto &o : t->wait_objs) w += " " + (o->name.empty() ? std::string("?") : o->name);
+        if (t->status != TStatus::Dead && t->status != TStatus::Dormant) w += guest_backtrace(t.get());
         LOG("[thread %u] prio %d %s pc=%08x lr=%08x sp=%08x arb=%08x%s\n", t->id, t->priority, st[(int)t->status],
             t->cpu.pc, t->cpu.r[14], t->cpu.r[13], t->arb_addr, w.c_str());
     }
@@ -979,3 +1087,13 @@ void start(const BootInfo &bi) {
 }  // namespace kernel
 
 extern "C" void rt_svc(CPU *c, u32 imm) { kernel::svc_dispatch(c, imm); }
+
+volatile u32 rt_preempt_flag;
+
+extern "C" void rt_preempt(CPU *) {
+    using namespace kernel;
+    Lock lk(kmutex);
+    rt_preempt_flag = 0;
+    flush_deferred();
+    reschedule(lk);
+}

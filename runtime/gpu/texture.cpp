@@ -123,6 +123,9 @@ u64 epoch = 1;
 size_t total_bytes = 0;
 }  // namespace
 
+double g_tex_decode_ms = 0;
+u32 g_tex_decodes = 0;
+
 static bool trust_invalidations = false;
 static u64 use_counter = 1;
 
@@ -184,6 +187,7 @@ const TexEntry *texcache_get(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) {
     if (!p || !pptr(addr + e.size - 1)) return nullptr;
     u64 hv = hash_bytes(p, e.size);
     if (hv != e.hash || e.lv.empty()) {
+        const double t0 = now_ms();
         for (auto &l : e.lv) total_bytes -= l.data.size() * 4;
         e.lv.resize(levels);
         u32 off = 0;
@@ -197,6 +201,8 @@ const TexEntry *texcache_get(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) {
             total_bytes += im.data.size() * 4;
         }
         e.hash = hv;
+        g_tex_decode_ms += now_ms() - t0;
+        g_tex_decodes++;
     }
     e.epoch = epoch;
     e.stale = false;
