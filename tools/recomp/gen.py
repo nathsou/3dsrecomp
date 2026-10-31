@@ -60,6 +60,18 @@ class Analyzer:
         return i
 
     def fixup_thumb(self, i, hw):
+        # `pop {..., rX}` then `bx rX`: Thumb's return through the popped lr (Thumb-1 code cannot pop pc and switch to
+        # ARM). Returning is right for any `bx` (a caller whose return site does not match returns too, until the
+        # dispatcher continues at pc); here it is the common case, and much cheaper than dispatching.
+        if (hw & 0xFF87) == 0x4700 and i.kind == JMP and not i.ret:
+            rm = (hw >> 3) & 15
+            a = i.addr - 2
+            prev = self.img.read16(a)
+            while prev is not None and (prev & 0xFF80) == 0xB000:  # add sp, #n (a varargs function's pushed arguments)
+                a -= 2
+                prev = self.img.read16(a)
+            if rm < 8 and prev is not None and (prev & 0xFF00) == 0xBC00 and (prev >> rm) & 1:
+                i.ret = True
         # `ldr rX, [pc, #n]` then `add rX, pc`: a pc-relative pointer (a function, or the base of a table of
         # self-relative offsets such as an init array when the two are adjacent)
         if (hw & 0xFF78) == 0x4478 and not hw & 0x80:
