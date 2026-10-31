@@ -465,6 +465,7 @@ class Analyzer:
                     candidates.add(v)
         done = set()
         gap_done = False
+        gaps = set()
         lit_candidates = set()
         rounds = 0
         while True:
@@ -537,11 +538,16 @@ class Analyzer:
                     if self.plausible_entry(v):
                         self.funcs[v] = True
                         queue.append(v)
+                        gaps.add(v)
                     else:
                         self.rejected.add(v)
                 self.log('gap filling: +%d functions' % len(queue))
             if not queue:
                 break
+        # the functions code can reach through a pointer: their addresses appear as values (data, literal pools, adr,
+        # relative tables), or something outside the program enters them (the entry point, the CRO header entries)
+        # (and those listed as extra, found by the runtime, and the gap-filled ones, which no known code calls)
+        self.pointed = set(candidates) | set(lit_candidates) | {img.entry} | set(img.extra_entries) | set(self.extra) | gaps
         # functions found later may cut earlier explorations: re-explore everything with final boundaries
         return sorted(self.funcs)
 
@@ -864,6 +870,11 @@ def main():
     with open(os.path.join(args.outdir, 'funcs.txt'), 'w') as f:
         for k in keys:
             f.write('%x\n' % k)
+    # the others are reached only by direct calls and branches of the program's code (every caller is known)
+    with open(os.path.join(args.outdir, 'pointed.txt'), 'w') as f:
+        for k in keys:
+            if k in an.pointed:
+                f.write('%x\n' % k)
     print('functions: %d, entries: %d, files: %d' % (len(keys), len(em.entries), len(files)))
     for k, v in sorted(em.stats.items()):
         print('  %s: %d' % (k, v))
