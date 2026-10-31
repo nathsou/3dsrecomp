@@ -691,7 +691,8 @@ enum : u32 {
 // the bottom screen at pixel x, y)
 struct ScriptEntry { u64 frame, dur; u32 buttons; int cx, cy, tx = -1, ty = -1; };
 // host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...), typed text
-// ("frame:TEXT_<text>", for the software keyboard), and the mouse in layout coordinates: "frame:MOUSE_DOWN@x/y"
+// ("frame:TEXT_<text>", for the software keyboard, or taps on the game's own keyboard from the profile's keys), and
+// the mouse in layout coordinates: "frame:MOUSE_DOWN@x/y"
 // (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy"
 struct ScriptKey {
     u64 frame;
@@ -962,6 +963,8 @@ void frontend_run() {
                     me.button.y = wy;
                 }
                 SDL_PushEvent(&me);
+            } else if (k.frame == frame_count && !k.text.empty() && !typing && !menu::keyboard_open()) {
+                type_text(k.text);  // a test knows the game's own keyboard is up, with or without a "keyboard" rule
             } else if (k.frame == frame_count && !k.text.empty()) {
                 SDL_Event te{};
                 te.type = SDL_EVENT_TEXT_INPUT;
