@@ -402,6 +402,26 @@ class Analyzer:
                 out.add(a)
             prev_end = False
 
+    def saves_lr(self, key):
+        """Whether the code at key starts by saving lr, after at most a few register moves: push {..., lr} (ARM stmdb
+        sp!, {..., lr} or str lr, [sp, #-4]!, Thumb push {..., lr}). Compilers save lr only at a function's entry."""
+        th = key & 1
+        a = key & ~1
+        for _ in range(4):
+            i = self.decode(a, th)
+            if i is None or i.cond != 14:
+                return False
+            if th:
+                return (i.word & 0xFF00) == 0xB500
+            w = i.word
+            if (w & 0xFFFF4000) == 0xE92D4000 or w == 0xE52DE004:
+                return True
+            # mov rd, rm (no shift, no flags) with rd not sp, lr or pc
+            if (w & 0xFFF00FF0) != 0xE1A00000 or ((w >> 12) & 15) >= 13:
+                return False
+            a += 4
+        return False
+
     def plausible_entry(self, key):
         th = key & 1
         a = key & ~1
@@ -444,6 +464,13 @@ class Analyzer:
                 done.add(f)
                 insts, _ = self.explore(f)
                 for i in insts.values():
+                    if i.kind == B:
+                        # a branch to code that saves lr is a tail call to a function of its own (not code of this
+                        # one): otherwise each function branching there would get a copy of it
+                        t = i.target | (f & 1)
+                        if t not in self.funcs and i.target != f & ~1 and self.saves_lr(t):
+                            self.funcs[t] = True
+                            queue.append(t)
                     if i.kind == CALL:
                         t = i.target
                         if t not in self.funcs:

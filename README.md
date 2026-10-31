@@ -178,8 +178,9 @@ A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `
 - `tools/recomp/` is the recompiler (Python):
   - `arm.py` / `thumb.py` decode ARMv6K ARM and Thumb instructions (including VFPv2 and the media
     instructions) and lower each one to C. Guest registers become C locals; flags are separate 0/1 locals.
-  - `gen.py` discovers functions (entry point, `bl` targets, pointers in data/rodata/literal pools,
-    pc-relative code pointers, RVCT init arrays), resolves jump tables (`ldr pc, [pc, rX, lsl #2]`,
+  - `gen.py` discovers functions (entry point, `bl` targets, `b` targets that save lr (tail calls: compilers
+    save lr only at a function's entry), pointers in data/rodata/literal pools, pc-relative code pointers, RVCT init
+    arrays), resolves jump tables (`ldr pc, [pc, rX, lsl #2]`,
     `add pc, pc, rX, lsl #2`, GCC's byte tables `ldr[s]b rX, [table, rY]` + `add pc, pc, rX, lsl #2`, and
     RVCT's Thumb tables of byte/halfword offsets after `add rX, pc` / `ldrb rX, [rX, #k]` / `add pc, rX`) and
     emits one C function per guest function. `udf` traps (`__builtin_trap`) count as code, not data. Calls are C calls followed by
