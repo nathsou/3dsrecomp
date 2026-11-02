@@ -399,6 +399,7 @@ struct FileSession : Service {
             u32 src = ipc[6];
             s64 n = romfs ? 0 : pwrite(fd, gptr(src), len, (off_t)off);
             if (n < 0) n = 0;
+            if (g_verbose) LOG("[fs] write %s off %llx len %x\n", path.c_str(), (unsigned long long)off, len);
             ipc.ok(2, 2);
             ipc.set(2, (u32)n);
             ipc.set(3, (len << 4) | 0xA);
@@ -595,7 +596,8 @@ struct FsUser : Service {
             ipc.set64(2, h);
             break;
         }
-        case 0x080D:  // ControlArchive
+        case 0x080D:  // ControlArchive(archive u64, action, ...)
+            if (g_verbose) LOG("[fs] control archive action %u\n", ipc[3]);
             ipc.ok();
             break;
         case 0x080E:  // CloseArchive

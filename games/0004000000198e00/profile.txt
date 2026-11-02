@@ -1,9 +1,10 @@
 # Animal Crossing: New Leaf – Welcome amiibo (USA). Format: runtime/profile.cpp.
 
-value keyboard = u8 0x94cbea   # 1 while the game's keyboard (names, town name) is on the bottom screen
+# No reliable sign of the game's keyboard (names, town name) is known yet: the byte at 0x94cbea first used here
+# turns on once text is typed, stays on after the keyboard closes and is also 1 at times in the village. Without
+# a "keyboard" rule the keys below are unused; the keyboard is tapped on the bottom screen.
 
 # the keyboard's "ABC" page, bottom-screen pixels
-keyboard when keyboard == 1
 key 1234567890- at 15 78 step 25
 key qwertyuiop at 18 102 step 25
 key asdfghjkl:[] at 23 123 step 25
@@ -12,3 +13,10 @@ key backspace at 295 78
 key shift at 85 167
 key space at 162 167
 key enter at 260 223           # Confirm
+
+# Resetti: each player's "session under way" bit (set when play starts, cleared by both saves), in the first part of
+# the player's data, a CRC-32C block (players 0xa480 apart)
+unsaved garden_plus.dat 0x57aa 0x02 crc32c 0xa0 0x6b84
+unsaved garden_plus.dat 0xfc2a 0x02 crc32c 0xa520 0x6b84
+unsaved garden_plus.dat 0x1a0aa 0x02 crc32c 0x149a0 0x6b84
+unsaved garden_plus.dat 0x2452a 0x02 crc32c 0x1ee20 0x6b84

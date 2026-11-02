@@ -4,13 +4,15 @@
 #include <string>
 #include <vector>
 
+#include <TargetConditionals.h>
+
 #include "rt.h"
 
 struct Settings {
     int scale = 0;          // internal resolution: 0 auto (from the window), 1-4
     int msaa = 4;           // samples per pixel: 1 (off), 2, 4, 8 (applies at launch)
     int aniso = 16;         // max anisotropy: 1 (off), 2, 4, 8, 16 (applies at launch)
-    int layout = 0;         // see the layout table in frontend.cpp (0 stacked, 1 top screen only, ...)
+    int layout = TARGET_OS_IOS ? 6 : 0;  // the layout table in frontend.cpp (0 stacked, 1 top screen only, ... 6 touch)
     bool fullscreen = false;
     bool split = false;        // separate windows: the top screen in the main one, the bottom screen in a second
     bool fullscreen2 = false;  // the bottom screen's window
@@ -20,6 +22,7 @@ struct Settings {
     bool show_fps = false;  // frame rate counter in the corner
     s64 clock_offset = 0;   // seconds added to the Mac's clock for the 3DS clock
     bool auto_backup = true;  // copy the save into backups/ at each launch (the last 5 are kept)
+    bool forgive_unsaved = true;  // clear the profile's "unsaved" marks at launch (no scolding after a crash)
     // single-screen layouts
     int pip = 1;              // the other screen in a corner: 0 off, 1 while it changes, 2 always
     int pip_corner = 0;       // 0 top right, 1 top left, 2 bottom right, 3 bottom left
@@ -48,3 +51,4 @@ bool save_restore(const SaveBackup &b);   // backs up the current save first; th
 bool save_delete_current();               // backs it up first; the game must be restarted
 bool save_delete_backup(const SaveBackup &b);
 void save_auto_backup();                  // at launch, if enabled
+void save_forgive_unsaved();              // at launch, if enabled: clears the profile's "unsaved" marks

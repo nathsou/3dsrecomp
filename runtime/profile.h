@@ -28,6 +28,14 @@ struct Icon {
     float scale = 1;                // drawn size relative to the texture's pixels
 };
 
+// bits in a save file that say a session ended without saving ("unsaved"), in a block led by its CRC-32C
+struct UnsavedMark {
+    std::string file;  // in the save data
+    u32 offset;
+    u8 bits;
+    u32 block, size;   // the CRC's offset, and how many bytes after it it covers
+};
+
 struct Button {
     int tx = 0, ty = 0;  // bottom-screen pixel the button taps
     int cond = -1;
@@ -47,5 +55,6 @@ bool value(int i, s64 &v);  // a value this frame (false: its pointer chain was 
 const Button *button();   // the HUD action button, if it applies now
 bool keyboard_active();   // the game's own keyboard is up ("keyboard when ...")
 bool key(const std::string &k, int &x, int &y);  // where a character or named key is on the bottom screen
+const std::vector<UnsavedMark> &unsaved_marks();
 
 }  // namespace profile

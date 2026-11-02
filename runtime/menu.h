@@ -1,5 +1,6 @@
-// The in-game menu (Esc, or the gamepad's Home button): saves, clock, graphics, speed and audio settings.
-// It pauses the game while open and is drawn over the last frame (runtime/menu.mm).
+// The in-game menu (Esc, the gamepad's Home button or Select + Start, the touch controls' menu button): saves,
+// clock, graphics, speed and audio settings. It pauses the game while open and is drawn over the last frame
+// (runtime/menu.mm).
 #pragma once
 #include <SDL3/SDL.h>
 
@@ -19,8 +20,10 @@ void frontend_set_layout(int layout);
 int frontend_layout_count();
 const char *frontend_layout_name(int layout);
 void frontend_set_fullscreen(bool on);
+bool frontend_typing();  // the game's own keyboard is up and the host keyboard types into it (profile "keyboard")
 void frontend_set_split(bool on);  // separate windows, one per screen
 void frontend_set_scale_mode(int mode);  // 0 auto, 1-4
 int frontend_current_scale();            // the internal resolution in use (0 without Metal)
 [[noreturn]] void frontend_restart();
+[[noreturn]] void frontend_choose_game();  // back to the game list (a multi-game app)
 [[noreturn]] void frontend_quit();

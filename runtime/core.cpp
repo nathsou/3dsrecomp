@@ -3,6 +3,7 @@
 #include <unistd.h>
 
 #include <dlfcn.h>
+#include <TargetConditionals.h>
 
 #include <algorithm>
 #include <map>
@@ -79,7 +80,10 @@ void init() {
     // 4 GiB for the guest address space plus a guard so unaligned accesses at the top stay mapped
     size_t size = (1ull << 32) + 0x10000;
     void *p = mmap(nullptr, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
-    if (p == MAP_FAILED) FATAL("cannot reserve guest memory\n");
+    if (p == MAP_FAILED)
+        FATAL(TARGET_OS_IOS ? "cannot reserve guest memory (an iPhone or iPad needs the app signed with the Extended "
+                              "Virtual Addressing capability)\n"
+                            : "cannot reserve guest memory\n");
     g_mem = (u8 *)p;
 }
 
@@ -112,8 +116,17 @@ u32 hle_alloc(u32 size, u32 align) {
 }  // namespace mem
 
 // ---------------------------------------------------------------- dispatch
+#ifdef RECOMP_MODULES  // several games in one app: the chosen game's module gives its table (set_game_code)
+static const GuestEntry *guest_entries;
+static u32 guest_entry_count;
+void set_game_code(const GuestEntry *entries, u32 count) {
+    guest_entries = entries;
+    guest_entry_count = count;
+}
+#else
 extern "C" const GuestEntry guest_entries[];
 extern "C" const u32 guest_entry_count;
+#endif
 
 const GuestEntry *dispatch_lookup(u32 addr) {
     u32 lo = 0, hi = guest_entry_count;
@@ -154,7 +167,7 @@ static const GuestEntry *lazy_lookup(u32 addr) {
 }
 
 static bool lazy_compile(u32 addr) {
-#ifdef RECOMP_SOURCE_DIR
+#if defined(RECOMP_SOURCE_DIR) && !TARGET_OS_IOS && !defined(RECOMP_MODULES)  // (iOS has no compiler to run)
     std::string root = RECOMP_SOURCE_DIR;
     std::string game = RECOMP_GAME;
     char gamedir[4096];

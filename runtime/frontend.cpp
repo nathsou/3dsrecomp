@@ -3,6 +3,7 @@
 #include "frontend.h"
 
 #include <SDL3/SDL.h>
+#include <TargetConditionals.h>
 #include <pthread/qos.h>
 #include <unistd.h>
 
@@ -26,6 +27,8 @@
 #include "menu.h"
 #include "services/services.h"
 #include "settings.h"
+#include "touch.h"
+#include "uiview.h"
 
 #include <mach-o/dyld.h>
 
@@ -49,17 +52,25 @@ struct ScreenLayout {
     const char *name;
     int w, h;
     SDL_FRect top, bottom;
+    SDL_FRect area{};  // single-screen: where the screen fits (w 0: the whole canvas)
 };
-static const ScreenLayout layouts[] = {
+static const ScreenLayout kBaseLayouts[] = {
     {"Stacked", 400, 480, {0, 0, 400, 240}, {40, 240, 320, 240}},
     {"Top screen only", 400, 240, {0, 0, 400, 240}, {}},
     {"Side by side", 720, 240, {0, 0, 400, 240}, {400, 0, 320, 240}},
     {"Large top, small bottom", 560, 240, {0, 0, 400, 240}, {400, 120, 160, 120}},
     {"Bottom screen only", 320, 240, {}, {0, 0, 320, 240}},
     {"Stacked, bottom first", 400, 480, {0, 240, 400, 240}, {40, 0, 320, 240}},
+    // with touch controls only: reshaped to the window by update_touch_layout()
+    {"Fitted around the touch controls", 400, 480, {0, 0, 400, 240}, {40, 240, 320, 240}},
 };
-constexpr int kLayouts = sizeof layouts / sizeof layouts[0];
+constexpr int kLayouts = sizeof kBaseLayouts / sizeof kBaseLayouts[0];
+// as shown: with touch controls, each one reshaped to the window by update_touch_layout()
+static ScreenLayout layouts[kLayouts] = {kBaseLayouts[0], kBaseLayouts[1], kBaseLayouts[2], kBaseLayouts[3],
+                                         kBaseLayouts[4], kBaseLayouts[5], kBaseLayouts[6]};
+constexpr int kTouchLayout = kLayouts - 1;
 static int layout;
+static bool touch_single;  // the touch layout shows one screen at a time (a wide window)
 // Tab / right-stick click: the same layout with the other screen (single-screen and stacked layouts)
 static int swapped_layout(int l) {
     switch (l) {
@@ -89,7 +100,8 @@ static void apply_layout() {
 }
 // reshape a normal window from one layout to another, keeping the screens their size on the display
 static void reshape(int from, int to) {
-    if (from == to || (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED))) return;
+    if (from == to || touch::enabled() || (SDL_GetWindowFlags(window) & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_MAXIMIZED)))
+        return;  // (the touch layouts are window-shaped)
     int ww, wh;
     SDL_GetWindowSize(window, &ww, &wh);
     float k = std::min((float)ww / layouts[from].w, (float)wh / layouts[from].h);
@@ -112,7 +124,7 @@ static void store_geometry(SDL_Window *w) {
     SDL_GetWindowPosition(w, &g[0], &g[1]);
     SDL_GetWindowSize(w, &g[2], &g[3]);
 }
-int frontend_layout_count() { return kLayouts; }
+int frontend_layout_count() { return touch::enabled() ? kLayouts : kLayouts - 1; }
 const char *frontend_layout_name(int l) { return layouts[std::clamp(l, 0, kLayouts - 1)].name; }
 
 static std::mutex gpu_m;
@@ -127,11 +139,47 @@ void frontend_wake() {
 }
 }  // namespace kernel
 
+static bool bottom_at(float wx, float wy, int &tx, int &ty);
+static int pip_finger_at(float wx, float wy);
+static void pip_finger_gesture(int mode, int phase, float x0, float y0, float x1, float y1);
+static std::atomic<bool> in_background;  // (iOS) the app is not on screen: nothing runs or draws
+
+#if TARGET_OS_IOS
+// Leaving the screen: the menu opens, which pauses the game and saves the settings, so the player comes back to a
+// paused game; nothing is drawn meanwhile (iOS refuses GPU work from the background). SDL calls this on the main
+// thread while the main loop polls events.
+static bool SDLCALL app_events(void *, SDL_Event *ev) {
+    if (ev->type == SDL_EVENT_WILL_ENTER_BACKGROUND) {
+        if (!menu::is_open() && !menu::keyboard_open()) menu::toggle();
+        paused = true;
+        in_background = true;
+    }
+    if (ev->type == SDL_EVENT_DID_ENTER_FOREGROUND) in_background = false;
+    return true;
+}
+#endif
+
 void frontend_init() {
+    if (!TARGET_OS_IOS && touch::enabled()) SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "1");  // the mouse is a finger
+#if TARGET_OS_IOS
+    SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");
+    SDL_SetHint(SDL_HINT_IOS_HIDE_HOME_INDICATOR, "2");  // dimmed; a swipe from the bottom edge needs two goes
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD)) FATAL("SDL_Init: %s\n", SDL_GetError());
+#if TARGET_OS_IOS
+    SDL_AddEventWatch(app_events, nullptr);
+#endif
+    {  // a gamepad already connected (its "added" event may have gone to the game list of a multi-game app)
+        int n = 0;
+        SDL_JoystickID *ids = SDL_GetGamepads(&n);
+        if (n > 0) pad = SDL_OpenGamepad(ids[0]);
+        SDL_free(ids);
+    }
     if (const char *s = getenv("RECOMP_SCALE")) scale = atoi(s);
-    layout = std::clamp(g_settings.layout, 0, kLayouts - 1);
-    window = SDL_CreateWindow(g_game.name.c_str(), layouts[layout].w * scale, layouts[layout].h * scale, SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+    layout = std::clamp(g_settings.layout, 0, frontend_layout_count() - 1);
+    if (getenv("RECOMP_TOUCH")) layout = kTouchLayout;  // (trying the touch controls on a Mac)
+    window = SDL_CreateWindow(g_game.name.c_str(), layouts[layout].w * scale, layouts[layout].h * scale,
+                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (TARGET_OS_IOS ? SDL_WINDOW_FULLSCREEN : 0));
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     restore_geometry(window, g_settings.geom);
     renderer = SDL_CreateRenderer(window, nullptr);
@@ -154,15 +202,20 @@ void frontend_init() {
     if (g_settings.tex_filter && !getenv("GPU_TEX_FILTER")) gpu::set_texture_filter(g_settings.tex_filter);
     audio::set_volume(g_settings.volume / 100.0f);
     menu::init(window, renderer);
+    touch::init(window, renderer);
+    touch::set_bottom_screen_mapper(bottom_at);
+    touch::set_pip_hooks(pip_finger_at, pip_finger_gesture);
     if (g_settings.split) frontend_set_split(true);
     profile::load();
 }
 
 // ---- what the in-game menu changes (runtime/menu.mm)
+static void update_touch_layout();
 void frontend_set_layout(int l) {
     const int from = shown_layout();
-    layout = std::clamp(l, 0, kLayouts - 1);
+    layout = std::clamp(l, 0, frontend_layout_count() - 1);
     apply_layout();
+    update_touch_layout();
     reshape(from, shown_layout());
 }
 void frontend_set_split(bool on) {
@@ -207,16 +260,30 @@ void frontend_set_scale_mode(int mode) {
 }
 int frontend_current_scale() { return gpu::scale(); }
 extern char **g_argv;
-void frontend_restart() {
+extern std::string g_start_game;  // main.cpp: (multi-game app) the game playing
+// starts the app again (an iOS app cannot: it closes, saying so, and the player opens it again)
+[[noreturn]] static void relaunch(const char *ios_message) {
     store_geometry(window);
     store_geometry(window2);
     settings_save();
+#if TARGET_OS_IOS
+    SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, g_game.title.c_str(), ios_message, window);
+    _exit(0);
+#endif
     LOG("frontend: restarting\n");
     unsetenv("RECOMP_INPUT");  // a test script runs once
     char exe[4096];
     uint32_t len = sizeof exe;
     if (_NSGetExecutablePath(exe, &len) == 0) execv(exe, g_argv);
     FATAL("cannot restart: %s\n", strerror(errno));
+}
+void frontend_restart() {
+    if (!g_start_game.empty()) setenv("RECOMP_START_GAME", g_start_game.c_str(), 1);  // the same game, not the list
+    relaunch("Open the app again to restart the game.");
+}
+void frontend_choose_game() {
+    unsetenv("RECOMP_START_GAME");
+    relaunch("Open the app again to choose another game.");
 }
 void frontend_quit() {
     store_geometry(window);
@@ -428,7 +495,49 @@ static void type_text(const std::string &s) {
     }
 }
 
-static bool single_layout() { return !window2 && (layout == 1 || layout == 4); }
+bool frontend_typing() { return typing; }
+static bool single_layout() { return !window2 && (layout == 1 || layout == 4 || (layout == kTouchLayout && touch_single)); }
+
+// With touch controls every layout is a canvas of the window's shape with the screens in the part the controls
+// leave. The touch layout puts them one above the other unless that makes them much smaller than one screen alone
+// (a phone held sideways), in which case one shows at a time like the single-screen layouts; the others keep their
+// own arrangement, as large as it fits.
+static void update_touch_layout() {
+    if (!touch::enabled()) return;
+    touch::set_swap_shown(single_layout());
+    if (window2) return;
+    int ww, wh;
+    SDL_GetWindowSize(window, &ww, &wh);
+    const SDL_FRect a = touch::screen_area();
+    if (ww <= 0 || wh <= 0 || a.w <= 0 || a.h <= 0) return;
+    ScreenLayout l = kBaseLayouts[layout];
+    bool single = touch_single;
+    float k;
+    if (layout == kTouchLayout) {
+        const float k2 = std::min(a.w / 400, a.h / 480), k1 = std::min(a.w / 400, a.h / 240);
+        single = k2 < 0.66f * k1;
+        k = single ? k1 : k2;
+        l.h = single ? 240 : 480;  // (the arrangement's size, for now)
+    } else {
+        k = std::min(a.w / l.w, a.h / l.h);
+    }
+    // the arrangement in the middle of the room it has
+    const float bx = (a.x + (a.w - l.w * k) / 2) / k, by = (a.y + (a.h - l.h * k) / 2) / k;
+    auto moved = [&](SDL_FRect r) { return r.w ? SDL_FRect{r.x + bx, r.y + by, r.w, r.h} : r; };
+    l.top = moved(l.top);
+    l.bottom = moved(l.bottom);
+    if (layout == kTouchLayout) l.area = single ? SDL_FRect{a.x / k, a.y / k, a.w / k, a.h / k} : SDL_FRect{};
+    else if (layout == 1 || layout == 4) l.area = {bx, by, (float)l.w, (float)l.h};  // (the corner screen stays in it)
+    l.w = (int)std::lround(ww / k);
+    l.h = (int)std::lround(wh / k);
+    const ScreenLayout &o = layouts[layout];
+    if (l.w == o.w && l.h == o.h && SDL_RectsEqualFloat(&l.top, &o.top) && SDL_RectsEqualFloat(&l.bottom, &o.bottom) &&
+        SDL_RectsEqualFloat(&l.area, &o.area) && single == touch_single)
+        return;
+    layouts[layout] = l;
+    touch_single = single;
+    apply_layout();
+}
 static profile::Focus auto_focus() { return g_settings.auto_focus ? profile::focus() : profile::FOCUS_NONE; }
 
 // 0 top, 1 bottom
@@ -469,31 +578,38 @@ static bool screen_changed(int screen) {
     return !first && changed > 40 * 30 * 8 / 100;
 }
 
+// where the single-screen layouts fit their screen and put the corner screen (canvas units)
+static SDL_FRect screen_area(const ScreenLayout &l) { return l.area.w ? l.area : SDL_FRect{0, 0, (float)l.w, (float)l.h}; }
+
 static void place_screens() {
     const ScreenLayout &l = layouts[shown_layout()];
     placement = {l.top, l.bottom, -1, 1};
     if (!single_layout()) return;
     const int main = focused_screen(), other = main ^ 1;
+    const SDL_FRect area = screen_area(l);
     auto fit = [&](int screen) {
-        const float sw = screen ? 320 : 400, k = std::min(l.w / sw, l.h / 240.0f);
-        return SDL_FRect{(l.w - sw * k) / 2, (l.h - 240 * k) / 2, sw * k, 240 * k};
+        const float sw = screen ? 320 : 400, k = std::min(area.w / sw, area.h / 240.0f);
+        return SDL_FRect{area.x + (area.w - sw * k) / 2, area.y + (area.h - 240 * k) / 2, sw * k, 240 * k};
     };
     (main ? placement.bottom : placement.top) = fit(main);
     (other ? placement.bottom : placement.top) = {};
     // the corner screen
     const Uint64 now = SDL_GetTicks();
     if (g_settings.pip == 1 && screen_changed(other)) pip_active_until = now + 3000;
-    const float ph = std::min(l.h * g_settings.pip_size / 100.0f, l.w * 240.0f / (other ? 320 : 400)),
-                pw = ph * (other ? 320 : 400) / 240.0f, m = l.h * 0.025f;
+    const float ph = std::min(area.h * g_settings.pip_size / 100.0f, area.w * 240.0f / (other ? 320 : 400)),
+                pw = ph * (other ? 320 : 400) / 240.0f, m = area.h * 0.025f;
     const int c = g_settings.pip_corner;
-    SDL_FRect r{c == 1 || c == 3 ? m : l.w - pw - m, c >= 2 ? l.h - ph - m : m, pw, ph};
+    SDL_FRect r{area.x + (c == 1 || c == 3 ? m : area.w - pw - m), area.y + (c >= 2 ? area.h - ph - m : m), pw, ph};
     if (g_settings.pip_x >= 0) {
-        r.x = std::clamp(g_settings.pip_x * l.w / 1000.0f, 0.0f, l.w - pw);
-        r.y = std::clamp(g_settings.pip_y * l.h / 1000.0f, 0.0f, l.h - ph);
+        r.x = area.x + std::clamp(g_settings.pip_x * area.w / 1000.0f, 0.0f, area.w - pw);
+        r.y = area.y + std::clamp(g_settings.pip_y * area.h / 1000.0f, 0.0f, area.h - ph);
     }
     // the grip tab and the resize handle go on the side facing the middle of the window
     const bool below = r.y + r.h / 2 < l.h / 2, left = r.x + r.w / 2 > l.w / 2;
-    const float gh = std::max(l.h * 0.05f, 6.0f), gw = std::min(r.w * 0.4f, gh * 5);
+    float gh = std::max(l.h * 0.05f, 6.0f);
+    if (touch::enabled())  // a fingertip: 34 points
+        gh = std::max(gh, 34 * SDL_GetWindowPixelDensity(window) / std::max(present_factor(), 0.01f));
+    const float gw = std::min(r.w * 0.4f, gh * 5);
     pip_rect = r;
     pip_grip = {r.x + (r.w - gw) / 2, below ? r.y + r.h : r.y - gh, gw, gh};
     pip_handle = {left ? r.x - gh : r.x + r.w, below ? r.y + r.h : r.y - gh, gh, gh};
@@ -516,6 +632,17 @@ static void place_screens() {
     placement.alpha = pip_alpha;
 }
 
+// the corner screen moved (its top left) or resized (its height), kept in the area; stored relative to the area
+static void store_pip(float x, float y, float h) {
+    const SDL_FRect a = screen_area(layouts[shown_layout()]);
+    const float aspect = pip_rect.h > 0 ? pip_rect.w / pip_rect.h : 4.0f / 3;
+    h = std::min(std::clamp(h, a.h * 0.15f, a.h * 0.8f), a.w / aspect);
+    const float w = h * aspect;
+    g_settings.pip_x = (int)std::lround(std::clamp(x - a.x, 0.0f, a.w - w) * 1000 / a.w);
+    g_settings.pip_y = (int)std::lround(std::clamp(y - a.y, 0.0f, a.h - h) * 1000 / a.h);
+    g_settings.pip_size = std::clamp((int)std::lround(h * 100 / a.h), 15, 80);
+}
+
 // the mouse moving or resizing the corner screen; true if the event was used
 static bool pip_mouse(const SDL_Event &ev) {
     if (window2 || placement.pip < 0) {
@@ -527,14 +654,6 @@ static bool pip_mouse(const SDL_Event &ev) {
     auto at = [&](float x, float y) { SDL_RenderCoordinatesFromWindow(renderer, x, y, &lx, &ly); };
     auto in = [&](const SDL_FRect &q) { return q.w && lx >= q.x && lx < q.x + q.w && ly >= q.y && ly < q.y + q.h; };
     const float aspect = pip_rect.h > 0 ? pip_rect.w / pip_rect.h : 4.0f / 3;
-    auto store = [&](float x, float y, float h) {
-        const float w = h * aspect;
-        x = std::clamp(x, 0.0f, l.w - w);
-        y = std::clamp(y, 0.0f, l.h - h);
-        g_settings.pip_x = (int)std::lround(x * 1000 / l.w);
-        g_settings.pip_y = (int)std::lround(y * 1000 / l.h);
-        g_settings.pip_size = std::clamp((int)std::lround(h * 100 / l.h), 15, 80);
-    };
     switch (ev.type) {
     case SDL_EVENT_MOUSE_BUTTON_DOWN:
         if (ev.button.button != SDL_BUTTON_LEFT || SDL_GetWindowFromID(ev.button.windowID) != window) return false;
@@ -556,10 +675,10 @@ static bool pip_mouse(const SDL_Event &ev) {
         if (!pip_drag) return false;
         at(ev.motion.x, ev.motion.y);
         if (pip_drag == 1) {
-            store(lx - drag_dx, ly - drag_dy, pip_rect.h);
+            store_pip(lx - drag_dx, ly - drag_dy, pip_rect.h);
         } else {
             const float h = std::clamp(std::max(std::fabs(ly - drag_ay), std::fabs(lx - drag_ax) / aspect), l.h * 0.15f, l.h * 0.8f);
-            store(lx < drag_ax ? drag_ax - h * aspect : drag_ax, ly < drag_ay ? drag_ay - h : drag_ay, h);
+            store_pip(lx < drag_ax ? drag_ax - h * aspect : drag_ax, ly < drag_ay ? drag_ay - h : drag_ay, h);
         }
         return true;
     case SDL_EVENT_MOUSE_BUTTON_UP:
@@ -571,12 +690,72 @@ static bool pip_mouse(const SDL_Event &ev) {
         at(ev.wheel.mouse_x, ev.wheel.mouse_y);
         if (!(in(pip_rect) || in(pip_grip) || in(pip_handle)) || ev.wheel.y == 0) return false;
         const float h = std::clamp(pip_rect.h * (1 + 0.06f * ev.wheel.y), l.h * 0.15f, l.h * 0.8f);
-        store(pip_rect.x + (pip_rect.w - h * aspect) / 2, pip_rect.y + (pip_rect.h - h) / 2, h);
+        store_pip(pip_rect.x + (pip_rect.w - h * aspect) / 2, pip_rect.y + (pip_rect.h - h) / 2, h);
         settings_save();
         return true;
     }
     }
     return false;
+}
+
+// Fingers on the corner screen (touch.h): what a window point is on (0 nothing, 1 its picture of the bottom
+// screen, 2 what moves it, 3 its resize handle) ...
+static int pip_finger_at(float wx, float wy) {
+    if (window2 || placement.pip < 0 || placement.alpha <= 0.5f) return 0;
+    float lx, ly;
+    SDL_RenderCoordinatesFromWindow(renderer, wx, wy, &lx, &ly);
+    auto in = [&](const SDL_FRect &q) { return q.w && lx >= q.x && lx < q.x + q.w && ly >= q.y && ly < q.y + q.h; };
+    if (in(pip_grip)) return 2;
+    if (in(pip_handle)) return 3;
+    if (in(pip_rect)) return placement.pip == 0 ? 2 : 1;  // (the top screen takes no touches: its picture moves it)
+    return 0;
+}
+// ... and moving it (mode 1), resizing it from its handle (2) or pinching it (3: the point between the two fingers
+// stays put in it while it scales with their distance)
+static void pip_finger_gesture(int mode, int phase, float x0, float y0, float x1, float y1) {
+    static float grab_x, grab_y, dist0, h0, fx, fy;
+    float ax, ay, bx, by;
+    SDL_RenderCoordinatesFromWindow(renderer, x0, y0, &ax, &ay);
+    SDL_RenderCoordinatesFromWindow(renderer, x1, y1, &bx, &by);
+    const float aspect = pip_rect.h > 0 ? pip_rect.w / pip_rect.h : 4.0f / 3;
+    if (phase == 2) {
+        pip_drag = 0;
+        settings_save();
+        return;
+    }
+    if (phase == 0) {
+        pip_drag = mode;
+        grab_x = ax - pip_rect.x;
+        grab_y = ay - pip_rect.y;
+        drag_ax = pip_handle.x < pip_rect.x ? pip_rect.x + pip_rect.w : pip_rect.x;  // the corner a resize keeps
+        drag_ay = pip_handle.y < pip_rect.y ? pip_rect.y + pip_rect.h : pip_rect.y;
+        dist0 = std::max(std::hypot(bx - ax, by - ay), 1.0f);
+        h0 = pip_rect.h;
+        fx = ((ax + bx) / 2 - pip_rect.x) / pip_rect.w;
+        fy = ((ay + by) / 2 - pip_rect.y) / pip_rect.h;
+        return;
+    }
+    if (mode == 1) {
+        store_pip(ax - grab_x, ay - grab_y, pip_rect.h);
+    } else if (mode == 2) {
+        const float h = std::max(std::fabs(ay - drag_ay), std::fabs(ax - drag_ax) / aspect);
+        store_pip(ax < drag_ax ? drag_ax - h * aspect : drag_ax, ay < drag_ay ? drag_ay - h : drag_ay, h);
+    } else {
+        const float h = h0 * std::hypot(bx - ax, by - ay) / dist0;
+        store_pip((ax + bx) / 2 - fx * h * aspect, (ay + by) / 2 - fy * h, h);
+    }
+}
+
+// where a point of the main window lands on the bottom screen (when it shows), in its pixels
+static bool bottom_at(float wx, float wy, int &tx, int &ty) {
+    float lx, ly;
+    SDL_RenderCoordinatesFromWindow(renderer, wx, wy, &lx, &ly);
+    const SDL_FRect &b = placement.bottom;
+    if (!b.w || (placement.pip == 1 && placement.alpha <= 0.5f) || lx < b.x || lx >= b.x + b.w || ly < b.y || ly >= b.y + b.h)
+        return false;
+    tx = std::clamp((int)((lx - b.x) * 320 / b.w), 0, 319);
+    ty = std::clamp((int)((ly - b.y) * 240 / b.h), 0, 239);
+    return true;
 }
 
 // a screenshot is due at frame n (RECOMP_SHOT / RECOMP_WINSHOT)
@@ -637,7 +816,7 @@ static void present() {
     // the corner screen goes over the main one
     draw(pl.pip == 0 ? 1 : 0);
     draw(pl.pip == 0 ? 0 : 1);
-    if (pl.pip >= 0 && pip_hover) {  // grip tab (three bars) and resize handle (a diagonal)
+    if (pl.pip >= 0 && (pip_hover || (touch::enabled() && pl.alpha > 0.5f))) {  // grip tab (three bars), resize handle (a diagonal)
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColorFloat(renderer, 0.1f, 0.1f, 0.12f, 0.85f * pl.alpha);
         SDL_RenderFillRect(renderer, &pip_grip);
@@ -657,6 +836,7 @@ static void present() {
     // the HUD over the top screen: the bottom screen's information when it is out of sight (or always)
     const bool bottom_seen = window2 || (pl.bottom.w && (pl.pip != 1 || pl.alpha > 0.5f));
     if (pl.top.w && pl.pip != 0 && (g_settings.hud == 2 || (g_settings.hud == 1 && !bottom_seen))) hud::draw(renderer, pl.top);
+    if (touch::enabled() && !menu::is_open() && !menu::keyboard_open()) touch::draw();
     menu::draw();
     write_window_shot(renderer, "window");
     SDL_RenderPresent(renderer);
@@ -680,26 +860,20 @@ static void present() {
     }
 }
 
-// 3DS buttons
-enum : u32 {
-    BTN_A = 1 << 0, BTN_B = 1 << 1, BTN_SELECT = 1 << 2, BTN_START = 1 << 3, BTN_RIGHT = 1 << 4, BTN_LEFT = 1 << 5,
-    BTN_UP = 1 << 6, BTN_DOWN = 1 << 7, BTN_R = 1 << 8, BTN_L = 1 << 9, BTN_X = 1 << 10, BTN_Y = 1 << 11,
-    BTN_ZL = 1 << 14, BTN_ZR = 1 << 15,
-};
-
 // scripted input for testing: RECOMP_INPUT="frame:BUTTONS:duration,..." (BUTTONS like A+START; T@x/y touches
 // the bottom screen at pixel x, y)
 struct ScriptEntry { u64 frame, dur; u32 buttons; int cx, cy, tx = -1, ty = -1; };
 // host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...), typed text
-// ("frame:TEXT_<text>", for the software keyboard, or taps on the game's own keyboard from the profile's keys), and
-// the mouse in layout coordinates: "frame:MOUSE_DOWN@x/y"
-// (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy"
+// ("frame:TEXT_<text>", for the software keyboard, or taps on the game's own keyboard from the profile's keys), the mouse in layout coordinates: "frame:MOUSE_DOWN@x/y"
+// (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy", and fingers in window points for the touch controls:
+// "frame:TOUCH_DOWN@x/y/finger" (also TOUCH_MOVE, TOUCH_UP; finger 0 when left out)
 struct ScriptKey {
     u64 frame;
     SDL_Scancode key;
     SDL_EventType mouse = (SDL_EventType)0;
-    float x = 0, y = 0, wheel = 0;
+    float x = 0, y = 0, wheel = 0;  // (wheel: the finger for TOUCH_)
     std::string text;
+    SDL_EventType finger = (SDL_EventType)0;
 };
 static std::vector<ScriptKey> script_keys;
 static std::vector<ScriptEntry> script;
@@ -723,6 +897,15 @@ static void parse_script() {
         }
         if (n.rfind("TEXT_", 0) == 0) {
             script_keys.push_back({f, SDL_SCANCODE_UNKNOWN, (SDL_EventType)0, 0, 0, 0, n.substr(5)});
+            continue;
+        }
+        if (n.rfind("TOUCH_", 0) == 0) {
+            ScriptKey k{f, SDL_SCANCODE_UNKNOWN};
+            const size_t at = n.find('@');
+            const std::string kind = n.substr(6, at == std::string::npos ? std::string::npos : at - 6);
+            k.finger = kind == "DOWN" ? SDL_EVENT_FINGER_DOWN : kind == "UP" ? SDL_EVENT_FINGER_UP : SDL_EVENT_FINGER_MOTION;
+            if (at != std::string::npos) sscanf(n.c_str() + at + 1, "%f/%f/%f", &k.x, &k.y, &k.wheel);
+            script_keys.push_back(k);
             continue;
         }
         if (n.rfind("MOUSE_", 0) == 0) {
@@ -842,6 +1025,10 @@ static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16
         tx = (u16)std::clamp(hud_tap_x, 0, 319);
         ty = (u16)std::clamp(hud_tap_y, 0, 239);
     }
+    if (touch::enabled()) {  // fingers: the on-screen controls and the bottom screen (not the mouse)
+        touch::poll(buttons, cx, cy, touch, tx, ty);
+        return;
+    }
     if (!touch && (mb & SDL_BUTTON_LMASK) && window2 && SDL_GetMouseFocus() == window2) {
         float lx, ly;  // the bottom screen's own window
         SDL_RenderCoordinatesFromWindow(renderer2, mx, my, &lx, &ly);
@@ -851,14 +1038,25 @@ static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16
             ty = (u16)ly;
         }
     } else if (!touch && !pip_drag && (mb & SDL_BUTTON_LMASK) && SDL_GetMouseFocus() == window) {
-        float lx, ly;
-        SDL_RenderCoordinatesFromWindow(renderer, mx, my, &lx, &ly);
-        const SDL_FRect &b = placement.bottom;  // touch: the mouse on the bottom screen, wherever it is
-        if (b.w && (placement.pip != 1 || placement.alpha > 0.5f) && lx >= b.x && lx < b.x + b.w && ly >= b.y && ly < b.y + b.h) {
+        int x, y;  // touch: the mouse on the bottom screen, wherever it is
+        if (bottom_at(mx, my, x, y)) {
             touch = true;
-            tx = (u16)std::clamp((int)((lx - b.x) * 320 / b.w), 0, 319);
-            ty = (u16)std::clamp((int)((ly - b.y) * 240 / b.h), 0, 239);
+            tx = (u16)x;
+            ty = (u16)y;
         }
+    }
+}
+
+// Tab, a right stick click or the swap button: the other screen (for now, when the game's profile picks it)
+static void swap_screens() {
+    if (window2) return;
+    if (single_layout() && (auto_focus() != profile::FOCUS_NONE || swapped_layout(layout) == layout)) {
+        manual_flip ^= 1;  // the profile picks the screen, or no layout has the other one: look at it for now
+        pip_alpha = 0;
+    } else if (const int l = swapped_layout(layout); l != layout) {
+        g_settings.layout = l;
+        frontend_set_layout(l);
+        settings_save();
     }
 }
 
@@ -941,7 +1139,18 @@ void frontend_run() {
         }
         // host events once per frame (pumping the macOS event loop is not free)
         for (auto &k : script_keys)
-            if (k.frame == frame_count && k.mouse) {
+            if (k.frame == frame_count && k.finger) {
+                int ww, wh;
+                SDL_GetWindowSize(window, &ww, &wh);
+                SDL_Event fe{};
+                fe.type = k.finger;
+                fe.tfinger.touchID = 1;
+                fe.tfinger.fingerID = (SDL_FingerID)k.wheel + 1;
+                fe.tfinger.x = k.x / ww;
+                fe.tfinger.y = k.y / wh;
+                fe.tfinger.windowID = SDL_GetWindowID(window);
+                SDL_PushEvent(&fe);
+            } else if (k.frame == frame_count && k.mouse) {
                 float wx, wy;
                 SDL_RenderCoordinatesToWindow(renderer, k.x, k.y, &wx, &wy);
                 SDL_Event me{};
@@ -994,6 +1203,14 @@ void frontend_run() {
             if (ev.type == SDL_EVENT_WINDOW_MOVED || ev.type == SDL_EVENT_WINDOW_RESIZED)
                 store_geometry(SDL_GetWindowFromID(ev.window.windowID));
             if (menu::handle_event(ev)) continue;
+            if (touch::enabled()) {  // fingers; the mouse events iOS makes from them were only for the menu
+                if (!menu::is_open() && !menu::keyboard_open() && touch::handle_event(ev)) continue;
+                if (((ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN || ev.type == SDL_EVENT_MOUSE_BUTTON_UP) && ev.button.which == SDL_TOUCH_MOUSEID) ||
+                    (ev.type == SDL_EVENT_MOUSE_MOTION && ev.motion.which == SDL_TOUCH_MOUSEID))
+                    continue;
+                if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN || (ev.type == SDL_EVENT_GAMEPAD_AXIS_MOTION && std::abs(ev.gaxis.value) > 16000))
+                    touch::gamepad(true);
+            }
             if (typing && ev.type == SDL_EVENT_TEXT_INPUT) {
                 type_text(ev.text.text);
                 continue;
@@ -1006,6 +1223,21 @@ void frontend_run() {
                     continue;  // a character (its text comes as SDL_EVENT_TEXT_INPUT), not a shortcut
             }
             if (ev.type == SDL_EVENT_GAMEPAD_ADDED && !pad) pad = SDL_OpenGamepad(ev.gdevice.which);
+            if (ev.type == SDL_EVENT_GAMEPAD_REMOVED && pad && SDL_GetGamepadID(pad) == ev.gdevice.which) {
+                SDL_CloseGamepad(pad);  // another one still connected takes over; else back to the touch controls
+                int n = 0;
+                SDL_JoystickID *ids = SDL_GetGamepads(&n);
+                pad = n > 0 ? SDL_OpenGamepad(ids[0]) : nullptr;
+                SDL_free(ids);
+                if (!pad) touch::gamepad(false);
+            }
+            // Select + Start: the menu, for gamepads whose Home button the system keeps (iOS)
+            if (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && pad && !menu::is_open() &&
+                ((ev.gbutton.button == SDL_GAMEPAD_BUTTON_START && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_BACK)) ||
+                 (ev.gbutton.button == SDL_GAMEPAD_BUTTON_BACK && SDL_GetGamepadButton(pad, SDL_GAMEPAD_BUTTON_START)))) {
+                menu::toggle();
+                continue;
+            }
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F11) {  // the window being used
                 const bool second = window2 && SDL_GetKeyboardFocus() == window2;
                 SDL_Window *w = second ? window2 : window;
@@ -1019,17 +1251,9 @@ void frontend_run() {
                 frontend_set_layout(g_settings.layout);
                 settings_save();
             }
-            if (!window2 && ((ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_TAB && !ev.key.repeat) ||
-                             (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && ev.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK))) {
-                if (single_layout() && auto_focus() != profile::FOCUS_NONE) {
-                    manual_flip ^= 1;  // the profile picks the screen: look at the other one for now
-                    pip_alpha = 0;
-                } else if (const int l = swapped_layout(layout); l != layout) {
-                    g_settings.layout = l;
-                    frontend_set_layout(l);
-                    settings_save();
-                }
-            }
+            if ((ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_TAB && !ev.key.repeat) ||
+                (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && ev.gbutton.button == SDL_GAMEPAD_BUTTON_RIGHT_STICK))
+                swap_screens();
             if ((ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_E && !ev.key.repeat) ||
                 (ev.type == SDL_EVENT_GAMEPAD_BUTTON_DOWN && ev.gbutton.button == SDL_GAMEPAD_BUTTON_LEFT_STICK))
                 if (const profile::Button *b = profile::button()) {  // the HUD button: a tap on the bottom screen
@@ -1037,7 +1261,7 @@ void frontend_run() {
                     hud_tap_y = b->ty;
                     hud_tap_until = frame_count + 6;
                 }
-            if (pip_mouse(ev)) continue;
+            if (!touch::enabled() && pip_mouse(ev)) continue;
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F3) {
                 cycle_scale();
                 g_settings.scale = scale_mode > 0 ? scale_mode : 0;
@@ -1049,9 +1273,17 @@ void frontend_run() {
                 kernel::dump_threads();
             }
         }
+        if (touch::take_menu()) menu::toggle();
+        if (touch::take_swap()) swap_screens();
         update_auto_scale();
         menu::update();
+        if (menu::is_open() && !paused) touch::reset();  // (fingers lifted while it is open are not seen)
         paused = menu::is_open();
+        if (in_background) {  // (iOS) until the app is back on screen
+            std::this_thread::sleep_for(milliseconds(50));
+            next_vblank = steady_clock::now();
+            continue;
+        }
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
         kernel::set_clock_speed((u32)g_settings.speed);
         if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC"); v != vsync) {
@@ -1073,7 +1305,11 @@ void frontend_run() {
             }
             if (!paused) kernel::gsp_vblank();  // the game waits for VBlank, so it stops while the menu is open
             profile::update();
-            if (profile::keyboard_active() != typing) {
+            uiview::keep_filling(renderer);
+            update_touch_layout();
+            // (on iOS only with a hardware keyboard: the game's own keyboard is tapped on the touch screen, and the
+            // system's on-screen one would cover the controls)
+            if (const bool want = profile::keyboard_active() && (!TARGET_OS_IOS || SDL_HasKeyboard()); want != typing) {
                 typing = !typing;
                 key_taps.clear();
                 if (typing) SDL_StartTextInput(window);

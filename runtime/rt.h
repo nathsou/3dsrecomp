@@ -66,5 +66,7 @@ u32 hle_alloc(u32 size, u32 align = 0x1000);
 
 // ---- dispatch
 const GuestEntry *dispatch_lookup(u32 addr);
+void set_game_code(const GuestEntry *entries, u32 count);  // (RECOMP_MODULES) the loaded game's table
+void set_game_cros(const GuestCro *cros, u32 count);       // (RECOMP_MODULES) its CRO modules' slots, if any
 void run_guest(CPU *c);  // runs until the thread returns to EXIT_MAGIC
 constexpr u32 EXIT_MAGIC = 0xFFFF0000u;

@@ -74,7 +74,7 @@ static void init_shared_page() {
 }
 
 // The English (else Japanese) short title of an SMDH icon file, as UTF-8; "" without one.
-static std::string smdh_title(const std::string &path) {
+std::string smdh_title(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
     std::vector<u8> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
     if (d.size() < 0x2040 || memcmp(d.data(), "SMDH", 4) != 0) return "";
@@ -90,6 +90,27 @@ static std::string smdh_title(const std::string &path) {
         if (!s.empty()) return s;
     }
     return "";
+}
+
+// The 48x48 icon of an SMDH icon file as RGBA (8x8 tiles of RGB565 in Morton order); empty without one.
+std::vector<u32> smdh_icon(const std::string &path) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<u8> d((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    if (d.size() < 0x24C0 + 48 * 48 * 2 || memcmp(d.data(), "SMDH", 4) != 0) return {};
+    std::vector<u32> px(48 * 48);
+    const u8 *src = d.data() + 0x24C0;
+    for (int t = 0; t < 36; t++)
+        for (int k = 0; k < 64; k++, src += 2) {
+            int x = 0, y = 0;
+            for (int b = 0; b < 3; b++) {
+                x |= ((k >> (2 * b)) & 1) << b;
+                y |= ((k >> (2 * b + 1)) & 1) << b;
+            }
+            const u32 v = src[0] | src[1] << 8, r = (v >> 11 & 31) * 255 / 31, g = (v >> 5 & 63) * 255 / 63,
+                      bl = (v & 31) * 255 / 31;
+            px[(t / 6 * 8 + y) * 48 + t % 6 * 8 + x] = r | g << 8 | bl << 16 | 0xFF000000u;
+        }
+    return px;
 }
 
 // The region a game is for, from its SMDH region lockout bits (the lowest one: EUR for EUR+AUS); -1 if region free.

@@ -11,3 +11,4 @@ build-*/
 dumps/
 shots/
 games/*/vsprograms.bin
+external/

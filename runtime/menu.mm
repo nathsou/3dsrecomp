@@ -1,9 +1,15 @@
 // The in-game menu. Pages are lists of rows rebuilt every frame from the current state (an immediate-mode
 // layout), drawn with SDL's renderer in window pixels; text is rasterised with Core Text (the system font)
-// into cached textures. Keyboard, gamepad and mouse drive it.
+// into cached textures. Keyboard, gamepad, mouse and fingers drive it: a finger drags the page to scroll it and
+// a tap acts when the finger lifts.
 #include "menu.h"
 
+#include <TargetConditionals.h>
+#if TARGET_OS_IOS
+#import <UIKit/UIKit.h>
+#else
 #import <AppKit/AppKit.h>
+#endif
 #import <CoreText/CoreText.h>
 
 #include <algorithm>
@@ -20,6 +26,8 @@
 #include "profile.h"
 #include "settings.h"
 #include "swkbd.h"
+#include "text.h"
+#include "touch.h"
 
 namespace kernel {
 std::string save_root();  // (kernel.h clashes with MacTypes.h)
@@ -31,6 +39,7 @@ namespace {
 SDL_Window *win;
 SDL_Renderer *ren;
 bool open_ = false;
+constexpr const char *kDevice = TARGET_OS_IOS ? "device" : "Mac";  // whose clock the 3DS clock follows
 float fps = 0;
 
 // ---- text
@@ -93,6 +102,9 @@ enum Page { MAIN, SAVES, BACKUP, CLOCK, GRAPHICS, SPEED, CONFIRM };
 struct Level {
     Page page;
     int sel = 0;
+    float scroll = 0;    // window pixels scrolled down the page
+    bool follow = true;  // scroll to keep the selection in view (it moved by keys); a page the mouse or a finger
+                         // points at stays put (the rows must not slide under it)
 };
 std::vector<Level> stack;
 std::string confirm_text;
@@ -154,19 +166,33 @@ std::vector<Row> rows(Page p) {
         r.push_back({"Restart game", "", "", nullptr, [] {
                          confirm("Restart the game? Progress since its last save is lost.", [] { frontend_restart(); });
                      }});
+#ifdef RECOMP_MODULES
+        r.push_back({"Choose another game", "", "", nullptr, [] {
+                         confirm("Leave this game? Progress since its last save is lost.", [] { frontend_choose_game(); });
+                     }});
+#endif
+#if !TARGET_OS_IOS  // (iOS apps are left from the app switcher)
         r.push_back({"Quit", "", "", nullptr, [] {
                          confirm("Quit? Progress since the game's last save is lost.", [] { frontend_quit(); });
                      }});
+#endif
         break;
     case SAVES: {
         r.push_back({"Current save", save_summary(), "The game saves by itself; this is the data it keeps.", nullptr, nullptr, true});
         r.push_back({"Back up now", "", "", nullptr, [] { say(save_backup_now() ? "Backed up" : "Nothing to back up"); }});
         r.push_back({"Back up at each launch", onoff(s.auto_backup), "Keeps the last 5 automatic copies.",
                      [&s](int) { s.auto_backup = !s.auto_backup; }});
+        if (!profile::unsaved_marks().empty())
+            r.push_back({"Forgive unsaved quits", onoff(s.forgive_unsaved),
+                         "After a crash or closing without saving, the game goes on from what it last wrote without "
+                         "scolding you (Resetti). Applies at the next launch.",
+                         [&s](int) { s.forgive_unsaved = !s.forgive_unsaved; }});
+#if !TARGET_OS_IOS
         r.push_back({"Show in Finder", "", "", nullptr, [] {
                          NSString *p = [NSString stringWithUTF8String:kernel::save_root().c_str()];
                          [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:p]];
                      }});
+#endif
         if (save_exists())
             r.push_back({"Delete save…", "", "", nullptr, [] {
                              confirm("Delete the current save and restart the game? A copy is kept in the backups.", [] {
@@ -203,14 +229,15 @@ std::vector<Row> rows(Page p) {
     case CLOCK: {
         const s64 o = s.clock_offset;
         r.push_back({"3DS clock", clock_text("%a %d %b %Y, %H:%M:%S"),
-                     o == 0 ? "Follows the Mac's clock." : "Set apart from the Mac's clock; it keeps running from there.",
+                     o == 0 ? std::string("Follows the ") + kDevice + "'s clock."
+                            : std::string("Set apart from the ") + kDevice + "'s clock; it keeps running from there.",
                      nullptr, nullptr, true});
         r.push_back({"Year", clock_text("%Y"), "", [](int d) { shift_clock(&tm::tm_year, d); }});
         r.push_back({"Month", clock_text("%B"), "", [](int d) { shift_clock(&tm::tm_mon, d); }});
         r.push_back({"Day", clock_text("%d"), "", [](int d) { shift_clock(&tm::tm_mday, d); }});
         r.push_back({"Hour", clock_text("%H"), "", [](int d) { shift_clock(&tm::tm_hour, d); }});
         r.push_back({"Minute", clock_text("%M"), "", [](int d) { shift_clock(&tm::tm_min, d); }});
-        r.push_back({"Use the Mac's clock", "", "Games read the clock when they need it; some notice when it moves.",
+        r.push_back({std::string("Use the ") + kDevice + "'s clock", "", "Games read the clock when they need it; some notice when it moves.",
                      nullptr, [&s] { s.clock_offset = 0; }});
         break;
     }
@@ -235,13 +262,18 @@ std::vector<Row> rows(Page p) {
                              s.tex_filter = (s.tex_filter + d + n) % n;
                              gpu::set_texture_filter(s.tex_filter);
                          }});
+#if !TARGET_OS_IOS
         r.push_back({"Separate windows", s.split ? "One per screen" : "Off",
                      "Put each screen on its own display; F11 makes the window you are in fullscreen.", [&s](int) {
                          s.split = !s.split;
                          frontend_set_split(s.split);
                      }});
+#endif
         r.push_back({"Screen layout", frontend_layout_name(s.layout),
-                     s.split ? "Used when the screens share one window." : "F2 cycles the layouts while playing.", [&s](int d) {
+                     s.split            ? "Used when the screens share one window."
+                     : touch::enabled() ? "Touch controls go in the room the screens leave."
+                                        : "F2 cycles the layouts while playing.",
+                     [&s](int d) {
                          const int n = frontend_layout_count();
                          s.layout = (s.layout + d + n) % n;
                          frontend_set_layout(s.layout);
@@ -251,11 +283,13 @@ std::vector<Row> rows(Page p) {
                                                    corners = {"Top right", "Top left", "Bottom right", "Bottom left"},
                                                    hud_names = {"Off", "When the bottom screen is hidden", "Always"};
             r.push_back({"Other screen in a corner", pip_names[s.pip],
-                         "In the single-screen layouts. Tab swaps the screens; click the corner to touch it.",
+                         touch::enabled() ? "In the single-screen layouts. The swap button swaps the screens; tap the corner one to touch it."
+                                          : "In the single-screen layouts. Tab swaps the screens; click the corner to touch it.",
                          [&s](int d) { cycle(s.pip, {0, 1, 2}, d); }});
             if (s.pip) {
                 r.push_back({"Position", s.pip_x >= 0 ? "Where you dragged it" : corners[s.pip_corner],
-                             "Drag the tab next to it to move it; drag its handle or scroll over it to resize it.",
+                             touch::enabled() ? "Drag the tab next to it to move it; drag its handle or pinch it to resize it."
+                                              : "Drag the tab next to it to move it; drag its handle or scroll over it to resize it.",
                              [&s](int d) {
                                  if (s.pip_x >= 0) s.pip_x = s.pip_y = -1;  // back to a corner
                                  else cycle(s.pip_corner, {0, 1, 2, 3}, d);
@@ -275,10 +309,12 @@ std::vector<Row> rows(Page p) {
                              "uses the stored item.",
                              [&s](int d) { cycle(s.hud, {0, 1, 2}, d); }});
         }
+#if !TARGET_OS_IOS
         r.push_back({"Fullscreen", onoff(s.fullscreen), "", [&s](int) {
                          s.fullscreen = !s.fullscreen;
                          frontend_set_fullscreen(s.fullscreen);
                      }});
+#endif
         if (restart_pending()) r.push_back({"Restart now to apply", "", "", nullptr, [] { frontend_restart(); }});
         break;
     }
@@ -323,28 +359,97 @@ const char *title(Page p) {
     return "";
 }
 
-// ---- layout (window pixels), shared by draw() and mouse hit-testing
+// ---- layout (window pixels), shared by draw() and hit-testing; inside the safe area (clear of a phone's
+// camera cutout and home indicator)
 struct Layout {
-    float k, x, y, w, row_h, top;
+    float k, x, y, w, row_h, top, bottom;  // the rows go from y to bottom
 };
 Layout layout() {
     int ow = 0, oh = 0;
     SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+    const float d = SDL_GetWindowPixelDensity(win);
+    SDL_Rect sa;
+    if (!SDL_GetWindowSafeArea(win, &sa) || sa.w <= 0) sa = {0, 0, (int)(ow / d), (int)(oh / d)};
+    const float sx = sa.x * d, sy = sa.y * d, sw = sa.w * d, sh = sa.h * d;
     Layout l;
-    l.k = std::clamp(std::min(ow / 640.0f, oh / 560.0f), 0.5f, 4.0f);
-    l.w = std::min(ow - 24 * l.k, 560 * l.k);
-    l.x = (ow - l.w) / 2;
-    l.row_h = 40 * l.k;
-    l.top = std::max(16 * l.k, oh * 0.08f);
-    l.y = l.top + 64 * l.k;
+    l.k = std::clamp(std::min(sw / 640.0f, sh / 560.0f), 0.5f, 4.0f);
+    if (touch::enabled()) l.k = std::max(l.k * 1.2f, d);  // (rows at least 44 points high: a fingertip)
+    l.w = std::min(sw - 24 * l.k, 560 * l.k);
+    l.x = sx + (sw - l.w) / 2;
+    l.row_h = (touch::enabled() ? 44 : 40) * l.k;
+    if (touch::enabled()) {  // (a phone held sideways is short: little room around the rows)
+        l.top = sy + 12 * l.k;
+        l.y = l.top + 52 * l.k;
+        l.bottom = sy + sh - 30 * l.k;
+    } else {
+        l.top = sy + std::max(16 * l.k, sh * 0.08f);
+        l.y = l.top + 64 * l.k;
+        l.bottom = sy + sh - 70 * l.k;
+    }
     return l;
 }
-std::vector<float> row_y;  // top of each row from the last draw (for the mouse)
+
+// a text in lines no wider than w, broken between words
+const std::vector<std::string> &wrapped(const std::string &s, float px, bool bold, float w) {
+    static std::map<std::string, std::vector<std::string>> cache;
+    char key[48];
+    snprintf(key, sizeof key, "|%.1f|%d|%.0f", px, bold, w);
+    auto it = cache.find(s + key);
+    if (it != cache.end()) return it->second;
+    if (cache.size() > 400) cache.clear();
+    std::vector<std::string> lines;
+    std::string line;
+    for (size_t i = 0; i <= s.size();) {
+        size_t j = s.find(' ', i);
+        if (j == std::string::npos) j = s.size();
+        const std::string word = s.substr(i, j - i), next = line.empty() ? word : line + " " + word;
+        if (!line.empty() && text::width(next, px, bold) > w) {
+            lines.push_back(line);
+            line = word;
+        } else {
+            line = next;
+        }
+        i = j + 1;
+    }
+    lines.push_back(line);
+    return cache[s + key] = lines;
+}
+
+// how a row is laid out: its label, value and note, the value beside the label or under it when there is no
+// room, the note in as many lines as it takes
+struct RowBox {
+    std::vector<std::string> label, note;
+    std::string value;
+    float label_px, h;
+    bool value_below = false;
+};
+RowBox measure(const Row &row, const Layout &l, bool sel) {
+    RowBox b;
+    b.label_px = (row.header ? 15 : 19) * l.k;
+    if (!row.value.empty()) b.value = row.change && (sel || touch::enabled()) ? "‹  " + row.value + "  ›" : row.value;
+    // (the room is kept for the arrows the selection shows, so choosing a row moves none of them)
+    const float vw = row.value.empty() ? 0 : text::width(row.change ? "‹  " + row.value + "  ›" : row.value, 17 * l.k, false) + 16 * l.k;
+    if (vw && text::width(row.label, b.label_px, row.header) > l.w - vw) b.value_below = true;
+    b.label = wrapped(row.label, b.label_px, row.header, b.value_below || !vw ? l.w : l.w - vw);
+    if (!row.note.empty()) b.note = wrapped(row.note, 13 * l.k, false, l.w);
+    const float content = b.label.size() * b.label_px * 1.3f + (b.value_below ? 17 * l.k * 1.35f : 0) +
+                          b.note.size() * 13 * l.k * 1.3f;
+    b.h = std::max(l.row_h, content + 14 * l.k);
+    return b;
+}
+
+// each row's place from the last draw (for the mouse and fingers): its top and height, and where its value is
+struct RowHit {
+    float y, h, vx0, vx1;
+};
+std::vector<RowHit> row_hits;
+float max_scroll = 0;
 
 bool selectable(const Row &r) { return !r.header && (r.change || r.activate); }
 
 void move(int dir) {
     auto r = rows(stack.back().page);
+    stack.back().follow = true;
     int &sel = stack.back().sel;
     for (int n = 0; n < (int)r.size(); n++) {
         sel = (sel + dir + (int)r.size()) % (int)r.size();
@@ -578,9 +683,88 @@ void init(SDL_Window *w, SDL_Renderer *r) {
 
 bool is_open() { return open_; }
 
+namespace {
+
+// the row at (x, y), window pixels (-1: none)
+int row_at(float x, float y) {
+    const Layout l = layout();
+    if (y < l.y || y >= l.bottom || x < l.x - 10 * l.k || x >= l.x + l.w + 10 * l.k) return -1;
+    auto r = rows(stack.back().page);
+    for (int i = 0; i < (int)row_hits.size() && i < (int)r.size(); i++)
+        if (selectable(r[i]) && y >= row_hits[i].y && y < row_hits[i].y + row_hits[i].h) return i;
+    return -1;
+}
+
+// a click or tap: the title line goes back (on touch screens, which have no Esc), a row is chosen or its value
+// changed; the left half of a value ("‹") steps it back, as the right mouse button does
+void click(float x, float y, bool right_button) {
+    const Layout l = layout();
+    if (y < l.y - 8 * l.k) {
+        if (touch::enabled()) pop();
+        return;
+    }
+    const int i = row_at(x, y);
+    if (i < 0) return;
+    stack.back().sel = i;
+    stack.back().follow = false;
+    auto r = rows(stack.back().page);
+    const RowHit &h = row_hits[i];
+    act(!r[i].change ? 0 : right_button || (x >= h.vx0 - 24 * l.k && x < (h.vx0 + h.vx1) / 2) ? -1 : 1);
+}
+
+// fingers on the menu: each one that moves a few points drags the page, and one that lifts without having moved
+// taps where it went down, on the row it went down on. Every finger counts on its own, so a thumb resting on the
+// screen while the phone is held blocks nothing.
+struct MenuFinger {
+    float x, y, last_y;
+    int row;       // the row it went down on (-1: none)
+    int sel_before;  // the selection before it lit that row (back when the finger turns out to drag)
+    bool dragged = false;
+};
+std::map<SDL_FingerID, MenuFinger> fingers;
+
+void finger_event(const SDL_Event &ev) {
+    int ow = 0, oh = 0;
+    SDL_GetCurrentRenderOutputSize(ren, &ow, &oh);
+    const float x = ev.tfinger.x * ow, y = ev.tfinger.y * oh;
+    const SDL_FingerID id = ev.tfinger.fingerID;
+    if (ev.type == SDL_EVENT_FINGER_DOWN) {
+        const int i = row_at(x, y);
+        fingers[id] = {x, y, y, i, stack.back().sel};
+        if (i >= 0) {  // (lit while the finger is on it)
+            stack.back().sel = i;
+            stack.back().follow = false;
+        }
+        return;
+    }
+    auto it = fingers.find(id);
+    if (it == fingers.end()) return;
+    MenuFinger &f = it->second;
+    if (ev.type == SDL_EVENT_FINGER_MOTION) {
+        if (!f.dragged && std::hypot(x - f.x, y - f.y) > 10 * layout().k) {
+            f.dragged = true;
+            if (f.row >= 0 && stack.back().sel == f.row) stack.back().sel = f.sel_before;
+        }
+        if (f.dragged) {
+            stack.back().follow = false;
+            stack.back().scroll = std::clamp(stack.back().scroll - (y - f.last_y), 0.0f, max_scroll);
+        }
+        f.last_y = y;
+        return;
+    }
+    const MenuFinger up = f;
+    fingers.erase(it);
+    // (another finger may have scrolled the page meanwhile: a row that is no longer there is not tapped)
+    if (ev.type == SDL_EVENT_FINGER_UP && !up.dragged && (up.row < 0 || row_at(up.x, up.y) == up.row))
+        click(up.x, up.y, false);
+}
+
+}  // namespace
+
 void toggle() {
     open_ = !open_;
     stack.clear();
+    fingers.clear();
     if (open_) {
         push(MAIN);
         fix_sel();
@@ -629,21 +813,37 @@ bool handle_event(const SDL_Event &ev) {
         }
         return true;
     }
+    if (ev.type == SDL_EVENT_FINGER_DOWN || ev.type == SDL_EVENT_FINGER_MOTION || ev.type == SDL_EVENT_FINGER_UP ||
+        ev.type == SDL_EVENT_FINGER_CANCELED) {
+        if (ev.tfinger.windowID == SDL_GetWindowID(win)) finger_event(ev);
+        return true;
+    }
+    // the mouse events iOS makes from fingers are left out (the finger events above are used), and on a Mac
+    // trying the touch controls, where the mouse makes the finger events, the mouse's own
+    const bool mouse_finger = !TARGET_OS_IOS && touch::enabled();
+    if ((ev.type == SDL_EVENT_MOUSE_MOTION && (ev.motion.which == SDL_TOUCH_MOUSEID || mouse_finger)) ||
+        ((ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN || ev.type == SDL_EVENT_MOUSE_BUTTON_UP) &&
+         (ev.button.which == SDL_TOUCH_MOUSEID || mouse_finger)))
+        return true;
     if ((ev.type == SDL_EVENT_MOUSE_MOTION && ev.motion.windowID != SDL_GetWindowID(win)) ||
         (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.windowID != SDL_GetWindowID(win)))
         return true;  // the bottom screen's window, when the screens have separate windows
-    if (ev.type == SDL_EVENT_MOUSE_MOTION || ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+    if (ev.type == SDL_EVENT_MOUSE_WHEEL) {
+        stack.back().follow = false;
+        stack.back().scroll = std::clamp(stack.back().scroll - ev.wheel.y * layout().row_h, 0.0f, max_scroll);
+        return true;
+    }
+    if (ev.type == SDL_EVENT_MOUSE_MOTION) {
         const float d = SDL_GetWindowPixelDensity(win);
-        const float mx = (ev.type == SDL_EVENT_MOUSE_MOTION ? ev.motion.x : ev.button.x) * d;
-        const float my = (ev.type == SDL_EVENT_MOUSE_MOTION ? ev.motion.y : ev.button.y) * d;
-        Layout l = layout();
-        auto r = rows(stack.back().page);
-        for (int i = 0; i < (int)row_y.size() && i < (int)r.size(); i++)
-            if (selectable(r[i]) && mx >= l.x && mx < l.x + l.w && my >= row_y[i] && my < row_y[i] + l.row_h) {
-                stack.back().sel = i;
-                if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN)
-                    act(r[i].change && ev.button.button == SDL_BUTTON_RIGHT ? -1 : r[i].change ? 1 : 0);
-            }
+        if (const int i = row_at(ev.motion.x * d, ev.motion.y * d); i >= 0 && i != stack.back().sel) {
+            stack.back().sel = i;
+            stack.back().follow = false;
+        }
+        return true;
+    }
+    if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+        const float d = SDL_GetWindowPixelDensity(win);
+        click(ev.button.x * d, ev.button.y * d, ev.button.button == SDL_BUTTON_RIGHT);
         return true;
     }
     return ev.type == SDL_EVENT_KEY_UP || ev.type == SDL_EVENT_GAMEPAD_BUTTON_UP || ev.type == SDL_EVENT_MOUSE_BUTTON_UP;
@@ -701,7 +901,7 @@ void draw() {
     if (kb_open) kb_draw();
     // a reminder when the game's own keyboard comes up (profile "keyboard"): the Mac's keyboard types into it
     static Uint64 typing_since;
-    if (!profile::keyboard_active()) typing_since = 0;
+    if (!frontend_typing()) typing_since = 0;
     else if (!typing_since) typing_since = SDL_GetTicks();
     if (typing_since && SDL_GetTicks() - typing_since < 5000 && !kb_open && !open_) {
         const Text &t = text("Type with your keyboard   ·   Return confirms", 14 * l.k, white, true);
@@ -716,44 +916,84 @@ void draw() {
         fill(0, 0, ow, oh, {10, 12, 18, 228});
         const Page p = stack.back().page;
         auto r = rows(p);
-        put(text(title(p), 28 * l.k, white, true), l.x, l.top);
-        if (stack.size() > 1) {
+        const Text &tt = text(title(p), 28 * l.k, white, true);
+        put(tt, l.x, l.top);
+        if (touch::enabled()) {  // (the whole title line is the button)
+            const Text &t = text(stack.size() > 1 ? "‹ Back" : "Close", 19 * l.k, accent, true);
+            put(t, l.x + l.w - t.w, l.top + (tt.h - t.h) / 2);
+        } else if (stack.size() > 1) {
             const Text &t = text(g_game.name, 14 * l.k, grey);
             put(t, l.x + l.w - t.w, l.top + 12 * l.k);
         }
-        row_y.assign(r.size(), 0);
-        float y = l.y;
-        const float max_y = oh - 70 * l.k;
-        // keep the selection visible on long pages (the backup list)
-        float sel_y = l.y;
-        for (int i = 0; i < stack.back().sel && i < (int)r.size(); i++) sel_y += r[i].note.empty() ? l.row_h : l.row_h * 1.45f;
-        if (sel_y + l.row_h * 2 > max_y) y -= sel_y + l.row_h * 2 - max_y;
+        // the rows, scrolled when the page is longer than the room it has
+        Level &lv = stack.back();
+        std::vector<RowBox> boxes;
+        std::vector<float> tops;
+        float total = 0;
+        for (int i = 0; i < (int)r.size(); i++) {
+            boxes.push_back(measure(r[i], l, i == lv.sel && selectable(r[i])));
+            tops.push_back(total);
+            total += boxes.back().h;
+        }
+        const float view = l.bottom - l.y;
+        max_scroll = std::max(0.0f, total - view);
+        if (lv.follow && lv.sel < (int)r.size()) {  // the selection in view, with a little of the rows around it
+            const float a = tops[lv.sel] - l.row_h / 2, b = tops[lv.sel] + boxes[lv.sel].h + l.row_h / 2;
+            if (a < lv.scroll) lv.scroll = a;
+            if (b > lv.scroll + view) lv.scroll = b - view;
+        }
+        lv.scroll = std::clamp(lv.scroll, 0.0f, max_scroll);
+        row_hits.assign(r.size(), {});
+        const SDL_Rect clip{0, (int)(l.y - 4 * l.k), ow, (int)(view + 4 * l.k)};
+        SDL_SetRenderClipRect(ren, &clip);
         for (int i = 0; i < (int)r.size(); i++) {
             const Row &row = r[i];
-            const float h = row.note.empty() ? l.row_h : l.row_h * 1.45f;
-            row_y[i] = y;
-            if (y + h > l.y - 4 && y < max_y) {
-                const bool sel = i == stack.back().sel && selectable(row);
-                if (sel) fill(l.x - 10 * l.k, y, l.w + 20 * l.k, h - 4 * l.k, {255, 255, 255, 34});
-                if (sel) fill(l.x - 10 * l.k, y, 4 * l.k, h - 4 * l.k, accent);
-                const Text &lt = text(row.label, (row.header ? 15 : 19) * l.k, row.header ? grey : white, row.header);
-                put(lt, l.x, y + (l.row_h - lt.h) / 2 - 2 * l.k);
-                if (!row.value.empty()) {
-                    std::string v = row.change && sel ? "‹  " + row.value + "  ›" : row.value;
-                    const Text &vt = text(v, 17 * l.k, row.change ? accent : grey, false);
-                    put(vt, l.x + l.w - vt.w, y + (l.row_h - vt.h) / 2 - 2 * l.k);
+            const RowBox &b = boxes[i];
+            const float y = l.y + tops[i] - lv.scroll;
+            row_hits[i] = {y, b.h, l.x + l.w, l.x + l.w};
+            if (y + b.h < l.y - 4 * l.k || y > l.bottom) continue;
+            const bool sel = i == lv.sel && selectable(row);
+            if (sel) fill(l.x - 10 * l.k, y, l.w + 20 * l.k, b.h - 4 * l.k, {255, 255, 255, 34});
+            if (sel) fill(l.x - 10 * l.k, y, 4 * l.k, b.h - 4 * l.k, accent);
+            const float lh = b.label_px * 1.3f;
+            const float content = b.label.size() * lh + (b.value_below ? 17 * l.k * 1.35f : 0) + b.note.size() * 13 * l.k * 1.3f;
+            float cy = y + (b.h - 4 * l.k - content) / 2;
+            for (const auto &line : b.label) {
+                const Text &lt = text(line, b.label_px, row.header ? grey : white, row.header);
+                put(lt, l.x, cy + (lh - lt.h) / 2);
+                if (!b.value.empty() && !b.value_below && &line == &b.label.front()) {
+                    const Text &vt = text(b.value, 17 * l.k, row.change ? accent : grey, false);
+                    put(vt, l.x + l.w - vt.w, cy + (lh - vt.h) / 2);
+                    row_hits[i].vx0 = l.x + l.w - vt.w;
                 }
-                if (!row.note.empty()) put(text(row.note, 13 * l.k, grey), l.x, y + l.row_h - 10 * l.k);
+                cy += lh;
             }
-            y += h;
+            if (!b.value.empty() && b.value_below) {
+                const Text &vt = text(b.value, 17 * l.k, row.change ? accent : grey, false);
+                put(vt, l.x + l.w - vt.w, cy);
+                row_hits[i].vx0 = l.x + l.w - vt.w;
+                cy += 17 * l.k * 1.35f;
+            }
+            for (const auto &line : b.note) {
+                put(text(line, 13 * l.k, grey), l.x, cy);
+                cy += 13 * l.k * 1.3f;
+            }
         }
-        const char *hint = "↑↓ choose   ←→ change   Return select   Esc back";
+        SDL_SetRenderClipRect(ren, nullptr);
+        if (max_scroll > 0) {  // where the page is scrolled to, at the right edge
+            const float bh = std::max(view * view / total, 24 * l.k), by = l.y + (view - bh) * lv.scroll / max_scroll;
+            fill(std::min(l.x + l.w + 16 * l.k, ow - 6 * l.k), by, 3 * l.k, bh, {255, 255, 255, 70});
+        }
+        const char *hint = touch::enabled() ? "Drag to scroll   ·   tap ‹ or › to change a value"
+                                            : "↑↓ choose   ←→ change   Return select   Esc back";
         const Text &ht = text(hint, 13 * l.k, grey);
-        put(ht, (ow - ht.w) / 2, oh - 34 * l.k);
+        const float hint_y = touch::enabled() ? l.bottom + (30 * l.k - ht.h) / 2 : l.bottom + 70 * l.k - 34 * l.k;
+        put(ht, (ow - ht.w) / 2, hint_y);
         if (SDL_GetTicks() < toast_until) {
             const Text &tt = text(toast, 16 * l.k, white, true);
-            fill((ow - tt.w) / 2 - 14 * l.k, oh - 76 * l.k, tt.w + 28 * l.k, tt.h + 12 * l.k, {40, 120, 70, 230});
-            put(tt, (ow - tt.w) / 2, oh - 70 * l.k);
+            const float ty = l.bottom - tt.h - 24 * l.k;
+            fill((ow - tt.w) / 2 - 14 * l.k, ty - 6 * l.k, tt.w + 28 * l.k, tt.h + 12 * l.k, {40, 120, 70, 230});
+            put(tt, (ow - tt.w) / 2, ty);
         }
     }
     SDL_SetRenderLogicalPresentation(ren, lw, lh, mode);
