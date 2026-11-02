@@ -49,7 +49,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
                NO_CMAKE_FIND_ROOT_PATH)
   set_target_properties(${APP} PROPERTIES MACOSX_BUNDLE OFF)  # (a plain executable: tools/bundle_ios.sh bundles it)
   target_link_libraries(${APP} PRIVATE SDL3::SDL3-static "-framework Metal" "-framework Foundation"
-                        "-framework UIKit" "-framework CoreText" "-framework CoreGraphics")
+                        "-framework UIKit" "-framework CoreText" "-framework CoreGraphics" "-framework Security")
 else()
   find_package(SDL3 REQUIRED CONFIG)
   target_link_libraries(${APP} PRIVATE SDL3::SDL3 "-framework Metal" "-framework Foundation" "-framework AppKit" "-framework CoreText" "-Wl,-export_dynamic")

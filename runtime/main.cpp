@@ -1,6 +1,7 @@
 // Entry point: loads the game files, boots the HLE kernel and runs the host frontend.
 #include <unistd.h>
 
+#include "cloud.h"
 #include "frontend.h"
 #include "gpu_iface.h"
 #include "kernel.h"
@@ -118,6 +119,7 @@ int main(int argc, char **argv) {
     rt_log_open(kernel::save_root() + "/log.txt");
     if (bundle) g_fatal_hook = fatal_dialog;
     settings_load();
+    cloud_boot();  // (a newer save from another device: runtime/cloud.mm)
     save_auto_backup();
     kernel::init_services();
     frontend_init();
