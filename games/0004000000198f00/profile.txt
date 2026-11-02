@@ -1,0 +1,10 @@
+# Animal Crossing: New Leaf – Welcome amiibo (EUR). Format: runtime/profile.cpp.
+
+# Resetti: each player's "session under way" bit (set when play starts, cleared by both saves), in the first part of
+# the player's data, a CRC-32C block (players 0xa480 apart). The save's layout is the USA edition's
+# (games/0004000000198e00); a save made on a console with the base game and its Welcome amiibo update
+# (0004000000086400) has the same garden_plus.dat.
+unsaved garden_plus.dat 0x57aa 0x02 crc32c 0xa0 0x6b84
+unsaved garden_plus.dat 0xfc2a 0x02 crc32c 0xa520 0x6b84
+unsaved garden_plus.dat 0x1a0aa 0x02 crc32c 0x149a0 0x6b84
+unsaved garden_plus.dat 0x2452a 0x02 crc32c 0x1ee20 0x6b84

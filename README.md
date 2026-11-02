@@ -64,6 +64,12 @@ python3 -m venv .venv && .venv/bin/pip install capstone unicorn   # only for too
    This writes `exheader.bin`, the decompressed `code.bin`, `romfs.bin` (the RomFS image the game reads) and an
    unpacked `romfs/` for inspection (`--no-unpack` skips it, which halves the disk space of large games).
 
+   Encrypted dumps (an encrypted `.cci`/`.cxi`, or a `.cia` with its ticket, such as an eShop title) are
+   decrypted while they are read, with keys from your own console: `--boot9 boot9.bin` (boot9strap dumps it to
+   the SD card's `boot9strap/` folder when the console is powered on with Start + Select + X held) and, for a
+   CIA, `--keys aes_keys.txt` in the Citra/Azahar format with the ticket's common KeyY (`common0=...`). Titles
+   that use seed crypto are not supported. See `tools/ctrcrypto.py`.
+
 2. **Recompile** the code to C (`generated/<name>/`, a few seconds):
 
    ```sh

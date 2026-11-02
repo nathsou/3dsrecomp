@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Extract a decrypted 3DS game (.cci/.3ds NCSD or .cxi/.app NCCH) or a homebrew .3dsx into a folder:
+"""Extract a 3DS game (.cci/.3ds NCSD, .cxi/.app NCCH or .cia) or a homebrew .3dsx into a folder:
 
   exheader.bin   the NCCH extended header (memory layout, services, kernel caps)
   code.bin       the decompressed ExeFS .code (text + rodata + data, page aligned)
@@ -7,15 +7,19 @@
   romfs/         the RomFS files, unpacked (for inspection only; --no-unpack skips it to save disk space)
   info.json      the parsed layout
 
-Only decrypted dumps are supported (NCCH flag NoCrypto). A .3dsx is relocated to 0x00100000 and gets a
-synthetic exheader, as if it were an application started by the system (see extract_3dsx).
-Usage: extract.py <dump> <outdir> [--no-unpack] [--argv0 sdmc:/3ds/<name>.3dsx]
+Encrypted dumps (an encrypted NCCH, a CIA with its ticket) are decrypted while they are read, with keys from
+your own console: --boot9 boot9.bin and, for a CIA's title key, --keys aes_keys.txt (see tools/ctrcrypto.py).
+A .3dsx is relocated to 0x00100000 and gets a synthetic exheader, as if it were an application started by the
+system (see extract_3dsx).
+Usage: extract.py <dump> <outdir> [--no-unpack] [--argv0 sdmc:/3ds/<name>.3dsx] [--boot9 <file>] [--keys <file>]
 """
 import json
 import os
 import struct
 import sys
 import zlib
+
+import ctrcrypto
 
 MU = 0x200
 
@@ -240,6 +244,9 @@ def main():
     src, outdir = sys.argv[1], sys.argv[2]
     global UNPACK
     UNPACK = '--no-unpack' not in sys.argv
+
+    def opt(name): return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
+    keys = ctrcrypto.Keys(opt('--boot9'), opt('--keys'))
     os.makedirs(outdir, exist_ok=True)
     with open(src, 'rb') as fh:
         if fh.read(4) == b'3DSX':
@@ -254,15 +261,19 @@ def main():
         fh.seek(0)
         head = fh.read(0x200)
         ncch_off = 0
-        if head[0x100:0x104] == b'NCSD':
+        if u32(head, 0) == 0x2020:  # a CIA's header size
+            fh = ctrcrypto.open_cia(fh, keys)
+        elif head[0x100:0x104] == b'NCSD':
             ncch_off = u32(head, 0x120) * MU  # partition 0: the executable content
         fh.seek(ncch_off)
         nh = fh.read(0x200)
         if nh[0x100:0x104] != b'NCCH':
-            sys.exit('not an NCCH/NCSD image')
+            sys.exit('not an NCCH/NCSD/CIA image')
         flags = nh[0x188:0x190]
         if not (flags[7] & 4):
-            sys.exit('encrypted NCCH: decrypt the dump first')
+            src = fh if isinstance(fh, ctrcrypto.Reader) else ctrcrypto.FileSlice(fh, ncch_off, u32(nh, 0x104) * MU)
+            fh, ncch_off = ctrcrypto.NcchContent(src, keys), 0
+            nh = fh.read(0x200)
         exh_size = u32(nh, 0x180)
         exefs_off, exefs_size = u32(nh, 0x1A0) * MU, u32(nh, 0x1A4) * MU
         romfs_off, romfs_size = u32(nh, 0x1B0) * MU, u32(nh, 0x1B4) * MU
