@@ -29,6 +29,22 @@ extern std::string g_save_base;
 namespace gpu {
 
 namespace {
+
+// shaders compiled at run time without fast math, as the precompiled ones (MTLMathModeSafe; before macOS 15 and
+// iOS 18, which iPhones and iPads may still run, the older switch)
+MTLCompileOptions *safe_math_options() {
+    MTLCompileOptions *opt = [MTLCompileOptions new];
+    if (@available(macOS 15.0, iOS 18.0, *)) {
+        opt.mathMode = MTLMathModeSafe;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opt.fastMathEnabled = NO;
+#pragma clang diagnostic pop
+    }
+    return opt;
+}
+
 // ---------------------------------------------------------------- shader sources
 const char *kCommonMSL = R"(
 #include <metal_stdlib>
@@ -1634,10 +1650,8 @@ id<MTLRenderPipelineState> build_pipeline(const DrawState &ds) {
         }
         const bool from_lib = ff != nil;
         if (!ff) {
-            MTLCompileOptions *opt = [MTLCompileOptions new];
-            opt.mathMode = MTLMathModeSafe;
             id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:(src + kVertexMSL).c_str()]
-                                                   options:opt
+                                                   options:safe_math_options()
                                                      error:&err];
             if (!lib) {
                 LOG("gpu metal: shader compile failed: %s\n%s\n", err.localizedDescription.UTF8String, src.c_str());
@@ -1762,7 +1776,8 @@ void pipelines_init() {
     }
     // precompiled fragment shaders
     if (!getenv("GPU_NO_METALLIB"))
-        for (const auto &p : {exe_dir() + "/shaders.metallib", exe_dir() + "/../Resources/shaders.metallib"}) {
+        for (const auto &p : {g_game.dir + "/shaders.metallib", exe_dir() + "/shaders.metallib",
+                              exe_dir() + "/../Resources/shaders.metallib"}) {  // (the game's own: in a multi-game app)
             if (!std::filesystem::exists(p)) continue;
             NSError *err = nil;
             pre_lib = [dev newLibraryWithURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:p.c_str()]] error:&err];
@@ -1932,10 +1947,8 @@ void build_vs_kernel(VsKern *k, const std::string &blob) {
             from_lib = fn != nil;
             NSError *err = nil;
             if (!fn) {
-                MTLCompileOptions *opt = [MTLCompileOptions new];
-                opt.mathMode = MTLMathModeSafe;
                 id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:(std::string(kVsCommonMSL) + src).c_str()]
-                                                       options:opt
+                                                       options:safe_math_options()
                                                          error:&err];
                 if (!lib) LOG("gpu metal: vertex kernel compile failed: %s\n%s\n", err.localizedDescription.UTF8String, src.c_str());
                 fn = [lib newFunctionWithName:[NSString stringWithUTF8String:name.c_str()]];

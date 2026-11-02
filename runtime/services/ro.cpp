@@ -14,12 +14,21 @@
 #include "../service.h"
 #include "services.h"
 
+#ifdef RECOMP_MODULES  // several games in one app: the loaded game's slots, if it has CRO modules (set_game_cros)
+static const GuestCro *guest_cros;
+static u32 guest_cro_count;
+void set_game_cros(const GuestCro *cros, u32 count) {
+    guest_cros = cros;
+    guest_cro_count = count;
+}
+#else
 extern "C" {
 extern const GuestCro guest_cros[];
 extern const u32 guest_cro_count;
 __attribute__((weak)) const GuestCro guest_cros[1] = {};
 __attribute__((weak)) const u32 guest_cro_count = 0;
 }
+#endif
 
 namespace kernel {
 namespace {

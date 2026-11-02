@@ -1,5 +1,6 @@
 #pragma once
 #include <string>
+#include <vector>
 
 #include "rt.h"
 
@@ -15,4 +16,6 @@ struct GameInfo {
 extern GameInfo g_game;
 
 void load_game(const std::string &dir);
+std::string smdh_title(const std::string &path);  // an SMDH's English (else Japanese) short title, as UTF-8
+std::vector<u32> smdh_icon(const std::string &path);  // its 48x48 icon as RGBA (empty without one)
 void update_shared_page_time();

@@ -4,12 +4,14 @@
 #include <sys/stat.h>
 
 #include <algorithm>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <map>
 
 #include "kernel.h"
+#include "profile.h"
 
 namespace fs = std::filesystem;
 
@@ -47,6 +49,7 @@ void settings_load() {
     num("show_fps", s.show_fps);
     num("clock_offset", s.clock_offset);
     num("auto_backup", s.auto_backup);
+    num("forgive_unsaved", s.forgive_unsaved);
     num("pip", s.pip);
     num("pip_corner", s.pip_corner);
     num("pip_x", s.pip_x);
@@ -77,6 +80,7 @@ void settings_save() {
       << "\nwindow=" << s.geom[0] << ',' << s.geom[1] << ',' << s.geom[2] << ',' << s.geom[3]
       << "\nwindow2=" << s.geom2[0] << ',' << s.geom2[1] << ',' << s.geom2[2] << ',' << s.geom2[3] << "\nspeed=" << s.speed << "\nvolume=" << s.volume
       << "\nshow_fps=" << s.show_fps << "\nclock_offset=" << s.clock_offset << "\nauto_backup=" << s.auto_backup
+      << "\nforgive_unsaved=" << s.forgive_unsaved
       << "\npip=" << s.pip << "\npip_corner=" << s.pip_corner << "\npip_x=" << s.pip_x << "\npip_y=" << s.pip_y
       << "\npip_size=" << s.pip_size << "\nauto_focus=" << s.auto_focus << "\nhud=" << s.hud
       << "\ntex_filter=" << s.tex_filter
@@ -181,4 +185,57 @@ void save_auto_backup() {
     for (auto &b : save_backups())
         if (b.name.size() > 5 && b.name.compare(b.name.size() - 5, 5, " auto") == 0 && ++kept > 5)
             save_delete_backup(b);
+}
+
+// ---- a session that ended without a save: the game finds its own mark still set and scolds the player for it
+// (Animal Crossing's Resetti). What the game last wrote is kept; only the mark goes.
+static u32 crc32c(const u8 *p, size_t n) {
+    static u32 table[256];
+    if (!table[1])
+        for (u32 i = 0; i < 256; i++) {
+            u32 c = i;
+            for (int k = 0; k < 8; k++) c = c & 1 ? (c >> 1) ^ 0x82F63B78 : c >> 1;  // (the Castagnoli polynomial)
+            table[i] = c;
+        }
+    u32 c = 0xffffffff;
+    while (n--) c = table[(c ^ *p++) & 0xff] ^ (c >> 8);
+    return ~c;
+}
+
+void save_forgive_unsaved() {
+    if (!g_settings.forgive_unsaved) return;
+    std::map<std::string, std::vector<const profile::UnsavedMark *>> by_file;
+    for (const auto &m : profile::unsaved_marks()) by_file[m.file].push_back(&m);
+    for (const auto &[name, marks] : by_file) {
+        const std::string path = kernel::save_root() + "/savedata/" + name;
+        std::ifstream in(path, std::ios::binary);
+        std::vector<u8> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+        in.close();
+        bool changed = false;
+        for (const profile::UnsavedMark *m : marks) {
+            if ((u64)m->block + 4 + m->size > d.size() || !(d[m->offset] & m->bits)) continue;
+            u32 stored;
+            memcpy(&stored, &d[m->block], 4);
+            if (stored != crc32c(&d[m->block + 4], m->size)) {
+                LOG("[save] %s: the block at %x does not match its CRC; its unsaved mark is left\n", name.c_str(), m->block);
+                continue;
+            }
+            d[m->offset] &= (u8)~m->bits;
+            const u32 crc = crc32c(&d[m->block + 4], m->size);
+            memcpy(&d[m->block], &crc, 4);
+            changed = true;
+            LOG("[save] %s: the last session ended without a save; cleared its mark at %x\n", name.c_str(), m->offset);
+        }
+        if (!changed) continue;
+        const std::string tmp = path + ".tmp";  // (written whole, then put in place)
+        std::ofstream out(tmp, std::ios::binary);
+        out.write((const char *)d.data(), (std::streamsize)d.size());
+        out.close();
+        std::error_code ec;
+        if (out) fs::rename(tmp, path, ec);
+        if (!out || ec) {
+            fs::remove(tmp, ec);
+            LOG("[save] could not write %s\n", path.c_str());
+        }
+    }
 }

@@ -27,6 +27,11 @@
 //   key <characters | space | backspace | shift | enter> at <x> <y> [step <dx>]
 //       Where the keys are, in bottom-screen pixels (320x240): one named key, or a row of characters <dx> apart.
 //       A letter typed in upper case taps "shift" first; Return taps "enter".
+//   unsaved <save file> <offset> <bits> crc32c <block> <size>
+//       Bits the game sets in its save when a session starts and clears when it saves, which a session that ends
+//       without a save leaves set (Animal Crossing scolds the player for it). With the menu's "Forgive unsaved
+//       quits" on they are cleared at launch, and the CRC-32C at <block> (of the <size> bytes after it) updated;
+//       nothing is changed unless that CRC is right to begin with.
 //
 // Positions are top-screen pixels (400x240); a negative x or y counts from the right or bottom edge.
 // Conditions: <value> <op> <number> [and ...], with op one of == != < <= > >= & (any bit set) !& (none set).
@@ -68,6 +73,7 @@ std::vector<Icon> icon_list;
 std::vector<Button> buttons;
 int keyboard_cond = -2;  // -2: no keyboard
 std::map<std::string, std::pair<int, int>> keys;  // a character (UTF-8) or a named key -> bottom-screen pixel
+std::vector<UnsavedMark> marks;
 Focus cur_focus = FOCUS_NONE;
 int trace_every;
 u64 frames;
@@ -320,6 +326,16 @@ bool parse_line(const std::string &line, std::string &err) {
         }
         return true;
     }
+    if (d == "unsaved") {
+        s64 off, bits, block, size;
+        if (t.size() != 7 || !num(t[2], off) || !num(t[3], bits) || t[4] != "crc32c" || !num(t[5], block) ||
+            !num(t[6], size) || off < block + 4 || off >= block + 4 + size || bits <= 0 || bits > 0xff) {
+            err = "expected 'unsaved <save file> <offset> <bits> crc32c <block> <size>' (the offset in the block)";
+            return false;
+        }
+        marks.push_back({t[1], (u32)off, (u8)bits, (u32)block, (u32)size});
+        return true;
+    }
     err = "unknown directive " + d;
     return false;
 }
@@ -403,6 +419,7 @@ bool load() {
 
 bool loaded() { return is_loaded; }
 bool has_focus_rules() { return !focus_rules.empty(); }
+const std::vector<UnsavedMark> &unsaved_marks() { return marks; }
 bool has_hud() { return hud_cond != -2 && !elems.empty(); }
 
 void update() {

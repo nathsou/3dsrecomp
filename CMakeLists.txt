@@ -3,20 +3,58 @@ project(3dsrecomp C CXX OBJCXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(GAME sm3dl CACHE STRING "generated/<GAME> to link")
+# GAMES="sm3dl;nsmb2;...": one app for several games instead (the executable `recomp`, which shows a game list,
+# and each game's code as a module <name>.dylib it loads; tools/bundle_ios.sh puts them together)
+set(GAMES "" CACHE STRING "games for one app with a game list (else GAME alone)")
 set(GEN_OPT -O2 CACHE STRING "optimisation of the generated code")
-
-file(GLOB GEN_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/generated/${GAME}/*.c)
-add_library(gamecode STATIC ${GEN_SRC})
-target_include_directories(gamecode PRIVATE runtime generated/${GAME})
-target_compile_options(gamecode PRIVATE ${GEN_OPT} -w -ffp-contract=off -fno-strict-aliasing -std=gnu11)
+set(GEN_FLAGS ${GEN_OPT} -w -ffp-contract=off -fno-strict-aliasing -std=gnu11)
 
 file(GLOB RT_SRC CONFIGURE_DEPENDS runtime/*.cpp runtime/*.mm runtime/services/*.cpp runtime/gpu/*.cpp runtime/gpu/*.mm runtime/audio/*.cpp)
-add_executable(${GAME} ${RT_SRC})
-target_include_directories(${GAME} PRIVATE runtime)
-target_compile_options(${GAME} PRIVATE -O2 -g -Wall -Wno-unused-function -Wno-unused-variable)
-find_package(SDL3 REQUIRED CONFIG)
-target_link_libraries(${GAME} PRIVATE gamecode SDL3::SDL3 "-framework Metal" "-framework Foundation" "-framework AppKit" "-framework CoreText" "-Wl,-export_dynamic")
-target_compile_definitions(${GAME} PRIVATE RECOMP_SOURCE_DIR="${CMAKE_SOURCE_DIR}" RECOMP_GAME="${GAME}")
+if(GAMES)
+  set(APP recomp)
+  add_executable(${APP} ${RT_SRC})
+  target_compile_definitions(${APP} PRIVATE RECOMP_MODULES RECOMP_GAME="")
+  foreach(g ${GAMES})
+    file(GLOB src CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/generated/${g}/*.c)
+    add_library(gamecode_${g} OBJECT ${src})
+    target_include_directories(gamecode_${g} PRIVATE runtime generated/${g})
+    target_compile_options(gamecode_${g} PRIVATE ${GEN_FLAGS})
+    # a loadable bundle whose runtime symbols (g_mem, rt_dispatch, ...) resolve against the app's executable
+    add_library(${g} MODULE $<TARGET_OBJECTS:gamecode_${g}>)
+    set_target_properties(${g} PROPERTIES PREFIX "" SUFFIX ".dylib" LINKER_LANGUAGE C)
+    target_link_options(${g} PRIVATE "SHELL:-bundle_loader $<TARGET_FILE:${APP}>")
+    add_dependencies(${g} ${APP})
+  endforeach()
+else()
+  set(APP ${GAME})
+  file(GLOB GEN_SRC CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/generated/${GAME}/*.c)
+  add_library(gamecode STATIC ${GEN_SRC})
+  target_include_directories(gamecode PRIVATE runtime generated/${GAME})
+  target_compile_options(gamecode PRIVATE ${GEN_FLAGS})
+  add_executable(${APP} ${RT_SRC})
+  target_link_libraries(${APP} PRIVATE gamecode)
+  target_compile_definitions(${APP} PRIVATE RECOMP_GAME="${GAME}")
+endif()
+target_include_directories(${APP} PRIVATE runtime)
+target_compile_options(${APP} PRIVATE -O2 -g -Wall -Wno-unused-function -Wno-unused-variable)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  # iPhone and iPad (cmake -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphoneos or iphonesimulator): SDL3 built as
+  # static libraries by tools/build_sdl_ios.sh, no lazy recompilation (no compiler on iOS), and the app bundle
+  # made by tools/bundle_ios.sh
+  set(IOS_SDK iphoneos)
+  if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+    set(IOS_SDK iphonesimulator)
+  endif()
+  find_package(SDL3 REQUIRED CONFIG PATHS ${CMAKE_SOURCE_DIR}/external/sdl-ios/${IOS_SDK}/lib/cmake/SDL3 NO_DEFAULT_PATH
+               NO_CMAKE_FIND_ROOT_PATH)
+  set_target_properties(${APP} PROPERTIES MACOSX_BUNDLE OFF)  # (a plain executable: tools/bundle_ios.sh bundles it)
+  target_link_libraries(${APP} PRIVATE SDL3::SDL3-static "-framework Metal" "-framework Foundation"
+                        "-framework UIKit" "-framework CoreText" "-framework CoreGraphics")
+else()
+  find_package(SDL3 REQUIRED CONFIG)
+  target_link_libraries(${APP} PRIVATE SDL3::SDL3 "-framework Metal" "-framework Foundation" "-framework AppKit" "-framework CoreText" "-Wl,-export_dynamic")
+endif()
+target_compile_definitions(${APP} PRIVATE RECOMP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 set_source_files_properties(${RT_SRC} PROPERTIES COMPILE_OPTIONS "")
 foreach(f ${RT_SRC})
   if(f MATCHES "\\.mm$")
@@ -25,27 +63,52 @@ foreach(f ${RT_SRC})
 endforeach()
 
 # Fragment shaders of the shipped pipeline lists (games/<title id>/pipelines.bin) and the vertex program
-# kernels (games/<title id>/vsprograms.bin), compiled ahead of time into build/shaders.metallib so the game
-# never waits for the Metal compiler (see runtime/gpu/metal.mm). Only this game's lists when
-# data/<GAME>/info.json names its title id.
-set(GAME_TID "*")
-if(EXISTS ${CMAKE_SOURCE_DIR}/data/${GAME}/info.json)
-  file(READ ${CMAKE_SOURCE_DIR}/data/${GAME}/info.json GAME_INFO)
-  string(JSON GAME_TID ERROR_VARIABLE GAME_INFO_ERR GET ${GAME_INFO} program_id)
-  if(GAME_INFO_ERR)
-    set(GAME_TID "*")
+# kernels (games/<title id>/vsprograms.bin), compiled ahead of time into a Metal library so the game never waits
+# for the Metal compiler (see runtime/gpu/metal.mm): build/shaders.metallib, or shaders_<name>.metallib per game
+# of a multi-game app. Only the game's own lists when data/<name>/info.json names its title id.
+# The shader sources are the same on every device; an iOS build cannot run its own binary here, so a Mac build's
+# (HOST_GAME, built first; any game's) writes them, and they are compiled for the iOS SDK.
+execute_process(COMMAND xcrun -f metal RESULT_VARIABLE METAL_RC OUTPUT_QUIET ERROR_QUIET)
+set(EMIT_GAME ${APP})
+set(METAL_SDK macosx)
+if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(HOST_GAME ${CMAKE_SOURCE_DIR}/build/sm3dl CACHE FILEPATH "a Mac build, which writes the shader sources")
+  set(EMIT_GAME ${HOST_GAME})
+  set(METAL_SDK ${IOS_SDK})
+  if(NOT EXISTS ${HOST_GAME})
+    message(STATUS "No Mac build at ${HOST_GAME}: shaders will be compiled at run time")
+    set(METAL_RC 1)
   endif()
 endif()
-file(GLOB PIPELINE_LISTS CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/games/${GAME_TID}/pipelines.bin
-     ${CMAKE_SOURCE_DIR}/games/${GAME_TID}/vsprograms.bin)
-execute_process(COMMAND xcrun -f metal RESULT_VARIABLE METAL_RC OUTPUT_QUIET ERROR_QUIET)
-if(PIPELINE_LISTS AND METAL_RC EQUAL 0)
-  add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/shaders.metallib
-    COMMAND ${GAME} --emit-shaders ${CMAKE_BINARY_DIR}/shaders ${PIPELINE_LISTS}
-    COMMAND sh ${CMAKE_SOURCE_DIR}/tools/build_metallib.sh ${CMAKE_BINARY_DIR}/shaders ${CMAKE_BINARY_DIR}/shaders.metallib
-    DEPENDS ${GAME} ${PIPELINE_LISTS} ${CMAKE_SOURCE_DIR}/tools/build_metallib.sh
-    COMMENT "Precompiling shaders")
-  add_custom_target(shaders ALL DEPENDS ${CMAKE_BINARY_DIR}/shaders.metallib)
-elseif(PIPELINE_LISTS)
-  message(STATUS "No Metal compiler (xcrun metal): shaders will be compiled at run time")
+function(game_shaders name out)
+  set(tid "*")
+  if(EXISTS ${CMAKE_SOURCE_DIR}/data/${name}/info.json)
+    file(READ ${CMAKE_SOURCE_DIR}/data/${name}/info.json info)
+    string(JSON tid ERROR_VARIABLE err GET ${info} program_id)
+    if(err)
+      set(tid "*")
+    endif()
+  endif()
+  file(GLOB lists CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/games/${tid}/pipelines.bin ${CMAKE_SOURCE_DIR}/games/${tid}/vsprograms.bin)
+  if(NOT lists)
+    return()
+  endif()
+  if(NOT METAL_RC EQUAL 0)
+    message(STATUS "No Metal compiler (xcrun metal): ${name}'s shaders will be compiled at run time")
+    return()
+  endif()
+  get_filename_component(dir ${out} NAME_WE)
+  add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/${out}
+    COMMAND ${EMIT_GAME} --emit-shaders ${CMAKE_BINARY_DIR}/${dir} ${lists}
+    COMMAND ${CMAKE_COMMAND} -E env METAL_SDK=${METAL_SDK} sh ${CMAKE_SOURCE_DIR}/tools/build_metallib.sh ${CMAKE_BINARY_DIR}/${dir} ${CMAKE_BINARY_DIR}/${out}
+    DEPENDS ${EMIT_GAME} ${lists} ${CMAKE_SOURCE_DIR}/tools/build_metallib.sh
+    COMMENT "Precompiling ${name}'s shaders")
+  add_custom_target(${dir} ALL DEPENDS ${CMAKE_BINARY_DIR}/${out})
+endfunction()
+if(GAMES)
+  foreach(g ${GAMES})
+    game_shaders(${g} shaders_${g}.metallib)
+  endforeach()
+else()
+  game_shaders(${GAME} shaders.metallib)
 endif()

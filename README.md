@@ -86,12 +86,14 @@ settings. The SD card and shared system data are `sdmc/` and `shared/` next to t
 
 ## In-game menu
 
-Esc (or the gamepad's Home button) pauses the game and opens the menu; arrows or the d-pad choose, Return or
+Esc (or the gamepad's Home button, or Select + Start) pauses the game and opens the menu; arrows or the d-pad choose, Return or
 A selects, left/right change a value, Esc or B goes back. The mouse works too.
 
 - **Saves**: the current save's size and date, back up now, automatic backup at each launch (the last 5 are kept),
   restore or delete a backup, delete the save (a copy is kept), show the folder in Finder. Restoring or deleting
-  restarts the game, since it keeps its save in memory.
+  restarts the game, since it keeps its save in memory. For games whose profile has `unsaved` lines (Animal
+  Crossing), "Forgive unsaved quits" (on by default) clears the mark a session that ended without a save leaves in
+  it, so after a crash or a closed app the game goes on from what it last wrote without scolding the player (Resetti).
 - **Clock**: the 3DS date and time, kept as an offset from the Mac's clock (year, month, day, hour, minute).
 - **Graphics**: internal resolution (auto or 1-4x, live), anti-aliasing and texture filtering (after a restart),
   screen layout (the six F2 layouts), fullscreen, and **separate windows**: the top screen in the main window and
@@ -120,6 +122,57 @@ working directory is what the Homebrew Launcher gives it. The SD card is `save/s
 `~/Library/Application Support/3dsrecomp/sdmc/`). The title id is synthetic, in the homebrew range
 (`0004000000Fxxx00`, from a hash of the SMDH title and author).
 
+### iPhone and iPad
+
+The same runtime builds for iOS 16 or later (iPhone and iPad, arm64), with touch controls and gamepad support:
+one game per app, or every game in one app that starts with a game list. It needs Xcode (not only the command
+line tools) and a Mac build first (`build/sm3dl`; `HOST_GAME` names another), whose binary writes the shader
+sources that the iOS build compiles for the iOS SDK.
+
+1. **SDL3 for iOS** (Homebrew's is macOS only), from an SDL 3.4 or later release source folder
+   ([libsdl-org/SDL](https://github.com/libsdl-org/SDL)), once: `tools/build_sdl_ios.sh <SDL source folder>`
+   (installs static libraries into `external/sdl-ios/`).
+2. **Build**, for the simulator (`iphonesimulator`) or a device (`iphoneos`):
+
+   ```sh
+   cmake -S . -B build-ios-sim -G Ninja -DCMAKE_SYSTEM_NAME=iOS -DCMAKE_OSX_SYSROOT=iphonesimulator \
+     -DCMAKE_OSX_ARCHITECTURES=arm64 -DCMAKE_OSX_DEPLOYMENT_TARGET=16.0 -DGAME=sm3dl
+   ninja -C build-ios-sim
+   ```
+
+3. **Bundle** with the game files: `BUILD=build-ios-sim tools/bundle_ios.sh sm3dl data/sm3dl "Super Mario 3D Land"`,
+   then `xcrun simctl install booted "build-ios-sim/Super Mario 3D Land.app"` and
+   `xcrun simctl launch booted local.3dsrecomp.sm3dl`. For a device, give the script a signing identity and a
+   provisioning profile (`IDENTITY=... PROFILE=<file>.mobileprovision BUNDLE_ID=<its app id>`). A free Apple
+   account's profile works (the app runs for 7 days, then needs signing again); a paid account can add the
+   **Extended Virtual Addressing** capability, which guarantees the 4 GiB the game reserves for its address space.
+
+**Several games in one app**: configure with `-DGAMES="sm3dl;nsmb2;tomodachi;metroid;acnl"` instead of `-DGAME`,
+then `BUILD=<folder> tools/bundle_ios.sh --games sm3dl nsmb2 tomodachi metroid acnl --name "3DS Games"`. The app
+(`recomp`) opens on a list of the games with their icons and names, the last one played selected; each game's
+code is a module (`Frameworks/<name>.dylib`, linked against the app's runtime) loaded once it is chosen, and its
+files are in `games/<name>/`. "Choose another game" in the menu goes back to the list (on iOS by closing the app:
+open it again). The same build works on a Mac: the executable looks for `games/<name>` (links to `data/<name>`)
+next to itself, and `RECOMP_START_GAME=<name>` skips the list.
+
+Playing:
+- **Touch controls**: a circle pad, A/B/X/Y (a finger between two presses both), L/R, Start/Select, a menu
+  button and, when one screen shows at a time, a button that swaps the screens. They sit under the screens when
+  the device is upright and in a column each side when it is sideways; on a phone held sideways one screen shows
+  at a time (the game's profile picks it, as in [Playing on one screen](#playing-on-one-screen)). Fingers
+  elsewhere on the bottom screen touch it. The layout is "Fitted around the touch controls" in the menu.
+- **The corner screen** (one screen at a time): its grip moves it and its handle resizes it, as do two fingers
+  pinching it (or a second finger while one holds the grip); a picture of the top screen moves when dragged.
+  "Always" in the menu's "Other screen in a corner" keeps it on screen.
+- **Gamepads** (MFi, Xbox, PlayStation, Switch Pro, ...) play as on the Mac and hide the touch controls until
+  the screen is touched again; Select + Start opens the menu, since iOS keeps the Home button. A hardware
+  keyboard uses the Mac's keys.
+- The menu is tapped (the title line goes back). Leaving the app opens it, which pauses the game. Restarting
+  the game from the menu closes the app: open it again.
+- Saves live in the app's own container (`Library/Application Support/3dsrecomp/<title id>/`).
+
+On a Mac, `RECOMP_TOUCH=1` shows the touch controls and layout in the window, the mouse acting as a finger.
+
 ## Controls
 
 | 3DS | Keyboard | Gamepad (by position) |
@@ -144,10 +197,12 @@ game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is ther
 - When a game opens the 3DS's system keyboard (names in Tomodachi Life, ...), a text field appears over the
   game: type with the Mac's keyboard (any language and input method, Cmd+V pastes), Return (or the gamepad's A)
   confirms and Esc (B) cancels when the game allows it. The game's length limit and character filters apply.
-- Games that draw their own keyboard on the bottom screen (Animal Crossing: New Leaf's names and town name) can
-  be typed into too when their profile describes it: while that keyboard is up, the Mac's keyboard types by
-  tapping its keys (capitals use its Shift key; Backspace deletes, Return taps Confirm). The keys mapped to 3DS
-  buttons type instead of pressing buttons until the keyboard closes; the arrows and the gamepad still play.
+- Games that draw their own keyboard on the bottom screen can be typed into too when their profile describes
+  it (`keyboard when ...` and the keys' places): while that keyboard is up, the Mac's keyboard types by tapping
+  its keys (capitals use its Shift key; Backspace deletes, Return taps Confirm). The keys mapped to 3DS buttons
+  type instead of pressing buttons until the keyboard closes; the arrows and the gamepad still play. On iOS this
+  needs a hardware keyboard (without one, the game's keyboard is tapped). Animal Crossing: New Leaf's profile maps
+  its keys but has no reliable sign of when its keyboard is up yet, so it is tapped there for now.
 
 ### Playing on one screen
 
@@ -288,6 +343,7 @@ keep the Metal compiler out of gameplay:
 - `RECOMP_VERBOSE=1|2` (or `-v`/`-vv`): kernel and IPC logs.
 - `RECOMP_INPUT` also takes host input for testing the frontend: `<frame>:KEY_<SDL key name>`, typed text
   `<frame>:TEXT_<text>` (no `,` or `:`), `<frame>:MOUSE_DOWN@x/y` (`MOUSE_MOVE`, `MOUSE_UP`) and `<frame>:MOUSE_WHEEL@x/y/dy`, in layout coordinates.
+  With `RECOMP_TOUCH=1`, `<frame>:TOUCH_DOWN@x/y/finger` (`TOUCH_MOVE`, `TOUCH_UP`) are fingers in window points.
 - `RECOMP_TRACE=n`: log the first n dispatcher transitions.
 - `RECOMP_MEMDUMP=<frame>,...`: snapshots of guest memory at those frames (`mem_<frame>_<address>.bin`: the
   data/bss segment and every mapped region), for finding where a game keeps its state by diffing them.
