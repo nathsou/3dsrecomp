@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "audio_iface.h"
+#include "cloud.h"
 #include "gpu_iface.h"
 #include "loader.h"
 #include "profile.h"
@@ -134,6 +135,72 @@ template <class T> void cycle(T &v, const std::vector<T> &opts, int dir) {
     v = opts[(i + dir + (int)opts.size()) % opts.size()];
 }
 std::string onoff(bool b) { return b ? "On" : "Off"; }
+std::string when(time_t t) {
+    char b[64];
+    strftime(b, sizeof b, "%a %d %b, %H:%M", localtime(&t));
+    return b;
+}
+bool cloud_restart;  // a save picked from the cloud: restored (and the game restarted) once it's downloaded
+
+// Cloud saves (runtime/cloud.mm): the bucket, each device's save of this game
+void cloud_rows(std::vector<Row> &r) {
+    CloudView v = cloud_view();
+    if (cloud_restart && !v.fetched.empty()) {  // (restored as any backup is, then the game restarts)
+        cloud_restart = false;
+        SaveBackup b{v.fetched.substr(v.fetched.rfind('/') + 1), v.fetched, 0};
+        if (save_restore(b)) frontend_restart();
+        say("Could not use the downloaded save");
+    }
+    if (cloud_restart && !v.busy && !v.error.empty()) cloud_restart = false;
+    r.push_back({"Cloud saves", "", "", nullptr, nullptr, true});
+    if (!v.configured) {
+        r.push_back({"Connect…", "", "Copy your bucket's line first - s3://<key ID>:<application key>@<endpoint>/<bucket> - "
+                                    "then select this. Every game on this " + std::string(kDevice) + " uses it.",
+                     nullptr, [] {
+#if TARGET_OS_IOS
+                         NSString *str = UIPasteboard.generalPasteboard.string;
+#else
+                         NSString *str = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
+#endif
+                         std::string why;
+                         if (cloud_connect(str ? str.UTF8String : "", &why)) say("Connected");
+                         else say("Can't connect: " + why);
+                     }});
+        return;
+    }
+    static Uint64 asked;  // (listed again when the page is shown, at most every 2 minutes)
+    if (!v.busy && (!asked || SDL_GetTicks() - asked > 120000)) {
+        asked = SDL_GetTicks();
+        if (!v.listed || time(nullptr) - v.listed > 60) cloud_refresh();
+    }
+    std::string line = v.error.empty() ? v.status : v.error;
+    if (v.progress >= 0) line += " " + std::to_string((int)(v.progress * 100)) + "%";
+    r.push_back({"Sync this device", onoff(v.sync), v.where, [v](int) { cloud_set_sync(!v.sync); }});
+    r.push_back({"Status", line.empty() ? (v.busy ? "Working…" : "") : line, "", nullptr, nullptr, true});
+    r.push_back({"Upload now", "", "This device is \"" + v.device + "\" (cloud.ini in the saves folder).", nullptr, [] {
+                     cloud_upload_now();
+                 }});
+    r.push_back({"Check again", "", "", nullptr, [] { cloud_refresh(); }});
+    for (auto &s : v.slots) {
+        std::string note = s.current ? "The save here now." : !s.same_game ? "Made with other game files (another version): not used."
+                                                                           : "Select to use this save instead.";
+        std::function<void()> use;
+        if (!s.current && s.same_game)
+            use = [s] {
+                confirm("Use the save from " + s.device + " (" + when(s.saved) + ")? It replaces the one here, which is "
+                        "backed up first, and the game restarts.",
+                        [s] {
+                            cloud_fetch(s.key);
+                            cloud_restart = true;
+                        });
+            };
+        r.push_back({s.device + (s.mine ? " (this device)" : ""), when(s.saved), note, nullptr, use});
+    }
+    if (v.slots.empty() && v.listed) r.push_back({"No device has uploaded a save of this game yet", "", "", nullptr, nullptr, true});
+    r.push_back({"Disconnect…", "", "", nullptr, [] {
+                     confirm("Stop syncing on this device and forget the key? The saves in the bucket stay.", [] { cloud_disconnect(); });
+                 }});
+}
 bool restart_pending() { return g_settings.msaa != msaa_at_launch || g_settings.aniso != aniso_at_launch; }
 
 std::string clock_text(const char *fmt) {
@@ -193,6 +260,7 @@ std::vector<Row> rows(Page p) {
                          [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:p]];
                      }});
 #endif
+        cloud_rows(r);
         if (save_exists())
             r.push_back({"Delete save…", "", "", nullptr, [] {
                              confirm("Delete the current save and restart the game? A copy is kept in the backups.", [] {
@@ -768,6 +836,7 @@ void toggle() {
     if (open_) {
         push(MAIN);
         fix_sel();
+        cloud_flush();  // (a pause: the save uploaded now if it changed)
     }
     settings_save();
 }

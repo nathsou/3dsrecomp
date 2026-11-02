@@ -10,6 +10,7 @@
 #include <fstream>
 #include <map>
 
+#include "cloud.h"
 #include "kernel.h"
 #include "profile.h"
 
@@ -164,13 +165,16 @@ bool save_restore(const SaveBackup &b) {
         if (fs::exists(src, ec)) fs::copy(src, fs::path(kernel::save_root()) / part, fs::copy_options::recursive, ec);
     }
     LOG("[saves] restored %s%s\n", b.name.c_str(), ec ? (" (error: " + ec.message() + ")").c_str() : "");
+    if (!ec) cloud_restored();
     return !ec;
 }
 
 bool save_delete_current() {
     save_backup_now(" before delete");
     LOG("[saves] deleted the current save (a copy is in backups/)\n");
-    return remove_current();
+    if (!remove_current()) return false;
+    cloud_deleted();
+    return true;
 }
 
 bool save_delete_backup(const SaveBackup &b) {

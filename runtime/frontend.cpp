@@ -2,6 +2,8 @@
 // (GX commands run on this thread). Audio frames are ticked from their own thread.
 #include "frontend.h"
 
+#include "cloud.h"
+
 #include <SDL3/SDL.h>
 #include <TargetConditionals.h>
 #include <pthread/qos.h>
@@ -266,6 +268,7 @@ extern std::string g_start_game;  // main.cpp: (multi-game app) the game playing
     store_geometry(window);
     store_geometry(window2);
     settings_save();
+    cloud_quit();  // (the save, if it changed, uploaded first)
 #if TARGET_OS_IOS
     SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_INFORMATION, g_game.title.c_str(), ios_message, window);
     _exit(0);
@@ -289,6 +292,7 @@ void frontend_quit() {
     store_geometry(window);
     store_geometry(window2);
     settings_save();
+    cloud_quit();
     _exit(0);
 }
 

@@ -94,6 +94,8 @@ A selects, left/right change a value, Esc or B goes back. The mouse works too.
   restarts the game, since it keeps its save in memory. For games whose profile has `unsaved` lines (Animal
   Crossing), "Forgive unsaved quits" (on by default) clears the mark a session that ended without a save leaves in
   it, so after a crash or a closed app the game goes on from what it last wrote without scolding the player (Resetti).
+- **Cloud saves** (on the Saves page): share each game's save between your Macs, iPhones and iPads through your own
+  storage bucket (see [Cloud saves](#cloud-saves)).
 - **Clock**: the 3DS date and time, kept as an offset from the Mac's clock (year, month, day, hour, minute).
 - **Graphics**: internal resolution (auto or 1-4x, live), anti-aliasing and texture filtering (after a restart),
   screen layout (the six F2 layouts), fullscreen, and **separate windows**: the top screen in the main window and
@@ -106,6 +108,42 @@ Settings are per game (`settings.ini`); an environment variable given at launch 
 
 Optional: some games read system archives (Mii data, shared font). Open-source replacements can be imported from
 an Azahar source checkout with `python3 tools/import_system_archives.py <azahar dir>` (writes `system_archives/`).
+
+### Cloud saves
+
+Each device can upload its save of each game to your own S3-compatible bucket (Backblaze B2, Cloudflare R2, AWS S3,
+MinIO), and a game starts with the newest save of it from any device.
+
+- **One file per device and game:** `<title id>/<device>.3dssave`, the game's `savedata/` and `extdata/` as a single
+  tar, with the device's name, when it was saved, which game files (a hash of `code.bin`) and its SHA-256 as the
+  file's metadata. Each upload replaces that device's file, and a device only writes its own, so devices never
+  overwrite each other.
+- **Uploads:** 30 seconds after the game's last write to its save, at most every 10 minutes while playing, and at once
+  when the menu opens (on iOS, also when you leave the app) or the game restarts or quits. Only a save that changed is uploaded.
+- **At launch:** if another device's save is newer than the one here and made with the same game files, it's
+  downloaded, its checksum checked, the save here backed up (`backups/<date> before the save from <device>`) and
+  replaced. A save made with other game files (another version) is never used.
+- **On the Saves page:**
+  - each device's save; selecting one uses it (download, backup, restart);
+  - restoring a backup or picking a save makes it the newest, so the other devices take it at their next launch;
+  - *Delete save* isn't undone by an older save in the bucket.
+
+Setting it up with Backblaze B2:
+
+1. **Bucket:** under B2 Cloud Storage > Buckets, choose Create a Bucket, with Files in Bucket set to Private. Note its
+   endpoint (`s3.eu-central-003.backblazeb2.com`).
+2. **Old versions:** in the bucket's Lifecycle Settings, choose "Keep prior versions for this number of days": 7. Each
+   upload replaces a file, and B2 otherwise keeps every version forever.
+3. **Keys:** under Application Keys, choose Add a New Application Key: one per device, restricted to that bucket, Read
+   and Write. Copy the keyID and applicationKey; Backblaze shows the application key only once.
+4. **Each device's line:** `s3://<keyID>:<applicationKey>@<endpoint>/<bucket>` (a folder may follow the bucket's name).
+   Copy it, open the menu's Saves page, and select *Connect…* (on an iPhone or iPad, Universal Clipboard pastes what
+   was copied on a Mac). It's kept for every game on that device: `<save dir>/cloud.ini`, and the key's secret in
+   `<save dir>/cloud.secret`, readable only by you, or the Keychain on iOS.
+
+The same bucket and lines can serve nx (its Switch games' saves are under their own names, so they don't collide).
+Tests: `RECOMP_CLOUD=<line>` uses that bucket without storing anything (`s3+http://` for a local server such as
+`moto_server`), and `RECOMP_CLOUD_DEVICE=<name>` acts as another device.
 
 ### Homebrew (.3dsx)
 

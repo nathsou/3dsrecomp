@@ -10,6 +10,7 @@
 #include <map>
 #include <mutex>
 
+#include "../cloud.h"
 #include "../loader.h"
 #include "../service.h"
 #include "services.h"
@@ -36,6 +37,18 @@ std::string save_root() {
     char tid[32];
     snprintf(tid, sizeof tid, "%016llx", (unsigned long long)g_game.program_id);
     return g_save_base + "/" + std::string(tid);
+}
+
+}  // namespace kernel
+// Held while the game writes its save, and while cloud saves read it (runtime/cloud.mm): never half a write
+static std::mutex g_save_mx;
+void save_lock() { g_save_mx.lock(); }
+void save_unlock() { g_save_mx.unlock(); }
+namespace kernel {
+// A change to the game's own save (savedata/, extdata/): cloud saves upload it a little later
+static void save_changed(const std::string &path) {
+    static const std::string root = save_root() + "/";
+    if (!path.compare(0, root.size(), root)) cloud_save_written();
 }
 
 // ---- paths
@@ -397,9 +410,12 @@ struct FileSession : Service {
             u64 off = (u64)ipc[1] | ((u64)ipc[2] << 32);
             u32 len = ipc[3];
             u32 src = ipc[6];
+            save_lock();
             s64 n = romfs ? 0 : pwrite(fd, gptr(src), len, (off_t)off);
+            save_unlock();
             if (n < 0) n = 0;
             if (g_verbose) LOG("[fs] write %s off %llx len %x\n", path.c_str(), (unsigned long long)off, len);
+            if (!romfs && n > 0) save_changed(path);
             ipc.ok(2, 2);
             ipc.set(2, (u32)n);
             ipc.set(3, (len << 4) | 0xA);
@@ -412,8 +428,11 @@ struct FileSession : Service {
             break;
         case 0x0805:  // SetSize
             if (!romfs) {
+                save_lock();
                 if (ftruncate(fd, (off_t)((u64)ipc[1] | ((u64)ipc[2] << 32)))) {
                 }
+                save_unlock();
+                save_changed(path);
             }
             ipc.ok();
             break;
@@ -633,6 +652,7 @@ struct FsUser : Service {
             if (!a) { ipc.result(ERR_ARCHIVE); break; }
             std::string path = a->host + sanitize(read_path(ipc[4], ipc[5], ipc[7]).str());
             ipc.result(fsys::remove(path) ? 0 : ERR_FILE_NOT_FOUND);
+            save_changed(path);
             break;
         }
         case 0x0805: {  // RenameFile(transaction, src archive, src type, src size, dst archive, dst type, dst size, ...)
@@ -644,6 +664,7 @@ struct FsUser : Service {
             std::error_code ec;
             fsys::rename(s, d, ec);
             ipc.result(ec ? ERR_FILE_NOT_FOUND : 0);
+            save_changed(d);
             break;
         }
         case 0x0806:    // DeleteDirectory
@@ -655,6 +676,7 @@ struct FsUser : Service {
             if (ipc.cmd() == 0x0807) fsys::remove_all(path, ec);
             else fsys::remove(path, ec);
             ipc.result(ec ? ERR_PATH_NOT_FOUND : 0);
+            save_changed(path);
             break;
         }
         case 0x0808: {  // CreateFile(transaction, archive, path type, size, attrs, filesize u64, desc, ptr)
@@ -671,6 +693,7 @@ struct FsUser : Service {
                 close(fd);
             }
             VLOG("[fs] CreateFile %s size %llx\n", path.c_str(), (unsigned long long)size);
+            save_changed(path);
             ipc.result(fd >= 0 ? 0 : ERR_PATH_NOT_FOUND);
             break;
         }
@@ -682,6 +705,7 @@ struct FsUser : Service {
             std::error_code ec;
             fsys::create_directory(path, ec);
             ipc.result(ec ? ERR_PATH_NOT_FOUND : 0);
+            save_changed(path);
             break;
         }
         case 0x080A: {  // RenameDirectory
@@ -693,6 +717,7 @@ struct FsUser : Service {
             std::error_code ec;
             fsys::rename(s, d, ec);
             ipc.result(ec ? ERR_PATH_NOT_FOUND : 0);
+            save_changed(d);
             break;
         }
         case 0x080B: {  // OpenDirectory(archive u64, type, size, desc, ptr)
@@ -715,6 +740,7 @@ struct FsUser : Service {
             fsys::remove_all(d, ec);
             fsys::create_directories(d);
             LOG("[fs] formatted save data at %s\n", d.c_str());
+            save_changed(d);
             ipc.ok();
             break;
         }
