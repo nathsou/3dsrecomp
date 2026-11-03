@@ -268,7 +268,9 @@ bottom screen never shows as such: the game plays like a single-screen Animal Cr
 - **X** opens the pockets (the game's own button). **ZL** opens a hub of the bottom screen's buttons: pockets,
   designs, Critterpedia, TPC, the map, the tools, chat, save. **−** shows the town map, live and enlarged.
 - **The d-pad** holds the tools in the pockets: up opens a ring of them (with their icons and names), left and right
-  take the previous or next one, down puts the held one away. It works through the pockets' own menus, out of sight.
+  take the previous or next one, down puts the held one away. It asks the game itself, as the pockets' "Hold" does,
+  so the tool comes out with the game's own animation, walking or not. The ring shows an item's icon once the
+  pockets have been open with it inside.
 - **The right stick** tilts the camera up (as L and R do) and, while a menu is up, moves a pointer over it; **ZR**
   touches where it points (for the few things only the touch screen does). The mouse and fingers touch menus too.
 - The Mac's keyboard types into the game's own keyboard (names, letters, chat) whenever it is up.

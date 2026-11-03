@@ -70,3 +70,8 @@ void set_game_code(const GuestEntry *entries, u32 count);  // (RECOMP_MODULES) t
 void set_game_cros(const GuestCro *cros, u32 count);       // (RECOMP_MODULES) its CRO modules' slots, if any
 void run_guest(CPU *c);  // runs until the thread returns to EXIT_MAGIC
 constexpr u32 EXIT_MAGIC = 0xFFFF0000u;
+// Guest calls made by the host, on a guest thread: the hook runs when a thread dispatches to <addr> (an indirect
+// call, such as a virtual method, is about to run there), and may call guest functions with rt_guest_call, which
+// leaves the thread's state as it found it. One hook at a time; addr 0 removes it.
+void rt_set_dispatch_hook(u32 addr, void (*hook)(CPU *c));
+u32 rt_guest_call(CPU *c, u32 fn, u32 a0 = 0, u32 a1 = 0, u32 a2 = 0, u32 a3 = 0);  // fn's r0

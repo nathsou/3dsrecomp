@@ -74,6 +74,8 @@ struct Tools {
     u32 record = 0, first = 0, category_off = 0, kind_lo = 0, kind_hi = 0;
     int icon_size = 28;           // items' icons: squares this big around the pockets, kept while they show
     std::string names;            // item names (RomFS MSBT, or several in a umsbt: the first)
+    u32 hold_fn = 0, hold_on = 0;  // the game's own "hold this item" (fn(&item, 0, 0)), called when its thread
+                                   // dispatches to hold_on; else the pockets are worked through out of sight
 };
 
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none

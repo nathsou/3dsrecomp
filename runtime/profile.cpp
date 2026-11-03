@@ -37,6 +37,11 @@
 //       tool kind, with their names from the game's own files and their icons as the pockets show them (squares
 //       of that size around each pocket, kept while the pockets are open); choosing one opens the pockets out of
 //       sight, taps it and picks the first choice ("Hold"); putting the held one away taps the portrait.
+//   tools hold <function> on <address>
+//       Tools are held with the game's own request instead: <function>(&item, 0, 0) (true: the change of tools
+//       starts; the empty item puts the held one away), called on the game's thread as it dispatches to <address>
+//       (an indirect call, e.g. the player's update through its vtable). The pocket gets the tool that was in hand
+//       once the new one is.
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -417,6 +422,13 @@ bool parse_line(const std::string &line, std::string &err) {
                 c.slots.push_back({(int)x, (int)y});
             }
             return true;
+        }
+        if (t[1] == "hold") {
+            if (t.size() != 5 || t[3] != "on") {
+                err = "expected 'tools hold <function> on <address>'";
+                return false;
+            }
+            return n(2, c.hold_fn) && n(4, c.hold_on);
         }
         if (t[1] == "equip") {
             u32 x, y;

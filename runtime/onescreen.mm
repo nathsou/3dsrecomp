@@ -1,17 +1,21 @@
 // One-screen play (onescreen.h): binds, the hub, the map, the tool ring and the pointer, drawn over the top screen.
 // Everything acts on the game through its own inputs: taps on the bottom screen where its buttons are, presses,
-// and its pockets' own menus, so the game's state never changes behind its back.
+// and its pockets' own menus, so the game's state never changes behind its back; tools can instead be taken out
+// with the game's own call for it ("tools hold"), made on its thread.
 #include "onescreen.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <atomic>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
 #include "profile.h"
+#include "rt.h"
 #include "settings.h"
 #include "text.h"
 
@@ -214,12 +218,99 @@ void macro_close_pockets(std::vector<Step> &m) {
 }
 
 
+// ---- holding through the game's own call ("tools hold"): asked for on the UI thread, made on the game's thread
+// when it dispatches to the profile's address. The pocket the tool came from (or the first free one, putting it
+// away) gets the one that was in hand only once the game has the new one in hand: a change the game refuses or
+// cuts short loses nothing.
+struct HoldAsk {
+    u32 item;       // to hold (the empty item: hands free)
+    int slot;       // the pocket it is in, or -1: the first free one takes the held tool
+    u32 pockets, held;  // their addresses
+};
+std::mutex hold_m;
+bool hold_asked;
+HoldAsk hold_ask;
+std::atomic<bool> hold_busy{false};  // a request waits or the game is changing tools
+std::atomic<int> hold_refused{0};    // requests the game turned down (the UI thread says so)
+constexpr int kHoldFrames = 180;     // the game's change takes about a second; past this it did not happen
+
+u32 item_at(u32 a) { return r16(a) | (u32)r16(a + 2) << 16; }  // (4 bytes, 2-aligned)
+
+void hold_hook(CPU *c) {
+    static HoldAsk now;
+    static int left;  // frames the change in progress has left
+    static u32 was;   // the item in hand before it
+    const profile::Tools &t = profile::tools();
+    if (left > 0) {
+        if (r16(now.held) == (now.item & 0xffff)) {  // in hand: the old one goes to the pocket
+            int slot = now.slot;
+            for (int i = 0; slot < 0 && i < kSlots; i++)
+                if (r16(now.pockets + 4 * i) == t.empty) slot = i;
+            if (slot >= 0) w32(now.pockets + 4 * slot, (was & 0xffff) == t.empty ? t.empty : was);
+            left = 0;
+            hold_busy = false;
+        } else if (--left == 0) {
+            hold_busy = false;
+        }
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> g(hold_m);
+        if (!hold_asked) return;
+        hold_asked = false;
+        now = hold_ask;
+    }
+    was = item_at(now.held);
+    const u32 sp = c->r[13];
+    c->r[13] = (sp - 16) & ~7u;  // the item, where the call's own stack does not reach
+    w32(c->r[13], now.item);
+    const bool ok = rt_guest_call(c, t.hold_fn, c->r[13], 0, 0) & 0xff;
+    c->r[13] = sp;
+    if (ok) {
+        left = kHoldFrames;
+    } else {
+        hold_refused++;
+        hold_busy = false;
+    }
+}
+
+// asks the game to hold t (or to put the held tool away)
+void hold_call(const Tool &t) {
+    const profile::Tools &c = profile::tools();
+    u32 pockets, held;
+    if (!profile::value_address(c.pockets, pockets) || !profile::value_address(c.held, held)) return;
+    if (t.slot < 0) {
+        bool space = false;
+        for (int i = 0; i < kSlots; i++) space |= r16(pockets + 4 * i) == c.empty;
+        if (!space) {
+            say("Your pockets are full");
+            return;
+        }
+    }
+    static bool hooked;
+    if (!hooked) {
+        hooked = true;
+        rt_set_dispatch_hook(c.hold_on, hold_hook);
+    }
+    std::lock_guard<std::mutex> g(hold_m);
+    hold_ask = {t.slot >= 0 ? t.item : c.empty, t.slot, pockets, held};
+    hold_asked = true;
+    hold_busy = true;
+}
+
 // holds a tool: taps its pocket and picks the menu's first choice ("Hold"), or puts the held one away: taps the
-// portrait and picks its first choice ("Remove Equipment"); the pockets stay out of sight meanwhile
+// portrait and picks its first choice ("Remove Equipment"); the pockets stay out of sight meanwhile. With the
+// game's own call ("tools hold") it is asked for directly.
 void use_tool(const Tool &t) {
     const profile::Tools &c = profile::tools();
     if (!profile::cond(c.ready_cond)) {
         say("Not now");
+        return;
+    }
+    load_items();
+    if (c.hold_fn) {
+        hold_call(t);
+        say(t.slot >= 0 ? item_name(t.item) : "Hands free");
         return;
     }
     if ((int)c.slots.size() < kSlots) return;
@@ -233,9 +324,11 @@ void use_tool(const Tool &t) {
     macro_close_pockets(m);
     macro = m;
     step_frame = 0;
-    load_items();
     say(t.slot >= 0 ? item_name(t.item) : "Hands free");
 }
+
+// a tool is being taken out (presses meanwhile are queued)
+bool tool_busy() { return !macro.empty() || hold_busy; }
 
 // the next or previous tool after the one in hand (quick switching), steps ahead (presses made while one was
 // being taken out count)
@@ -529,7 +622,12 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
     while (!macro.empty() && step_frame == 0 && macro.front().if_cond >= -1 && !profile::cond(macro.front().if_cond))
         macro.erase(macro.begin());
     static int pending_wait;
-    if (macro.empty() && pending_steps) {  // tool switches asked for meanwhile, once the field is back
+    static int refused_seen;
+    if (hold_refused != refused_seen) {
+        refused_seen = hold_refused;
+        say("Not now");
+    }
+    if (!tool_busy() && pending_steps) {  // tool switches asked for meanwhile, once the field is back
         if (profile::cond(profile::tools().ready_cond) && !panel_r.w) {
             const int n = pending_steps;
             pending_steps = 0;
@@ -635,8 +733,8 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
         if (b->target == "hub") open_overlay(HUB);
         else if (b->target == "map") open_overlay(MAP);
         else if (b->target == "tools") open_overlay(TOOLS);
-        else if (b->target == "tool-next") cycle_tool(1);
-        else if (b->target == "tool-prev") cycle_tool(-1);
+        else if (b->target == "tool-next") tool_busy() ? (void)pending_steps++ : cycle_tool(1);
+        else if (b->target == "tool-prev") tool_busy() ? (void)pending_steps-- : cycle_tool(-1);
         else if (b->target == "tool-away") {
             load_items();
             u32 held;
