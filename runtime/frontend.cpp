@@ -526,6 +526,12 @@ static void type_key(const std::string &k) {
     if (key_taps.empty()) key_tap_start = frame_count;
     key_taps.push_back({x, y});
 }
+static std::mutex live_text_m;
+static std::string live_text;  // RECOMP_LIVE's TEXT, typed at the next frame
+void frontend_live_text(const std::string &s) {
+    std::lock_guard<std::mutex> lk(live_text_m);
+    live_text += s;
+}
 static void type_text(const std::string &s) {
     for (size_t i = 0; i < s.size();) {
         size_t j = i + 1;
@@ -1349,6 +1355,11 @@ void frontend_run() {
             continue;
         }
         // host events once per frame (pumping the macOS event loop is not free)
+        {
+            std::lock_guard<std::mutex> lk(live_text_m);
+            if (!live_text.empty()) type_text(live_text);  // (RECOMP_LIVE's TEXT: the game's own keyboard)
+            live_text.clear();
+        }
         for (auto &k : script_keys)
             if (k.frame == frame_count && k.finger) {
                 int ww, wh;

@@ -69,7 +69,6 @@ hub "TPC" tap 178 12 icon 158 0 48 22 when map != 0
 hub "Map" map when map != 0
 hub "Tools" tools when map != 0
 hub "Chat" tap 160 226 icon 136 214 48 26 when map != 0
-hub "Options" press SELECT glyph "⚙" when map != 0
 hub "Save" press START glyph "✓" when map != 0
 map 64 27 192 184 when map != 0
 

@@ -528,7 +528,7 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
     if (panel && (std::fabs(rsx) > 0.2f || std::fabs(rsy) > 0.2f)) {
         auto curve = [](float v) { return (v < 0 ? -1 : 1) * std::max(0.0f, std::fabs(v) - 0.2f) / 0.8f; };
         ptr_x = std::clamp(ptr_x + curve(rsx) * std::fabs(curve(rsx)) * kPointerSpeed * 2, 0.0f, 319.0f);
-        ptr_y = std::clamp(ptr_y + curve(rsy) * std::fabs(curve(rsy)) * kPointerSpeed * 2, 0.0f, 239.0f);
+        ptr_y = std::clamp(ptr_y - curve(rsy) * std::fabs(curve(rsy)) * kPointerSpeed * 2, 0.0f, 239.0f);  // (up: -y)
         ptr_idle = 0;
     } else {
         ptr_idle++;
@@ -845,9 +845,12 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
     if (panel_r.w && ptr_idle < 120 && overlay == NONE) {
         const float a = ptr_idle < 90 ? 1 : (120 - ptr_idle) / 30.0f;
         const float x = panel_r.x + ptr_x * panel_r.w / 320, y = panel_r.y + ptr_y * panel_r.h / 240;
-        rounded_rect(r, nullptr, {x - 7 * k, y - 7 * k, 14 * k, 14 * k}, 7 * k, {0, 0, 0, 0.35f * a});
-        rounded_rect(r, nullptr, {x - 5 * k, y - 5 * k, 10 * k, 10 * k}, 5 * k, {1, 1, 1, 0.95f * a});
-        rounded_rect(r, nullptr, {x - 2.5f * k, y - 2.5f * k, 5 * k, 5 * k}, 2.5f * k, {0.36f, 0.76f, 0.69f, a});
+        const bool down = (prev_host & H_ZR) != 0;  // (pressed: smaller, as a finger touching)
+        const float o = down ? 8 : 10;
+        rounded_rect(r, nullptr, {x - o * k, y - o * k, 2 * o * k, 2 * o * k}, o * k, {0, 0, 0, 0.35f * a});
+        rounded_rect(r, nullptr, {x - (o - 2) * k, y - (o - 2) * k, 2 * (o - 2) * k, 2 * (o - 2) * k}, (o - 2) * k,
+                     {1, 1, 1, 0.95f * a});
+        rounded_rect(r, nullptr, {x - 3.5f * k, y - 3.5f * k, 7 * k, 7 * k}, 3.5f * k, {0.36f, 0.76f, 0.69f, a});
     }
     if (toast_left > 0) {
         const float a = std::min(1.0f, toast_left / 15.0f);
