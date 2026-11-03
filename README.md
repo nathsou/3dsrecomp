@@ -272,6 +272,8 @@ bottom screen never shows as such: the game plays like a single-screen Animal Cr
 - **The right stick** tilts the camera up (as L and R do) and, while a menu is up, moves a pointer over it; **ZR**
   touches where it points (for the few things only the touch screen does). The mouse and fingers touch menus too.
 - The Mac's keyboard types into the game's own keyboard (names, letters, chat) whenever it is up.
+- Tab, the right stick's click and the touch controls' swap button open the hub too (on iOS the hub's entries
+  and the menus are tapped).
 
 The keyboard's keys stand for the gamepad's as in the controls table (1 is ZL, Backspace is −, I J K L the d-pad).
 

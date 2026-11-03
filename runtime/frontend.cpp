@@ -1272,6 +1272,10 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
 // Tab, a right stick click or the swap button: the other screen (for now, when the game's profile picks it)
 static void swap_screens() {
     if (window2) return;
+    if (onescreen::active()) {  // one-screen play: the bottom screen's buttons are in the hub
+        onescreen::toggle_hub();
+        return;
+    }
     if (single_layout() && (auto_focus() != profile::FOCUS_NONE || swapped_layout(layout) == layout)) {
         manual_flip ^= 1;  // the profile picks the screen, or no layout has the other one: look at it for now
         pip_alpha = 0;

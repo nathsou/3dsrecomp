@@ -26,6 +26,7 @@ void set_state(bool active, const SDL_FRect &top, const SDL_FRect &panel);
 bool active();
 bool overlay_open();  // the hub, the map or the tool ring is up (it takes the game's input)
 bool busy();          // an overlay is playing inputs on the game (the panel stays hidden)
+void toggle_hub();    // the hub, from the screen-swap button (Tab, the right stick's click, the touch button)
 
 // host inputs (and the right stick, -1..1) -> the game's: binds, overlays, the pointer; buttons/cx/cy hold the
 // default translation on entry (unbound inputs play their own 3DS button) and may be replaced

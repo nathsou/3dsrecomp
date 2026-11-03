@@ -499,6 +499,12 @@ void set_state(bool active, const SDL_FRect &top, const SDL_FRect &panel) {
 }
 
 bool active() { return on; }
+void toggle_hub() {
+    if (overlay == HUB) overlay = NONE;
+    else if (overlay == NONE && available("hub")) open_overlay(HUB);
+    else if (overlay != NONE) overlay = NONE;
+    else say("Not now");
+}
 bool busy() { return on && !macro.empty(); }
 bool overlay_open() { return on && overlay != NONE; }
 
