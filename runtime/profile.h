@@ -91,6 +91,16 @@ struct Stacks {
     std::vector<u8> free_states;  // ...is one of these (none: while the tools' ready condition holds)
 };
 
+// aiming with a stick and the mouse through the game's own data (runtime/aim.cpp)
+struct Aim {
+    u32 pad_on = 0, mode_off = 0, stick_x = 0, stick_y = 0;  // the pad copy's address, offsets in the pad state
+    u8 mode = 0;                                              // the game's stick-aiming mode
+    u32 delta_ret = 0, delta_x = 0, delta_y = 0;              // where the frame's aim delta is (sp + offsets)
+    int delta_per = -1;                                       // a rate: the frame time is in this s register
+    std::vector<u32> delta_on;                                // calls made while it is there
+    int cond = -2;                                            // when it applies (-2: never)
+};
+
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none
 bool loaded();
 bool has_focus_rules();
@@ -114,6 +124,7 @@ const std::vector<HubEntry> &hub();
 const std::vector<MapArea> &map_areas();
 const Tools &tools();
 const Stacks &stacks();
+const Aim &aim();
 // read from guest memory now, from any thread (runtime flags: as of the last update)
 bool value_now(int i, s64 &v, u32 *at = nullptr);
 bool cond_now(int i);

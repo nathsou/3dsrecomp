@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "aim.h"
 #include "audio_iface.h"
 #include "gpu_iface.h"
 #include "kernel.h"
@@ -1158,11 +1159,31 @@ static u32 host_input(float &rsx, float &rsy) {
     return h;
 }
 
+// Aiming (aim.h): the mouse is captured while the game's profile says aiming applies; its motion (window points)
+// is handed over each frame. RECOMP_LIVE's MOUSEREL adds to it (frontend_live_mouse).
+static bool aiming;
+static float aim_mx, aim_my;
+constexpr float kMouseAim = 0.35f;  // top-screen pixels of aim per window point of mouse motion
+static std::atomic<int> live_mx, live_my;  // (1/16 points)
+void frontend_live_mouse(float dx, float dy) {
+    live_mx += (int)std::lround(dx * 16);
+    live_my += (int)std::lround(dy * 16);
+}
+static void update_aim(float &rsx, float &rsy) {
+    const float mx = aim_mx + live_mx.exchange(0) / 16.0f, my = aim_my + live_my.exchange(0) / 16.0f;
+    aim_mx = aim_my = 0;
+    aiming = aim::update(rsx, rsy, mx * kMouseAim, my * kMouseAim) && !paused;
+    const bool capture = aiming && SDL_GetKeyboardFocus() == window && !touch::enabled();
+    if (capture != SDL_GetWindowRelativeMouseMode(window)) SDL_SetWindowRelativeMouseMode(window, capture);
+    if (aiming) rsx = rsy = 0;  // (the right stick aims: no pointer, no binds)
+}
+
 static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty);
 static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
     poll_input_devices(buttons, cx, cy, touch, tx, ty);
     float rsx, rsy;
     const u32 host = host_input(rsx, rsy);
+    update_aim(rsx, rsy);
     if (const u32 live = g_live_host; live) {  // (scripted host input: its default buttons too)
         static const u32 defaults[][2] = {
             {onescreen::H_A, BTN_A}, {onescreen::H_B, BTN_B}, {onescreen::H_X, BTN_X}, {onescreen::H_Y, BTN_Y},
@@ -1182,10 +1203,10 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
     buttons = 0;
     if (kb[SDL_SCANCODE_X]) buttons |= BTN_A;
     if (kb[SDL_SCANCODE_Z]) buttons |= BTN_B;
-    if (kb[SDL_SCANCODE_S]) buttons |= BTN_X;
-    if (kb[SDL_SCANCODE_A]) buttons |= BTN_Y;
+    if (kb[SDL_SCANCODE_S] && !aiming) buttons |= BTN_X;  // (while aiming WASD move, see below)
+    if (kb[SDL_SCANCODE_A] && !aiming) buttons |= BTN_Y;
     if (kb[SDL_SCANCODE_Q]) buttons |= BTN_L;
-    if (kb[SDL_SCANCODE_W]) buttons |= BTN_R;
+    if (kb[SDL_SCANCODE_W] && !aiming) buttons |= BTN_R;
     if (kb[SDL_SCANCODE_1]) buttons |= BTN_ZL;
     if (kb[SDL_SCANCODE_2]) buttons |= BTN_ZR;
     if (kb[SDL_SCANCODE_RETURN]) buttons |= BTN_START;
@@ -1199,6 +1220,16 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
     if (k[SDL_SCANCODE_RIGHT]) x += 1;
     if (k[SDL_SCANCODE_UP]) y += 1;
     if (k[SDL_SCANCODE_DOWN]) y -= 1;
+    if (aiming) {  // mouse and keyboard play: WASD move, the left button fires (L), the right one is R
+        if (kb[SDL_SCANCODE_A]) x -= 1;
+        if (kb[SDL_SCANCODE_D]) x += 1;
+        if (kb[SDL_SCANCODE_W]) y += 1;
+        if (kb[SDL_SCANCODE_S]) y -= 1;
+        x = std::clamp(x, -1, 1), y = std::clamp(y, -1, 1);
+        const SDL_MouseButtonFlags b = SDL_GetMouseState(nullptr, nullptr);
+        if (b & SDL_BUTTON_LMASK) buttons |= BTN_L;
+        if (b & SDL_BUTTON_RMASK) buttons |= BTN_R;
+    }
     cx = (s16)(x * 155);
     cy = (s16)(y * 155);
     if (pad) {
@@ -1267,7 +1298,7 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
             tx = (u16)lx;
             ty = (u16)ly;
         }
-    } else if (!touch && !pip_drag && (mb & SDL_BUTTON_LMASK) && SDL_GetMouseFocus() == window) {
+    } else if (!touch && !pip_drag && !aiming && (mb & SDL_BUTTON_LMASK) && SDL_GetMouseFocus() == window) {
         int x, y;  // touch: the mouse on the bottom screen, wherever it is
         if (bottom_at(mx, my, x, y)) {
             touch = true;
@@ -1514,6 +1545,15 @@ void frontend_run() {
                     hud_tap_y = b->ty;
                     hud_tap_until = frame_count + 6;
                 }
+            if (aiming && SDL_GetWindowRelativeMouseMode(window)) {  // the captured mouse aims
+                if (ev.type == SDL_EVENT_MOUSE_MOTION) {
+                    aim_mx += ev.motion.xrel;
+                    aim_my += ev.motion.yrel;
+                }
+                if (ev.type == SDL_EVENT_MOUSE_MOTION || ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+                    ev.type == SDL_EVENT_MOUSE_BUTTON_UP || ev.type == SDL_EVENT_MOUSE_WHEEL)
+                    continue;
+            }
             if (!touch::enabled() && pip_mouse(ev)) continue;
             if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT &&
                 onescreen::overlay_open() && SDL_GetWindowFromID(ev.button.windowID) == window) {
