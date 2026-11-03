@@ -33,6 +33,7 @@ class Analyzer:
         self.notes = defaultdict(int)
         self.rel_tables = set()
         self.pc_rel_ptrs = set()
+        self.base_tables = set()  # tables of offsets from their own start to code (hand-written call tables)
         self.extra = set()
 
     def decode(self, addr, th):
@@ -108,7 +109,7 @@ class Analyzer:
         if i.kind == JMP and not i.ret:
             # `mov lr, pc` / `add lr, pc, #n` then a write to pc: an indirect call
             link = None
-            for back in (1, 2):
+            for back in (1, 2, 3, 4):
                 pa = i.addr - 4 * back
                 p = img.read32(pa)
                 if p is None:
@@ -126,6 +127,15 @@ class Analyzer:
                 i.link = link
                 i.size = link - i.addr
                 i.note += ' (call via lr)'
+        if i.kind in (JMP, ICALL) and (i.word & 0x0FF0FFF0) == 0x0080F000 and i.word >> 28 == 14:
+            # `sub rB, pc, #n` (or add), `ldr rA, [rB, rX, lsl #2]`, `add pc, rA, rB`: a table of offsets from its
+            # own start (hand-written code: Kid Icarus: Uprising's video decoder calls its pieces this way)
+            base = None
+            for ra, rb in (((i.word >> 16) & 15, i.word & 15), (i.word & 15, (i.word >> 16) & 15)):  # (either order)
+                base = self.offset_table_base(i.addr, ra, rb)
+                if base is not None:
+                    self.base_tables.add(base)
+                    break
         if i.kind == OP and (i.word & 0x0FEF0000) == 0x008F0000 and (i.word & 0xFF0) == 0:
             # `add rX, pc, rY` with rY loaded from a literal shortly before: a pc-relative code/data pointer
             ry = i.word & 15
@@ -149,6 +159,38 @@ class Analyzer:
                     lit = img.ro_read(i.addr - 4 + 8 + (p & 0xFFF))
                     if lit is not None:
                         self.rel_tables.add((i.addr + 8 + lit) & 0xFFFFFFFF)
+
+    def adr_target(self, i):
+        """The address an ARM `add/sub rX, pc, #imm` makes, with a second `add/sub rX, rX, #imm` right after it
+        (hand-written code reaching further than one immediate: Kid Icarus: Uprising's video decoder)."""
+        def imm(w):
+            return arm.ror(w & 0xFF, ((w >> 8) & 15) * 2)
+        sign = 1 if (i.word >> 21) & 15 == 4 else -1
+        v = i.addr + 8 + sign * imm(i.word)
+        rx = (i.word >> 12) & 15
+        n = self.img.read32(i.addr + 4)
+        if n is not None and n >> 28 == 14 and (n & 0x0FDFF000) == (0x02400000 | rx << 16 | rx << 12):
+            v += (1 if (n >> 21) & 15 == 4 else -1) * imm(n)
+        return v & 0xFFFFFFFF
+
+    def offset_table_base(self, a, ra, rb):
+        """Before `add pc, rA, rB` at a: `ldr rA, [rB, rX, lsl #2]` after `sub rB, pc, #n` (or add): the table's start."""
+        img = self.img
+        loaded = False
+        for back in range(1, 8):
+            pa = a - 4 * back
+            p = img.read32(pa)
+            if p is None or p >> 28 != 14:
+                return None
+            if not loaded and (p & 0x0FFFF070) == (0x07900000 | (rb << 16) | (ra << 12)) and (p >> 7) & 31 == 2:
+                loaded = True
+                continue
+            if loaded and (p & 0x0FFFF000) in (0x024F0000 | (rb << 12), 0x028F0000 | (rb << 12)):
+                imm = arm.ror(p & 0xFF, ((p >> 8) & 15) * 2)
+                return (pa + 8 - imm if (p >> 21) & 15 == 2 else pa + 8 + imm) & 0xFFFFFFFF
+            if (p >> 12) & 15 in (ra, rb, 15) or (p >> 25) & 7 in (4, 5):
+                return None
+        return None
 
     # ------------------------------------------------------------ jump tables
     def jump_table(self, i, th):
@@ -495,8 +537,8 @@ class Analyzer:
                         v = img.read32(i.reads_pc_lit)
                         if v is not None and img.in_text(v & ~1):
                             lit_candidates.add(v)
-                    if i.kind == OP and not i.thumb and (i.word & 0x0FFF0000) == 0x028F0000:  # ADR (add rX, pc, #imm)
-                        v = (i.addr + 8 + arm.ror(i.word & 0xFF, ((i.word >> 8) & 15) * 2)) & 0xFFFFFFFF
+                    if i.kind == OP and not i.thumb and (i.word & 0x0FDF0000) == 0x024F0000:  # ADR (add/sub rX, pc, #imm)
+                        v = self.adr_target(i)
                         if img.in_text(v & ~1):
                             lit_candidates.add(v)
             for v in self.pc_rel_ptrs:
@@ -513,6 +555,13 @@ class Analyzer:
                         break
                     lit_candidates.add(f)
                     k += 1
+            for t in sorted(self.base_tables):
+                for k in range(256):
+                    w = img.read32(t + 4 * k)
+                    if w is None or w >= 0x10000 or w & 3:
+                        break  # (small forward offsets to ARM code; the code after the table ends it)
+                    if img.in_text(t + w):
+                        lit_candidates.add(t + w)
             added = 0
             for v in sorted(self.extra):
                 if v not in self.funcs:
