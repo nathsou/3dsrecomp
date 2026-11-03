@@ -46,7 +46,7 @@ struct Button {
 struct Bind {
     std::string host;    // a gamepad input by position: a b x y l r zl zr start back ls rs dup ddown dleft dright
                          // rs-up rs-down rs-left rs-right
-    std::string target;  // hub map tools wheel pointer none, or 3DS buttons (A+B, DUP, ...)
+    std::string target;  // hub map tools tool-next tool-prev tool-away pointer none, or 3DS buttons (A+B, DUP, ...)
     u32 buttons = 0;     // the 3DS buttons, when it is buttons
 };
 struct HubEntry {

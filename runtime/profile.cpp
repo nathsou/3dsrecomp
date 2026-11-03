@@ -42,7 +42,7 @@
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
 //   onescreen
 //       In the single-screen layouts the bottom screen never shows in a corner: the profile's panel and overlays
-//       (hub, map, wheel, tools) stand in for it.
+//       (hub, map, tools) stand in for it.
 //   hud [when <condition>]
 //       When the HUD is drawn over the top screen.
 //   icon <name> <romfs path>[:<file inside a NARC/SARC/DARC archive>] [rect <x> <y> <w> <h>] [scale <s>]
@@ -60,9 +60,9 @@
 //       What the HUD action button (keyboard E, gamepad left stick click) does: tap the bottom screen there.
 //   keyboard [when <condition>]
 //       When the game's own keyboard is on the bottom screen: the Mac's keyboard then types by tapping its keys.
-//   key <characters | space | backspace | shift | enter> at <x> <y> [step <dx>]
+//   key <characters | space | backspace | shift | enter | escape> at <x> <y> [step <dx>]
 //       Where the keys are, in bottom-screen pixels (320x240): one named key, or a row of characters <dx> apart.
-//       A letter typed in upper case taps "shift" first; Return taps "enter".
+//       A letter typed in upper case taps "shift" first; Return taps "enter", Esc "escape" (closing the keyboard).
 //   unsaved <save file> <offset> <bits> crc32c <block> <size>
 //       Bits the game sets in its save when a session starts and clears when it saves, which a session that ends
 //       without a save leaves set (Animal Crossing scolds the player for it). With the menu's "Forgive unsaved
@@ -308,8 +308,8 @@ bool parse_line(const std::string &line, std::string &err) {
             return false;
         }
         Bind b{t[1], t[2], 0};
-        static const char *overlays[] = {"hub", "map", "tools", "tool-next", "tool-prev", "tool-away", "wheel",
-                                         "pointer", "none"};
+        static const char *overlays[] = {"hub", "map", "tools", "tool-next", "tool-prev", "tool-away", "pointer",
+                                         "none"};
         if (std::find(std::begin(overlays), std::end(overlays), t[2]) == std::end(overlays) &&
             !(b.buttons = button_mask(t[2]))) {
             err = "unknown target " + t[2];
@@ -556,7 +556,7 @@ bool parse_line(const std::string &line, std::string &err) {
             err = "expected 'key <characters> at <x> <y> [step <dx>]'";
             return false;
         }
-        static const char *named[] = {"space", "backspace", "shift", "enter"};
+        static const char *named[] = {"space", "backspace", "shift", "enter", "escape"};
         if (std::find(std::begin(named), std::end(named), t[1]) != std::end(named)) {
             keys[t[1]] = {(int)x, (int)y};
             return true;

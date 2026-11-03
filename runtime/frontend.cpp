@@ -1441,6 +1441,12 @@ void frontend_run() {
             }
             if (ev.type == SDL_EVENT_WINDOW_MOVED || ev.type == SDL_EVENT_WINDOW_RESIZED)
                 store_geometry(SDL_GetWindowFromID(ev.window.windowID));
+            int ex, ey;  // Esc while the game's own keyboard is up: its close key, when the profile names one
+            if (typing && ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_ESCAPE && !menu::is_open() &&
+                profile::key("escape", ex, ey)) {
+                type_key("escape");
+                continue;
+            }
             if (menu::handle_event(ev)) continue;
             if (touch::enabled()) {  // fingers; the mouse events iOS makes from them were only for the menu
                 if (!menu::is_open() && !menu::keyboard_open() && touch::handle_event(ev)) continue;

@@ -194,12 +194,12 @@ void macro_open_pockets(std::vector<Step> &m) {
     w.frames = 120;
     w.or_abort = true;
     m.push_back(w);
-    m.push_back({0, 45});  // (the pockets slide in and take touches)
+    m.push_back({0, 26});  // (the pockets slide in and take touches)
 }
 
 void macro_close_pockets(std::vector<Step> &m) {
     const profile::Tools &c = profile::tools();
-    m.push_back({0, 20});
+    m.push_back({0, 6});
     for (int i = 0; i < 4; i++) {  // B until they close (it is not taken while they are busy)
         Step b{1u << 1, 6};
         b.if_cond = c.open_cond;
@@ -227,9 +227,9 @@ void use_tool(const Tool &t) {
     macro_open_pockets(m);
     if (t.slot >= 0) tap(m, c.slots[t.slot].first, c.slots[t.slot].second);
     else tap(m, c.portrait_x, c.portrait_y);
-    m.push_back({0, 30});       // (the choices open)
+    m.push_back({0, 16});       // (the choices open)
     m.push_back({1u << 0, 6});  // A: the first choice
-    m.push_back({0, 30});
+    m.push_back({0, 14});
     macro_close_pockets(m);
     macro = m;
     step_frame = 0;
@@ -237,8 +237,11 @@ void use_tool(const Tool &t) {
     say(t.slot >= 0 ? item_name(t.item) : "Hands free");
 }
 
-// the next or previous tool after the one in hand (quick switching)
-void cycle_tool(int dir) {
+// the next or previous tool after the one in hand (quick switching), steps ahead (presses made while one was
+// being taken out count)
+int pending_steps;
+void cycle_tool(int steps) {
+    const int dir = steps > 0 ? 1 : -1;
     load_items();
     u32 held;
     std::vector<Tool> v = tool_list(held);
@@ -252,11 +255,14 @@ void cycle_tool(int dir) {
     // the pockets in order: the tool after (or before) the last one taken out, whose slot the held one takes
     static int last = -1;
     const Tool *pick = nullptr;
-    for (auto &t : pockets)
-        if (dir > 0 ? t.slot > last && (!pick || t.slot < pick->slot) : t.slot < last && (!pick || t.slot > pick->slot))
-            pick = &t;
-    if (!pick) pick = dir > 0 ? &pockets.front() : &pockets.back();
-    last = pick->slot;
+    for (int n = 0; n < std::abs(steps); n++) {
+        pick = nullptr;
+        for (auto &t : pockets)
+            if (dir > 0 ? t.slot > last && (!pick || t.slot < pick->slot) : t.slot < last && (!pick || t.slot > pick->slot))
+                pick = &t;
+        if (!pick) pick = dir > 0 ? &pockets.front() : &pockets.back();
+        last = pick->slot;
+    }
     use_tool(*pick);
 }
 
@@ -521,7 +527,25 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
     // a scripted sequence plays alone (B or the start of another input does not stop it: it is short)
     while (!macro.empty() && step_frame == 0 && macro.front().if_cond >= -1 && !profile::cond(macro.front().if_cond))
         macro.erase(macro.begin());
+    static int pending_wait;
+    if (macro.empty() && pending_steps) {  // tool switches asked for meanwhile, once the field is back
+        if (profile::cond(profile::tools().ready_cond) && !panel_r.w) {
+            const int n = pending_steps;
+            pending_steps = 0;
+            cycle_tool(n);
+        } else if (++pending_wait > 180) {
+            pending_steps = 0;
+        }
+    } else {
+        pending_wait = 0;
+    }
     if (!macro.empty()) {
+        for (const HostName &h : kHostNames)  // (switching on while one is being taken out: queued)
+            if (pressed & h.bit)
+                if (const profile::Bind *b = bound(h.bit)) {
+                    if (b->target == "tool-next") pending_steps++;
+                    if (b->target == "tool-prev") pending_steps--;
+                }
         Step &s = macro.front();
         buttons = s.buttons;
         cx = cy = 0;
@@ -600,7 +624,11 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
             }
             continue;
         }
-        if (!available(b->target)) continue;
+        if (!available(b->target)) {
+            // (the hub and the map have no button of their own on the game's side: say why nothing happens)
+            if ((pressed & h.bit) && !panel_r.w && (b->target == "hub" || b->target == "map")) say("Not now");
+            continue;
+        }
         buttons &= ~default_button(h.bit);
         if (!(pressed & h.bit)) continue;
         if (b->target == "hub") open_overlay(HUB);

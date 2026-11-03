@@ -12,7 +12,8 @@ key zxcvbnm,.'/ at 27 146 step 25
 key backspace at 295 78
 key shift at 85 167
 key space at 162 167
-key enter at 260 223           # Confirm
+key enter at 260 223           # Confirm (chat: send)
+key escape at 40 223           # Close (chat; the name keyboards have none)
 
 # Resetti: each player's "session under way" bit (set when play starts, cleared by both saves), in the first part of
 # the player's data, a CRC-32C block (players 0xa480 apart)
@@ -27,7 +28,7 @@ unsaved garden_plus.dat 0x2452a 0x02 crc32c 0x1ee20 0x6b84
 onescreen
 value single = runtime single
 value debug = runtime debug
-value map = u32 0x94fc3c                       # the BsMenuMap page (the field's map): set while it shows
+value map = u32 0x94fc3c > 0                   # the BsMenuMap page's vtable (0x8f92cc) while the field's map shows
 # BsMenuBg's layout: N_mvmnt_Uscrn > P_base_00 (the plaid), hidden (alpha 0: not drawn). The bottom screen's pass
 # reuses the top screen's render target, so it is cleared to transparent first ("clearbottom").
 clearbottom
@@ -42,9 +43,10 @@ value title_set_name = u32 0x97528c > 0x3fc > 0x620 > 0x14 > 0x10 > 0xb4
 value title_set_flags = u8 0x97528c > 0x3fc > 0x620 > 0x14 > 0x10 > 0xb3
 set title_set_flags = 0 when single == 1 and title == 0x40760e18 and title_set_name == 0x65735f4e
 set title_set_flags = 1 when single == 0 and debug == 0 and title == 0x40760e18 and title_set_name == 0x65735f4e
-focus top when map != 0
+focus top when map == 0x8f92cc
 focus panel
-value pockets_open = u32 0x94f9dc               # the BsMenuItem page (the pockets): set while it shows
+value pockets_open = u32 0x94f9dc > 0          # the BsMenuItem page's vtable (0x8eaf14) while the pockets show
+                                                # (the pointer stays after they close; the page's memory is reused)
 value pocket0 = u32 0xaaf14c > 0x6bd0           # the current player's first pocket (16 items, 4 bytes apart)
 value held = u16 0xaaf14c > 0x26                # the item in the player's hands
 value talk = u8 0xadf8d1                        # 1 while the player is not in control (dialogs, the arrival, ...)
@@ -65,14 +67,14 @@ bind rs-up R
 # the hub: the field's buttons (bottom-screen pixels; outdoors only: indoors the bottom screen has none), their
 # icons kept from the bottom screen
 hub "Pockets" press X icon 2 0 46 22 when talk == 0 and held >= 0
-hub "Designs" tap 72 12 icon 54 0 46 22 when map != 0 and talk == 0
-hub "Critterpedia" tap 123 12 icon 106 0 48 22 when map != 0 and talk == 0
-hub "TPC" tap 178 12 icon 158 0 48 22 when map != 0 and talk == 0
-hub "Map" map when map != 0 and talk == 0
+hub "Designs" tap 72 12 icon 54 0 46 22 when map == 0x8f92cc and talk == 0
+hub "Critterpedia" tap 123 12 icon 106 0 48 22 when map == 0x8f92cc and talk == 0
+hub "TPC" tap 178 12 icon 158 0 48 22 when map == 0x8f92cc and talk == 0
+hub "Map" map when map == 0x8f92cc and talk == 0
 hub "Tools" tools when talk == 0 and held >= 0
-hub "Chat" tap 160 226 icon 136 214 48 26 when map != 0 and talk == 0
+hub "Chat" tap 160 226 icon 136 214 48 26 when map == 0x8f92cc and talk == 0
 hub "Save" press START glyph "✓" when talk == 0 and held >= 0
-map 64 27 192 184 when map != 0 and talk == 0
+map 64 27 192 184 when map == 0x8f92cc and talk == 0
 
 # the tool ring: pockets whose category is a tool (axes to toy hammers), held through the pockets' own menus
 tools pockets pocket0 held held empty 0x7ffe
@@ -80,4 +82,4 @@ tools items /Item/Param/Item.bin record 30 first 0x2000 category 10 kinds 0x0e 0
 tools icon 30
 tools names /Script/Str/STR_Item_name.umsbt
 tools slots 35 115 85 115 235 115 285 115 35 157 85 157 135 157 185 157 235 157 285 157 35 197 85 197 135 197 185 197 235 197 285 197
-tools equip 160 80 open X when-open pockets_open != 0 ready map != 0 and talk == 0
+tools equip 160 80 open X when-open pockets_open == 0x8eaf14 ready map == 0x8f92cc and talk == 0
