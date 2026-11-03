@@ -28,14 +28,15 @@
 //   map <x> <y> <w> <h> [when <condition>]
 //       The map overlay: that part of the bottom screen, live and enlarged (first area whose condition holds).
 //   tools pockets <value> held <value> [empty <item>]
-//   tools items <romfs file> record <bytes> first <item> icon <offset> category <offset> kinds <lo> <hi>
-//   tools icons <romfs archive>:<file pattern with %d>
+//   tools items <romfs file> record <bytes> first <item> category <offset> kinds <lo> <hi>
+//   tools icon <size>
 //   tools names <romfs msbt/umsbt>
 //   tools slots <x> <y> ...
 //   tools equip <portrait x> <portrait y> open <buttons> when-open <value> <op> <n> ready <value> <op> <n>
 //       The tool ring: the pockets (16 items, 4 bytes apart, from the first one's value) whose category is a
-//       tool kind, with their icons and names from the game's own files; choosing one opens the pockets and drags
-//       it onto the portrait (another tool goes back to a free pocket the same way).
+//       tool kind, with their names from the game's own files and their icons as the pockets show them (squares
+//       of that size around each pocket, kept while the pockets are open); choosing one opens the pockets out of
+//       sight, taps it and picks the first choice ("Hold"); putting the held one away taps the portrait.
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -391,17 +392,18 @@ bool parse_line(const std::string &line, std::string &err) {
             return true;
         }
         if (t[1] == "items") {
-            if (t.size() != 14 || t[3] != "record" || t[5] != "first" || t[7] != "icon" || t[9] != "category" ||
-                t[11] != "kinds") {
-                err = "expected 'tools items <file> record <n> first <item> icon <off> category <off> kinds <lo> <hi>'";
+            if (t.size() != 12 || t[3] != "record" || t[5] != "first" || t[7] != "category" || t[9] != "kinds") {
+                err = "expected 'tools items <file> record <n> first <item> category <off> kinds <lo> <hi>'";
                 return false;
             }
             c.items = t[2];
-            return n(4, c.record) && n(6, c.first) && n(8, c.icon_off) && n(10, c.category_off) &&
-                   n(12, c.kind_lo) && n(13, c.kind_hi) && c.record > 0;
+            return n(4, c.record) && n(6, c.first) && n(8, c.category_off) && n(10, c.kind_lo) && n(11, c.kind_hi) &&
+                   c.record > 0;
         }
-        if (t[1] == "icons" && t.size() == 3) {
-            c.icons = t[2];
+        if (t[1] == "icon" && t.size() == 3) {
+            u32 v;
+            if (!n(2, v) || v < 4 || v > 64) return false;
+            c.icon_size = (int)v;
             return true;
         }
         if (t[1] == "names" && t.size() == 3) {

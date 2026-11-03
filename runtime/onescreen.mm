@@ -11,7 +11,6 @@
 #include <string>
 #include <vector>
 
-#include "hud.h"
 #include "profile.h"
 #include "settings.h"
 #include "text.h"
@@ -38,6 +37,7 @@ int hub_sel, tool_sel;
 u32 prev_host;
 int repeat_frames;
 u32 repeat_dir;
+bool hold_dir;  // directions are ignored until released (the one that opened an overlay)
 std::string toast;
 int toast_left, hint_left = -1;
 
@@ -73,8 +73,9 @@ struct Items {
     bool loaded = false;
     std::vector<u8> records;
     std::vector<std::string> names;
-    std::map<int, SDL_Texture *> icons;  // by icon number (nullptr: could not be read)
 } items;
+// items' icons, kept from the pockets while they show (by item number)
+std::map<u32, Icon> item_icons;
 
 struct Tool {
     int slot;  // pocket, or -1: the hands (putting the held tool away)
@@ -305,6 +306,7 @@ void open_overlay(Overlay o) {
             return;
         }
         tool_sel = 0;
+        hold_dir = true;  // (the press that opened it does not move it)
     }
     if (o == HUB) {
         if (offered_hub().empty()) {
@@ -312,6 +314,7 @@ void open_overlay(Overlay o) {
             return;
         }
         hub_sel = 0;
+        hold_dir = true;
     }
     overlay = o;
 }
@@ -325,8 +328,10 @@ u32 direction(u32 host, s16 cx, s16 cy) {
     if (cx > kStick) d |= H_DRIGHT;
     if (!d) {
         repeat_dir = 0;
+        hold_dir = false;
         return 0;
     }
+    if (hold_dir) return 0;
     if (d != repeat_dir) {
         repeat_dir = d;
         repeat_frames = 0;
@@ -407,30 +412,23 @@ void put_text(SDL_Renderer *r, const std::string &s, float x, float y, float siz
     SDL_RenderTexture(r, t.tex, nullptr, &d);
 }
 
-SDL_Texture *icon_texture(SDL_Renderer *r, int n) {
-    auto it = items.icons.find(n);
-    if (it != items.icons.end()) return it->second;
-    SDL_Texture *t = nullptr;
-    const std::string &spec = profile::tools().icons;
-    const size_t colon = spec.find(':');
-    if (colon != std::string::npos) {
-        char inner[128];
-        snprintf(inner, sizeof inner, spec.c_str() + colon + 1, n);
-        std::vector<u32> px;
-        int w, h;
-        if (hud::load_image(spec.substr(0, colon), inner, px, w, h)) {
-            t = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
-            SDL_UpdateTexture(t, nullptr, px.data(), w * 4);
-            SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
-            SDL_SetTextureScaleMode(t, SDL_SCALEMODE_LINEAR);
+SDL_Texture *icon_tex(SDL_Renderer *r, Icon &ic) {
+    if (ic.dirty) {
+        if (!ic.tex || ic.tex->w != ic.w || ic.tex->h != ic.h) {
+            if (ic.tex) SDL_DestroyTexture(ic.tex);
+            ic.tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, ic.w, ic.h);
+            SDL_SetTextureBlendMode(ic.tex, SDL_BLENDMODE_BLEND);
+            SDL_SetTextureScaleMode(ic.tex, SDL_SCALEMODE_LINEAR);
         }
+        SDL_UpdateTexture(ic.tex, nullptr, ic.px.data(), ic.w * 4);
+        ic.dirty = false;
     }
-    return items.icons[n] = t;
+    return ic.tex;
 }
 
 SDL_Texture *item_icon(SDL_Renderer *r, u32 item) {
-    const int n = item_field(item, profile::tools().icon_off, 2);
-    return n >= 0 ? icon_texture(r, n) : nullptr;
+    auto it = item_icons.find(item & 0xffff);
+    return it == item_icons.end() ? nullptr : icon_tex(r, it->second);
 }
 
 void pill(SDL_Renderer *r, const std::string &s, float cx, float y, float px, float a) {
@@ -658,23 +656,51 @@ bool click(float x, float y) {
     return true;
 }
 
+// a part of a picture (bottom-screen pixels) into an icon; false if it is outside
+bool crop(Icon &ic, const u32 *img, int w, int h, int bx, int by, int bw, int bh) {
+    const float s = w / 320.0f;
+    const int x0 = (int)(bx * s), y0 = (int)(by * s), iw = (int)(bw * s), ih = (int)(bh * s);
+    if (x0 < 0 || y0 < 0 || iw <= 0 || ih <= 0 || x0 + iw > w || y0 + ih > h) return false;
+    ic.px.resize((size_t)iw * ih);
+    for (int y = 0; y < ih; y++) memcpy(&ic.px[(size_t)y * iw], &img[(size_t)(y0 + y) * w + x0], iw * 4);
+    ic.w = iw;
+    ic.h = ih;
+    ic.dirty = true;
+    return true;
+}
+
 void bottom_image(const u32 *img, int w, int h) {
+    // the items' icons from the pockets while they show (they have settled once open a while)
+    const profile::Tools &c = profile::tools();
+    static int open_frames;
+    open_frames = profile::cond(c.open_cond) && c.open_cond >= 0 ? open_frames + 1 : 0;
+    // (an icon is kept when two looks 10 frames apart agree: not while the pockets slide in or out)
+    static Icon last[kSlots];
+    static u32 last_item[kSlots];
+    if (open_frames > 30 && open_frames % 10 == 0 && (int)c.slots.size() >= kSlots) {
+        u32 p[kSlots], held;
+        if (read_pockets(p, held))
+            for (int i = 0; i < kSlots; i++) {
+                Icon now;
+                const u32 item = p[i] & 0xffff;
+                if (item == c.empty || !crop(now, img, w, h, c.slots[i].first - c.icon_size / 2,
+                                             c.slots[i].second - c.icon_size / 2, c.icon_size, c.icon_size))
+                    continue;
+                if (last_item[i] == item && last[i].px == now.px) item_icons[item] = now;
+                last[i] = std::move(now);
+                last_item[i] = item;
+            }
+    }
+    if (!open_frames)
+        for (u32 &i : last_item) i = 0;
     // keep the hub's icons from a picture where their entry is offered (once a second is enough)
     const auto &hub = profile::hub();
     if (hub_icons.size() != hub.size()) hub_icons.assign(hub.size(), {});
     if (frames_seen % 30) return;
-    const float s = w / 320.0f;
     for (size_t i = 0; i < hub.size(); i++) {
         const profile::HubEntry &e = hub[i];
         if (!e.iw || !profile::cond(e.cond)) continue;
-        Icon &ic = hub_icons[i];
-        const int x0 = (int)(e.ix * s), y0 = (int)(e.iy * s), iw = (int)(e.iw * s), ih = (int)(e.ih * s);
-        if (x0 < 0 || y0 < 0 || x0 + iw > w || y0 + ih > h) continue;
-        ic.px.resize((size_t)iw * ih);
-        for (int y = 0; y < ih; y++) memcpy(&ic.px[(size_t)y * iw], &img[(size_t)(y0 + y) * w + x0], iw * 4);
-        ic.w = iw;
-        ic.h = ih;
-        ic.dirty = true;
+        crop(hub_icons[i], img, w, h, e.ix, e.iy, e.iw, e.ih);
     }
 }
 
@@ -751,16 +777,7 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
             rounded_rect(r, nullptr, {cx0 + 5 * k, cy0 + 2 * k, 36 * k, 32 * k}, 9 * k,
                          sel ? SDL_FColor{1, 1, 1, 1} : SDL_FColor{0.93f, 0.89f, 0.8f, 1});
             Icon *ic = (size_t)v[i] < hub_icons.size() ? &hub_icons[v[i]] : nullptr;
-            if (ic && ic->dirty) {
-                if (!ic->tex || ic->tex->w != ic->w || ic->tex->h != ic->h) {
-                    if (ic->tex) SDL_DestroyTexture(ic->tex);
-                    ic->tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, ic->w, ic->h);
-                    SDL_SetTextureBlendMode(ic->tex, SDL_BLENDMODE_BLEND);
-                    SDL_SetTextureScaleMode(ic->tex, SDL_SCALEMODE_LINEAR);
-                }
-                SDL_UpdateTexture(ic->tex, nullptr, ic->px.data(), ic->w * 4);
-                ic->dirty = false;
-            }
+            if (ic && !ic->px.empty()) icon_tex(r, *ic);
             const profile::MapArea *ma = e.action == profile::HubEntry::MAP ? map_area() : nullptr;
             SDL_Texture *tool_icon = nullptr;
             if (e.action == profile::HubEntry::TOOLS) {  // the tool in hand, or the first in the pockets
@@ -810,8 +827,10 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
             if (v[i].slot < 0) {
                 put_text(r, "\xe2\x9c\x8b", x, y - 9 * k, 14, ink, false, 1, px);  // a raised hand: put away
             } else if (SDL_Texture *t = item_icon(r, v[i].item)) {
-                const SDL_FRect d{x - s * 0.38f, y - s * 0.38f, s * 0.76f, s * 0.76f};
+                const SDL_FRect d{x - s * 0.45f, y - s * 0.45f, s * 0.9f, s * 0.9f};
                 SDL_RenderTexture(r, t, nullptr, &d);
+            } else {  // (not seen in the pockets yet)
+                put_text(r, item_name(v[i].item).substr(0, 1), x, y - 10 * k, 16, ink, true, 1, px);
             }
         }
         const Tool &t = v[std::clamp(tool_sel, 0, n - 1)];

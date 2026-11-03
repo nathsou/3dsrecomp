@@ -70,9 +70,9 @@ struct Tools {
     u32 open = 0;                 // the 3DS buttons that open the pockets
     int open_cond = -1;           // the pockets are open
     int ready_cond = -1;          // the tool ring can be used (the player is free to move)
-    std::string items;            // item records (RomFS): icon u16 and category byte per item, from "first"
-    u32 record = 0, first = 0, icon_off = 0, category_off = 0, kind_lo = 0, kind_hi = 0;
-    std::string icons;            // the icons' archive and file pattern (RomFS "file:pattern" with a %d)
+    std::string items;            // item records (RomFS): a category byte per item, from "first"
+    u32 record = 0, first = 0, category_off = 0, kind_lo = 0, kind_hi = 0;
+    int icon_size = 28;           // items' icons: squares this big around the pockets, kept while they show
     std::string names;            // item names (RomFS MSBT, or several in a umsbt: the first)
 };
 

@@ -338,12 +338,6 @@ const Tex &text(SDL_Renderer *r, const std::string &s, float size, float px) {
 
 }  // namespace
 
-bool load_image(const std::string &file, const std::string &inner, std::vector<u32> &px, int &w, int &h) {
-    std::vector<u8> f = yaz0(kernel::romfs_file(file));
-    if (!inner.empty()) f = yaz0(archive_file(f, inner));
-    return !f.empty() && (bclim(f, px, w, h) || bcfnt(f, px, w, h) || bctex(f, px, w, h));
-}
-
 void draw(SDL_Renderer *r, const SDL_FRect &top) {
     if (!profile::has_hud() || !profile::hud_visible() || top.w <= 0) return;
     const float k = top.w / 400.0f;  // render units per top-screen pixel

@@ -66,10 +66,10 @@ hub "Options" press SELECT glyph "⚙" when map != 0
 hub "Save" press START glyph "✓" when map != 0
 map 64 27 192 184 when map != 0
 
-# the tool ring: pockets whose category is a tool (axes to toy hammers), held by dragging them onto the portrait
+# the tool ring: pockets whose category is a tool (axes to toy hammers), held through the pockets' own menus
 tools pockets pocket0 held held empty 0x7ffe
-tools items /Item/Param/Item.bin record 30 first 0x2000 icon 0 category 10 kinds 0x0e 0x14
-tools icons /Layout/ItemWin/item_icon_tex.arc:timg/icn_%03d.bclim
+tools items /Item/Param/Item.bin record 30 first 0x2000 category 10 kinds 0x0e 0x14
+tools icon 30
 tools names /Script/Str/STR_Item_name.umsbt
 tools slots 35 115 85 115 235 115 285 115 35 157 85 157 135 157 185 157 235 157 285 157 35 197 85 197 135 197 185 197 235 197 285 197
 tools equip 160 80 open X when-open pockets_open != 0 ready map != 0
