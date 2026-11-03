@@ -1,4 +1,5 @@
-// APT: applet manager. Only the application slot exists; the home menu and library applets are absent.
+// APT: applet manager. Only the application slot exists; the home menu and the applets are absent (library applets
+// run as HLE, system applets such as the browser close as soon as they start).
 #include <deque>
 
 #include "../service.h"
@@ -48,6 +49,13 @@ static void applet_receive(u32 id, u32 signal, u32 ptr, u32 size) {
         }
         send_parameter({id, 0x300, 3, capture, {}});  // Response
     }
+}
+
+// System applets (the browser, ...) are absent: the one started takes the application's request at once and closes
+static void system_applet_receive(u32 id, u32 signal) {
+    if (signal != 16) return;  // RequestForSysApplet
+    send_parameter({id, 0x300, 3, nullptr, {}});   // Response
+    send_parameter({id, 0x300, 10, nullptr, {}});  // WakeupByExit: back to the application
 }
 
 // The Mii selector returns a standard Mii: a plain male Mii named "Mario" (made-up console/Mii IDs and a
@@ -316,12 +324,15 @@ struct AptService : Service {
             u32 dst = ipc[2], signal = ipc[3], size = ipc[4];
             LOG("[apt] SendParameter src=%x dst=%x signal=%x size=%x\n", ipc[1], dst, signal, size);
             if ((dst & 0xF00) == 0x200 || (dst & 0xF00) == 0x400) applet_receive(dst, signal, ipc[8], size);
+            if ((dst & 0xF00) == 0x100) system_applet_receive(dst, signal);
             ipc.ok();
             break;
         }
         case 0x0016:  // PreloadLibraryApplet(id)
         case 0x0018:  // PrepareToStartLibraryApplet(id)
-            LOG("[apt] %s library applet %x\n", ipc.cmd() == 0x16 ? "preload" : "prepare", ipc[1]);
+        case 0x0019:  // PrepareToStartSystemApplet(id)
+            LOG("[apt] %s %s applet %x\n", ipc.cmd() == 0x16 ? "preload" : "prepare",
+                ipc.cmd() == 0x19 ? "system" : "library", ipc[1]);
             apt.lib_applet = ipc[1];
             ipc.ok();
             break;
@@ -330,11 +341,12 @@ struct AptService : Service {
         case 0x0027:  // CloseApplication(size, handle, buffer): ExitProcess follows
             ipc.ok();
             break;
-        case 0x001E: {  // StartLibraryApplet(id, size, handle, buffer)
+        case 0x001E:    // StartLibraryApplet(id, size, handle, buffer)
+        case 0x001F: {  // StartSystemApplet(id, size, handle, buffer): absent, see system_applet_receive
             u32 id = ipc[1], size = ipc[2], src = ipc[6];
-            LOG("[apt] StartLibraryApplet %x size %x\n", id, size);
+            LOG("[apt] Start%sApplet %x size %x\n", ipc.cmd() == 0x1F ? "System" : "Library", id, size);
             std::vector<u8> buf(gptr(src), gptr(src) + size);
-            applet_run(id, buf, get_object(ipc[4]));
+            if (ipc.cmd() != 0x1F) applet_run(id, buf, get_object(ipc[4]));
             ipc.ok();
             break;
         }
@@ -345,7 +357,10 @@ struct AptService : Service {
                 break;
             }
             Parameter p = apt.params.front();
-            if (ipc.cmd() == 0x000D) apt.params.pop_front();
+            if (ipc.cmd() == 0x000D) {
+                apt.params.pop_front();
+                if (!apt.params.empty()) apt.param_ev->signal();  // one-shot: the next one waiting is told too
+            }
             u32 max = ipc[2];
             u32 n = std::min<u32>(max, (u32)p.buffer.size());
             ipc.ok(4, 4);
