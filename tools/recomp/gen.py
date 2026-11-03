@@ -16,6 +16,7 @@ from . import arm
 from . import thumb
 from .ins import B, CALL, ICALL, JMP, SVC, UDF, OP, COND_C
 from . import flags
+from . import rtti
 
 
 def fname(key):
@@ -840,6 +841,13 @@ class Emitter:
                 for m in cros.mods:
                     f.write('  {"%s", 0x%xu, 0x%xu},\n' % (m.name, m.base, m.slot_size()))
                 f.write('};\nconst u32 guest_cro_count = %d;\n' % len(cros.mods))
+            # classes by name, for profiles that find addresses through RTTI (tools/recomp/rtti.py)
+            cls = sorted(rtti.classes(self.an.img).items())
+            if cls:
+                f.write('\nconst GuestClass guest_classes[] = {\n')
+                for name, vptr in cls:
+                    f.write('  {"%s", 0x%xu},\n' % (name, vptr))
+                f.write('};\nconst u32 guest_class_count = %d;\n' % len(cls))
         files.append(os.path.join(self.outdir, 'table.c'))
         return files
 
