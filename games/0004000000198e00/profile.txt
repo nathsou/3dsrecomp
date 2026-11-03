@@ -1,8 +1,8 @@
 # Animal Crossing: New Leaf – Welcome amiibo (USA). Format: runtime/profile.cpp.
 
-# No reliable sign of the game's keyboard (names, town name) is known yet: the byte at 0x94cbea first used here
-# turns on once text is typed, stays on after the keyboard closes and is also 1 at times in the village. Without
-# a "keyboard" rule the keys below are unused; the keyboard is tapped on the bottom screen.
+# The game's own keyboard (names, the town's name, letters, chat): BsSkb, whose instance is set while it is up.
+value skb = u32 0x950648
+keyboard when skb != 0
 
 # the keyboard's "ABC" page, bottom-screen pixels
 key 1234567890- at 15 78 step 25
@@ -35,6 +35,13 @@ value bg_alpha = u8 0x94f708 > 0x78 > 0xbc > 0x14 > 0xb0
 set bg_alpha = 0 when single == 1
 set bg_alpha = 255 when single == 0 and debug == 0
 set bg_alpha = 0 when debug == 1
+# The title screen's bottom layout (BsTitle, found through the game's tree of modes, slot 0x3fc): N_All > N_set
+# holds only its background pictures. Guarded: the slot must hold a BsTitle and the pane be named "N_set".
+value title = u32 0x97528c > 0x3fc > 0                            # the slot's object's vtable
+value title_set_name = u32 0x97528c > 0x3fc > 0x620 > 0x14 > 0x10 > 0xb4
+value title_set_flags = u8 0x97528c > 0x3fc > 0x620 > 0x14 > 0x10 > 0xb3
+set title_set_flags = 0 when single == 1 and title == 0x40760e18 and title_set_name == 0x65735f4e
+set title_set_flags = 1 when single == 0 and debug == 0 and title == 0x40760e18 and title_set_name == 0x65735f4e
 focus top when map != 0
 focus panel
 value pockets_open = u32 0x94f9dc               # the BsMenuItem page (the pockets): set while it shows
