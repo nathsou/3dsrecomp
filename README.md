@@ -444,8 +444,8 @@ keep the Metal compiler out of gameplay:
   `WAIT <frames>`); commands run one after another, each followed by a few released frames, and the log says when
   each starts. Also `DRAG <x>/<y> <x1>/<y1> <frames>` (a moving touch), `PAD <host inputs> <frames>` (gamepad
   inputs by position for one-screen play: `PAD zl 6`, `PAD rs-up 10`), `TEXT <text>` (typed on the game's own
-  keyboard), `WINSHOT` (the whole window as `window_<frame>.ppm`), `MEMDUMP <tag>` (guest memory, as
-  `RECOMP_MEMDUMP`), and, at once, `DUMP` (the state of every thread in the log) and `POKE8 <address> <value>` (a
+  keyboard), `KEY <SDL key name>` (a host key press), `WINSHOT` (the whole window as `window_<frame>.ppm`),
+  `MEMDUMP <tag>` (guest memory, as `RECOMP_MEMDUMP`), and, at once, `DUMP` (the state of every thread in the log) and `POKE8 <address> <value>` (a
   byte of guest memory, hexadecimal). With `RECOMP_SHOT`, this drives long explorations step by step without
   replaying a script from boot.
 - A jump to a null function pointer stops with the registers in the log (instead of trying to recompile it), and

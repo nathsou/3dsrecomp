@@ -7,6 +7,7 @@
 extern std::atomic<int> g_winshot_request;  // (frontend.cpp)
 extern std::atomic<u32> g_live_host;         // (frontend.cpp): host inputs for one-screen play (onescreen.h)
 void frontend_live_text(const std::string &s);  // (frontend.cpp): typed as on the host's keyboard
+void frontend_live_key(const std::string &name);  // (frontend.cpp): a host key press (SDL key name)
 namespace onescreen {
 u32 host_mask(const char *names);
 }
@@ -42,7 +43,7 @@ static void ensure_shm() {
 // starts. A line "DUMP" writes the state of every thread to the log at once, "MEMDUMP <tag>" snapshots guest memory
 // (mem_<tag>_<address>.bin, as RECOMP_MEMDUMP), "POKE8 <hex address> <hex value>" writes a byte at once,
 // "DRAG <x>/<y> <x1>/<y1> <frames>" touches and moves (bottom-screen pixels), "PAD <host inputs> <frames>" plays host inputs by position (one-screen play: "PAD zl 6", "PAD rs-up 30"),
-// "TEXT <text>" types on the game's own keyboard (the profile's keys), "WINSHOT" writes the whole window at the next frame (window_<frame>.ppm, as RECOMP_WINSHOT).
+// "KEY <SDL key name>" presses a host key, "TEXT <text>" types on the game's own keyboard (the profile's keys), "WINSHOT" writes the whole window at the next frame (window_<frame>.ppm, as RECOMP_WINSHOT).
 namespace {
 struct LiveCmd {
     u32 buttons = 0;
@@ -77,6 +78,11 @@ LiveCmd parse_live(const std::string &line) {
         sscanf(line.c_str() + 4, "%127s %d", names, &n);
         c.host = onescreen::host_mask(names);
         c.frames = n > 0 ? n : 1;
+        return c;
+    }
+    if (line.rfind("KEY ", 0) == 0) {  // a host key press (Tab, F2, Escape, ...)
+        c.memdump = "@key:" + line.substr(4);
+        c.frames = 1;
         return c;
     }
     if (line.rfind("TEXT ", 0) == 0) {  // typed on the game's own keyboard, as on the host's
@@ -155,6 +161,8 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         LOG("[live] command %zu starts (%d frames)\n", live.next, live.cur.frames);
         if (live.cur.memdump == "@window") {
             g_winshot_request = 1;
+        } else if (live.cur.memdump.rfind("@key:", 0) == 0) {
+            frontend_live_key(live.cur.memdump.substr(5));
         } else if (live.cur.memdump.rfind("@text:", 0) == 0) {
             frontend_live_text(live.cur.memdump.substr(6));
         } else if (!live.cur.memdump.empty()) {

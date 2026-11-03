@@ -52,6 +52,7 @@ struct Step {
     int wait_cond = -2;   // >= -1: wait (up to frames) until this condition holds (-1: always)
     bool wait_not = false;
     int if_cond = -2;     // >= -1: skipped unless this condition holds when the step begins
+    bool or_abort = false;  // a wait that times out ends the whole sequence (the game did not follow)
     bool touch = false;
     float x0 = 0, y0 = 0, x1 = 0, y1 = 0;  // a touch from (x0, y0) to (x1, y1) over the step
 };
@@ -191,6 +192,7 @@ void macro_open_pockets(std::vector<Step> &m) {
     Step w;
     w.wait_cond = c.open_cond;
     w.frames = 120;
+    w.or_abort = true;
     m.push_back(w);
     m.push_back({0, 45});  // (the pockets slide in and take touches)
 }
@@ -516,8 +518,14 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
             ty = (u16)std::clamp((int)std::lround(s.y0 + (s.y1 - s.y0) * t), 0, 239);
         }
         bool done = ++step_frame >= s.frames;
-        if (s.wait_cond >= -1 && profile::cond(s.wait_cond) != s.wait_not) done = true;
-        if (done) {
+        const bool met = s.wait_cond >= -1 && profile::cond(s.wait_cond) != s.wait_not;
+        if (done && s.or_abort && !met) {
+            macro.clear();
+            step_frame = 0;
+            say("Not now");
+            return;
+        }
+        if (done || met) {
             macro.erase(macro.begin());
             step_frame = 0;
         }

@@ -532,6 +532,11 @@ void frontend_live_text(const std::string &s) {
     std::lock_guard<std::mutex> lk(live_text_m);
     live_text += s;
 }
+static std::vector<std::string> live_keys;  // RECOMP_LIVE's KEY, pressed at the next frame
+void frontend_live_key(const std::string &name) {
+    std::lock_guard<std::mutex> lk(live_text_m);
+    live_keys.push_back(name);
+}
 static void type_text(const std::string &s) {
     for (size_t i = 0; i < s.size();) {
         size_t j = i + 1;
@@ -1359,6 +1364,14 @@ void frontend_run() {
             std::lock_guard<std::mutex> lk(live_text_m);
             if (!live_text.empty()) type_text(live_text);  // (RECOMP_LIVE's TEXT: the game's own keyboard)
             live_text.clear();
+            for (auto &n : live_keys) {
+                SDL_Event ke{};
+                ke.type = SDL_EVENT_KEY_DOWN;
+                ke.key.scancode = SDL_GetScancodeFromName(n.c_str());
+                ke.key.down = true;
+                SDL_PushEvent(&ke);
+            }
+            live_keys.clear();
         }
         for (auto &k : script_keys)
             if (k.frame == frame_count && k.finger) {

@@ -61,15 +61,16 @@ bind ddown tool-away
 bind zr pointer
 bind rs-up R
 
-# the hub: the field's buttons (bottom-screen pixels), their icons kept from the bottom screen
-hub "Pockets" press X icon 2 0 46 22 when map != 0
+# the hub: the field's buttons (bottom-screen pixels; outdoors only: indoors the bottom screen has none), their
+# icons kept from the bottom screen
+hub "Pockets" press X icon 2 0 46 22
 hub "Designs" tap 72 12 icon 54 0 46 22 when map != 0
 hub "Critterpedia" tap 123 12 icon 106 0 48 22 when map != 0
 hub "TPC" tap 178 12 icon 158 0 48 22 when map != 0
 hub "Map" map when map != 0
-hub "Tools" tools when map != 0
+hub "Tools" tools
 hub "Chat" tap 160 226 icon 136 214 48 26 when map != 0
-hub "Save" press START glyph "✓" when map != 0
+hub "Save" press START glyph "✓"
 map 64 27 192 184 when map != 0
 
 # the tool ring: pockets whose category is a tool (axes to toy hammers), held through the pockets' own menus
