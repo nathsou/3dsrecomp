@@ -1220,18 +1220,36 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
     if (k[SDL_SCANCODE_RIGHT]) x += 1;
     if (k[SDL_SCANCODE_UP]) y += 1;
     if (k[SDL_SCANCODE_DOWN]) y -= 1;
-    if (aiming) {  // mouse and keyboard play: WASD move, the left button fires (L), the right one is R
-        if (kb[SDL_SCANCODE_A]) x -= 1;
-        if (kb[SDL_SCANCODE_D]) x += 1;
-        if (kb[SDL_SCANCODE_W]) y += 1;
-        if (kb[SDL_SCANCODE_S]) y -= 1;
-        x = std::clamp(x, -1, 1), y = std::clamp(y, -1, 1);
+    // Mouse and keyboard play while aiming: WASD (or the arrows) move, easing the circle pad in, since a sudden full
+    // tilt is a flick, which games such as Kid Icarus: Uprising read as a dash; Space flicks (dashes). The left button
+    // fires (L), the right one is R; Q and E are the d-pad's left and right, F its down, R its up.
+    static float ease;
+    float fx = (float)x, fy = (float)y;
+    if (aiming) {
+        constexpr float kEaseFrames = 15;
+        if (kb[SDL_SCANCODE_A]) fx -= 1;
+        if (kb[SDL_SCANCODE_D]) fx += 1;
+        if (kb[SDL_SCANCODE_W]) fy += 1;
+        if (kb[SDL_SCANCODE_S]) fy -= 1;
+        fx = std::clamp(fx, -1.0f, 1.0f), fy = std::clamp(fy, -1.0f, 1.0f);
+        ease = fx || fy ? std::min(1.0f, ease + 1 / kEaseFrames) : 0;
+        if (kb[SDL_SCANCODE_SPACE] && (fx || fy)) ease = 1;
+        const float len = std::sqrt(fx * fx + fy * fy);
+        if (len > 1) fx /= len, fy /= len;
+        fx *= ease, fy *= ease;
         const SDL_MouseButtonFlags b = SDL_GetMouseState(nullptr, nullptr);
+        buttons &= ~BTN_L;  // (Q is a d-pad direction here)
         if (b & SDL_BUTTON_LMASK) buttons |= BTN_L;
         if (b & SDL_BUTTON_RMASK) buttons |= BTN_R;
+        if (kb[SDL_SCANCODE_Q]) buttons |= BTN_LEFT;
+        if (kb[SDL_SCANCODE_E]) buttons |= BTN_RIGHT;
+        if (kb[SDL_SCANCODE_F]) buttons |= BTN_DOWN;
+        if (kb[SDL_SCANCODE_R]) buttons |= BTN_UP;
+    } else {
+        ease = 0;
     }
-    cx = (s16)(x * 155);
-    cy = (s16)(y * 155);
+    cx = (s16)std::lround(fx * 155);
+    cy = (s16)std::lround(fy * 155);
     if (pad) {
         auto btn = [&](SDL_GamepadButton b) { return SDL_GetGamepadButton(pad, b); };
         if (btn(SDL_GAMEPAD_BUTTON_EAST)) buttons |= BTN_A;
@@ -1246,8 +1264,9 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
         if (btn(SDL_GAMEPAD_BUTTON_DPAD_DOWN)) buttons |= BTN_DOWN;
         if (btn(SDL_GAMEPAD_BUTTON_DPAD_LEFT)) buttons |= BTN_LEFT;
         if (btn(SDL_GAMEPAD_BUTTON_DPAD_RIGHT)) buttons |= BTN_RIGHT;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) buttons |= BTN_ZL;
-        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) buttons |= BTN_ZR;
+        // (while aiming the triggers fire (L) and play R, as the shoulders do: a shooter's hands)
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) buttons |= aiming ? BTN_R : BTN_ZL;
+        if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) buttons |= aiming ? BTN_L : BTN_ZR;
         int ax = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTX), ay = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFTY);
         if (abs(ax) > 4000 || abs(ay) > 4000) {
             cx = (s16)(ax * 156 / 32767);

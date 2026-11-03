@@ -11,3 +11,9 @@ value aim_vt = u32 0xe14504 > 8 > -0x10
 aim delta 0x6d2820 8 12 per s16 active r4 0x1bc on 0xa9ac40 0xaf7918
 aim stick 320
 aim when aim_vt == 0xcf1c34 or aim_vt == 0xcf1be0
+
+# ---- one screen: battles play on the top screen (the bottom one, with the dialogue, comes up in the corner when it
+# changes); elsewhere the menus, which are on the bottom screen, come up as a panel over the top one (they all take
+# the d-pad and A/B).
+focus top when aim_vt == 0xcf1c34 or aim_vt == 0xcf1be0
+focus panel
