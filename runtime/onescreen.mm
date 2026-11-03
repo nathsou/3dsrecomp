@@ -194,7 +194,7 @@ void macro_open_pockets(std::vector<Step> &m) {
     w.frames = 120;
     w.or_abort = true;
     m.push_back(w);
-    m.push_back({0, 26});  // (the pockets slide in and take touches)
+    m.push_back({0, 40});  // (the pockets slide in and take touches)
 }
 
 void macro_close_pockets(std::vector<Step> &m) {
@@ -227,9 +227,9 @@ void use_tool(const Tool &t) {
     macro_open_pockets(m);
     if (t.slot >= 0) tap(m, c.slots[t.slot].first, c.slots[t.slot].second);
     else tap(m, c.portrait_x, c.portrait_y);
-    m.push_back({0, 16});       // (the choices open)
+    m.push_back({0, 24});       // (the choices open)
     m.push_back({1u << 0, 6});  // A: the first choice
-    m.push_back({0, 14});
+    m.push_back({0, 20});
     macro_close_pockets(m);
     macro = m;
     step_frame = 0;
@@ -534,7 +534,7 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
             const int n = pending_steps;
             pending_steps = 0;
             cycle_tool(n);
-        } else if (++pending_wait > 180) {
+        } else if (++pending_wait > 360) {
             pending_steps = 0;
         }
     } else {
