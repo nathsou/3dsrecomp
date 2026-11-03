@@ -15,6 +15,10 @@
 #include "../service.h"
 #include "services.h"
 
+namespace stacks {
+void save_written(const std::string &path);  // (runtime/stacks.h)
+}
+
 namespace fsys = std::filesystem;
 
 namespace kernel {
@@ -48,7 +52,9 @@ namespace kernel {
 // A change to the game's own save (savedata/, extdata/): cloud saves upload it a little later
 static void save_changed(const std::string &path) {
     static const std::string root = save_root() + "/";
-    if (!path.compare(0, root.size(), root)) cloud_save_written();
+    if (path.compare(0, root.size(), root)) return;
+    stacks::save_written(path);  // (before the cloud copy is made: the stacks file goes with the save)
+    cloud_save_written();
 }
 
 // ---- paths
