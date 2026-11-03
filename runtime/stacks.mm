@@ -4,6 +4,7 @@
 // pocket it left. With the option off, the stacks empty into free pockets as room allows.
 #include "stacks.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <map>
@@ -85,12 +86,20 @@ bool pockets_at(u32 &a) {
     return profile::value_now(profile::tools().pockets, v, &a);
 }
 
-void tidy(CPU *) {
+// the player can move (no dialog, menu or shop screen, which show the pockets as they read them)
+bool player_free(CPU *c) {
+    const profile::Stacks &s = profile::stacks();
+    if (s.free_states.empty()) return profile::cond_now(profile::tools().ready_cond);
+    const u8 st = r8(c->r[0] + s.free_off);
+    return std::find(s.free_states.begin(), s.free_states.end(), st) != s.free_states.end();
+}
+
+void tidy(CPU *c) {
     const profile::Tools &t = profile::tools();
     u32 pa;
-    // only while the player is free in the field and the pockets are closed (the open pockets show what they
-    // read as they opened: a pocket changed behind them would not match)
-    if (!profile::cond_now(t.ready_cond) || profile::cond_now(t.open_cond) || !pockets_at(pa)) return;
+    // only while the player is free and the pockets are closed (the open pockets show what they read as they
+    // opened: a pocket changed behind them would not match)
+    if (!player_free(c) || profile::cond_now(t.open_cond) || !pockets_at(pa)) return;
     const std::string who = owner();
     if (who.empty()) return;
     std::lock_guard<std::mutex> g(m);

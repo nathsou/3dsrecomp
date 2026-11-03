@@ -85,8 +85,10 @@ struct StackKind {
 };
 struct Stacks {
     std::vector<StackKind> kinds;
-    std::vector<int> owner;  // values that tell the players (and towns) apart: each keeps its own stacks
-    u32 on = 0;              // the game's thread tidies the pockets as it dispatches here (an indirect call)
+    std::vector<int> owner;       // values that tell the players (and towns) apart: each keeps its own stacks
+    u32 on = 0;                   // the game's thread tidies the pockets as it dispatches here (an indirect call)
+    u32 free_off = 0;             // the player is free while this byte of the object called at "on" (r0)...
+    std::vector<u8> free_states;  // ...is one of these (none: while the tools' ready condition holds)
 };
 
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none

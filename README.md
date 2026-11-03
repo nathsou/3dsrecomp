@@ -279,12 +279,12 @@ bottom screen never shows as such: the game plays like a single-screen Animal Cr
 
 **Stacks in the pockets** (the menu's "Stack items", in any layout, off by default): as in New Horizons, several of
 the same item share one pocket, with the count on it: flowers, seed bags, saplings, shrub starts, shells,
-mushrooms, stationery, wrapping paper, pitfall seeds, fertilizer, candy, lollipops, fortune cookies and coffee beans up to 10, nuggets and
-gems up to 30 (fruit already stacks in the game). An item picked up joins its stack; one dropped, sold, given or
-planted from a stack is replaced by the next once the pockets close. The game itself knows only the pocket's one
-item: the rest are kept next to its save (`savedata/recomp_stacks.txt`, written whenever the game saves, so backups
-and cloud saves carry it), for each player of each town. Turned off, the stacks go back to free pockets as room
-allows.
+mushrooms, wrapping paper, pitfall seeds, fertilizer, candy, lollipops, fortune cookies and coffee beans up to 10,
+nuggets and gems up to 30 (fruit and stationery already stack in the game). An item picked up joins its stack; one
+dropped, sold, given or planted from a stack is replaced by the next as soon as the player is free again (the
+pockets, a dialog or a shop's screen closed). The game itself knows only the pocket's one item: the rest are kept
+next to its save (`savedata/recomp_stacks.txt`, written whenever the game saves, so backups and cloud saves carry
+it), for each player of each town. Turned off, the stacks go back to free pockets as room allows.
 
 The keyboard's keys stand for the gamepad's as in the controls table (1 is ZL, Backspace is −, I J K L the d-pad).
 

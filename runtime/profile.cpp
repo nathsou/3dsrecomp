@@ -45,12 +45,15 @@
 //   stack kinds <category> ... max <n>
 //   stack owner <value> ...
 //   stack on <address>
+//   stack free <offset> <state> ...
 //       Stacks in the pockets, as in Animal Crossing: New Horizons (an option in the menu): items of those
 //       categories (as "tools items" reads them) pile up to n in one pocket, the extra ones kept by the runtime
 //       for each owner (the values tell players and towns apart) and written next to the save whenever the game
 //       writes it. The game's thread tidies the pockets as it dispatches to <address>, while the player is free
 //       and the pockets are closed ("tools equip ... when-open ... ready"): a second pocket with the same item joins the first one's stack, and a stack's
-//       pocket that empties (the item dropped, sold, given, planted) gets the next one.
+//       pocket that empties (the item dropped, sold, given, planted) gets the next one. With "stack free", the
+//       player is free while the byte at <offset> in the object called there (its first argument: the player) is
+//       one of the states (standing, walking: indoors too, where the ready condition may not tell).
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -476,6 +479,22 @@ bool parse_line(const std::string &line, std::string &err) {
                 return false;
             }
             c.on = (u32)a;
+            return true;
+        }
+        if (t[1] == "free") {
+            if (t.size() < 4 || !num(t[2], a)) {
+                err = "expected 'stack free <offset> <state> ...'";
+                return false;
+            }
+            c.free_off = (u32)a;
+            for (size_t i = 3; i < t.size(); i++) {
+                s64 v;
+                if (!num(t[i], v)) {
+                    err = "expected a number";
+                    return false;
+                }
+                c.free_states.push_back((u8)v);
+            }
             return true;
         }
         if (t[1] == "kinds") {
