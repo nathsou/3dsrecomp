@@ -54,16 +54,16 @@
 //       pocket that empties (the item dropped, sold, given, planted) gets the next one. With "stack free", the
 //       player is free while the byte at <offset> in the object called there (its first argument: the player) is
 //       one of the states (standing, walking: indoors too, where the ready condition may not tell).
-//   aim pad <address> mode <offset> <value> stick <x offset> <y offset>
-//   aim delta <return address> <x offset> <y offset> [per s<n>] on <address> ...
+//   aim delta <return address> <x offset> <y offset> [per s<n>] [active r<n> <offset>] on <address> ...
+//   aim stick <pixels per second>
 //   aim when <condition>
-//       Aiming without the touch screen (runtime/aim.cpp), while the condition holds: as the game's thread
-//       dispatches to the pad address (r1: the pad state the game copies for its players), the byte at the mode
-//       offset is set to the value (the game's own stick aiming) and the right stick is written there as two
-//       floats (-1..1, up negative); as it dispatches to one of the "on" addresses returning to the return address
-//       (a call made while the frame's aim delta sits on the stack), the mouse's motion since the last frame is
-//       added to the floats at sp + the offsets ("per s<n>": the delta is a rate the game multiplies by the frame
-//       time it holds in that VFP register, so the motion is divided by it). The mouse is captured meanwhile.
+//       Aiming with the right stick and the mouse (runtime/aim.cpp), while the condition holds: as the game's thread
+//       dispatches to one of the "on" addresses returning to the return address (a call made while the frame's aim
+//       delta sits on the stack, as two floats at sp + the offsets), the mouse's motion since the last frame and the
+//       right stick (at most "stick" pixels per second, default 300) are added to it. "per s<n>": the delta is a
+//       rate the game multiplies by the frame time it holds in that VFP register (the mouse's motion is divided by
+//       it). "active": the byte at that register + offset (the game's own "aim input this frame") is set while the
+//       stick is held or the mouse moved lately. The mouse is captured meanwhile.
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -473,37 +473,42 @@ bool parse_line(const std::string &line, std::string &err) {
     if (d == "aim" && t.size() >= 2) {
         Aim &c = aim_cfg;
         s64 a = 0, b = 0, v = 0;
-        if (t[1] == "pad") {  // aim pad <address> mode <offset> <value> stick <x offset> <y offset>
-            if (t.size() != 9 || t[3] != "mode" || t[6] != "stick" || !num(t[2], a) || !num(t[4], b) || !num(t[5], v)) {
-                err = "expected 'aim pad <address> mode <offset> <value> stick <x offset> <y offset>'";
-                return false;
-            }
-            c.pad_on = (u32)a, c.mode_off = (u32)b, c.mode = (u8)v;
-            if (!num(t[7], a) || !num(t[8], b)) {
-                err = "expected the stick's offsets";
-                return false;
-            }
-            c.stick_x = (u32)a, c.stick_y = (u32)b;
-            return true;
-        }
-        if (t[1] == "delta") {  // aim delta <return address> <x offset> <y offset> [per s<n>] on <address> ...
-            size_t on = 5;
-            if (t.size() > 7 && t[5] == "per" && t[6].size() > 1 && t[6][0] == 's' && num(t[6].substr(1), a) && a < 32) {
-                c.delta_per = (int)a;
-                on = 7;
-            }
-            if (t.size() < on + 2 || t[on] != "on" || !num(t[2], a) || !num(t[3], b) || !num(t[4], v)) {
-                err = "expected 'aim delta <return address> <x offset> <y offset> [per s<n>] on <address> ...'";
+        if (t[1] == "delta") {  // aim delta <return> <x off> <y off> [per s<n>] [active r<n> <off>] on <address> ...
+            const char *usage = "expected 'aim delta <return address> <x offset> <y offset> [per s<n>] [active r<n> <offset>] "
+                                "on <address> ...'";
+            if (t.size() < 7 || !num(t[2], a) || !num(t[3], b) || !num(t[4], v)) {
+                err = usage;
                 return false;
             }
             c.delta_ret = (u32)a, c.delta_x = (u32)b, c.delta_y = (u32)v;
-            for (size_t i = on + 1; i < t.size(); i++) {
+            size_t i = 5;
+            auto reg = [&](const std::string &w, char kind, s64 &n) { return w.size() > 1 && w[0] == kind && num(w.substr(1), n); };
+            for (;;) {
+                if (i + 1 < t.size() && t[i] == "per" && reg(t[i + 1], 's', a) && a < 32) {
+                    c.delta_per = (int)a;
+                    i += 2;
+                } else if (i + 2 < t.size() && t[i] == "active" && reg(t[i + 1], 'r', a) && a < 13 && num(t[i + 2], b)) {
+                    c.active_reg = (int)a, c.active_off = (u32)b;
+                    i += 3;
+                } else {
+                    break;
+                }
+            }
+            if (i + 1 >= t.size() || t[i] != "on") {
+                err = usage;
+                return false;
+            }
+            for (i++; i < t.size(); i++) {
                 if (!num(t[i], a)) {
                     err = "expected an address";
                     return false;
                 }
                 c.delta_on.push_back((u32)a);
             }
+            return true;
+        }
+        if (t[1] == "stick" && t.size() == 3 && num(t[2], a) && a > 0) {
+            c.stick_speed = (float)a;
             return true;
         }
         if (t[1] == "when") return (c.cond = parse_cond(t, 2, err)) != -2;

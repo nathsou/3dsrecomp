@@ -93,12 +93,13 @@ struct Stacks {
 
 // aiming with a stick and the mouse through the game's own data (runtime/aim.cpp)
 struct Aim {
-    u32 pad_on = 0, mode_off = 0, stick_x = 0, stick_y = 0;  // the pad copy's address, offsets in the pad state
-    u8 mode = 0;                                              // the game's stick-aiming mode
-    u32 delta_ret = 0, delta_x = 0, delta_y = 0;              // where the frame's aim delta is (sp + offsets)
-    int delta_per = -1;                                       // a rate: the frame time is in this s register
-    std::vector<u32> delta_on;                                // calls made while it is there
-    int cond = -2;                                            // when it applies (-2: never)
+    u32 delta_ret = 0, delta_x = 0, delta_y = 0;  // where the frame's aim delta is (sp + offsets)
+    int delta_per = -1;                           // a rate: the frame time is in this s register
+    int active_reg = -1;                          // the game's "aim input" byte: register + offset (-1: none)
+    u32 active_off = 0;
+    std::vector<u32> delta_on;                    // calls made while it is there
+    float stick_speed = 300;                      // the right stick at full tilt: top-screen pixels per second
+    int cond = -2;                                // when it applies (-2: never)
 };
 
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none

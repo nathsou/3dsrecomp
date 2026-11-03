@@ -1,12 +1,13 @@
 # Kid Icarus: Uprising (EUR). Format: runtime/profile.cpp.
 
 # ---- aiming without the stylus. The player's aim object (reached from 0xe14504; land battles: vtable 0xcf1c34, air
-# battles: 0xcf1be0) holds the reticle (top-screen pixels at +0xa4, +0xa8). Each frame 0x6d27e8 sums the stylus's
-# motion and the aim stick's into a delta (sp+8, sp+0xc; per second: it is multiplied by the frame time, in s16), then
-# turns the camera with it (land) and moves the reticle. The virtual call it makes in between (vtable +0x30: 0xa9ac40
-# on land, 0xaf7918 in the air) returns to 0x6d2820: the mouse's motion is added there. The pad state the game copies
-# for the player (0xa3f050, r1) holds the control mode at +0 (2: aiming with a stick, the floats at +0x48, +0x4c).
+# battles: 0xcf1be0) holds the reticle (top-screen pixels at +0xa4, +0xa8). Each frame 0x6d27e8 (r4: the object)
+# sums the stylus's motion and the button aiming's into a delta (sp+8, sp+0xc; per second: it is multiplied by the
+# frame time, in s16), then turns the camera with it (land) and moves the reticle. The virtual call it makes in
+# between (vtable +0x30: 0xa9ac40 on land, 0xaf7918 in the air) returns to 0x6d2820: the stick and the mouse are added
+# there. The byte at +0x1bc is set while the game's button aiming has input; without it the reticle goes back to the
+# middle each frame (0x76ed88), as when the stylus is lifted, and the camera never turns.
 value aim_vt = u32 0xe14504 > 8 > -0x10
-aim pad 0xa3f050 mode 0 2 stick 0x48 0x4c
-aim delta 0x6d2820 8 12 per s16 on 0xa9ac40 0xaf7918
+aim delta 0x6d2820 8 12 per s16 active r4 0x1bc on 0xa9ac40 0xaf7918
+aim stick 320
 aim when aim_vt == 0xcf1c34 or aim_vt == 0xcf1be0

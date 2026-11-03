@@ -1,11 +1,12 @@
-// Aiming without the touch screen (aim.h). The profile names two of the game's calls:
-// - "aim pad": the copy of the pad state the game makes for its player each frame; r1 is the state copied, where
-//   the control mode byte is set to the game's stick-aiming mode and the right stick written as its aim stick;
-// - "aim delta": a call made while the frame's aim delta (reticle and camera motion, from the stylus and the stick)
-//   sits on the stack; the mouse's motion is added to it there, so the game's own limits and camera turning apply.
+// Aiming without the touch screen (aim.h). The profile names a call the game makes while the frame's aim delta
+// (the reticle's and the camera's motion, from the stylus or the game's own button aiming) sits on the stack: the
+// right stick and the mouse's motion are added to it there, so the game's own reticle limits and camera turning
+// apply, and the game's "aim input this frame" flag is set meanwhile (without it, the game recenters the reticle as
+// it does when the stylus is lifted).
 #include "aim.h"
 
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
@@ -17,11 +18,13 @@ namespace aim {
 namespace {
 
 constexpr float kDeadzone = 0.15f;
+constexpr double kMouseHold = 1.5;  // seconds the aim stays where the mouse left it (input flag kept)
 
 std::atomic<bool> on;
 std::mutex m;
-float stick_x, stick_y;    // the right stick, past the dead zone (-1..1, up positive)
+float stick_x, stick_y;    // the right stick, past the dead zone and curved (-1..1, up positive)
 float mouse_x, mouse_y;    // mouse motion not yet handed to the game (top-screen pixels)
+bool engaged;              // the stick is held or the mouse moved lately: the game's input flag is set
 bool hooked;
 
 void put_float(u32 a, float f) {
@@ -36,39 +39,26 @@ float get_float(u32 a) {
     return f;
 }
 
-// the game copying its pad state (r1)
-void pad_hook(CPU *c) {
-    if (!on) return;
-    const profile::Aim &a = profile::aim();
-    float x, y;
-    {
-        std::lock_guard<std::mutex> g(m);
-        x = stick_x, y = stick_y;
-    }
-    const u32 pad = c->r[1];
-    w8(pad + a.mode_off, a.mode);
-    put_float(pad + a.stick_x, x);
-    put_float(pad + a.stick_y, -y);  // (the game's sticks: up is negative)
-}
-
 // a call made while the frame's aim delta is on the stack
 void delta_hook(CPU *c) {
     const profile::Aim &a = profile::aim();
     if (!on || c->r[14] != a.delta_ret) return;
-    float x, y;
+    float mx, my, sx, sy;
+    bool held;
     {
         std::lock_guard<std::mutex> g(m);
-        x = mouse_x, y = mouse_y;
+        mx = mouse_x, my = mouse_y, sx = stick_x, sy = stick_y, held = engaged;
         mouse_x = mouse_y = 0;
     }
-    if (x == 0 && y == 0) return;
-    const u32 sp = c->r[13];
+    if (held && a.active_reg >= 0) w8(c->r[a.active_reg] + a.active_off, 1);
+    if (mx == 0 && my == 0 && sx == 0 && sy == 0) return;
     if (a.delta_per >= 0) {  // a rate the game multiplies by its frame time (in that register): pixels per frame
         const float dt = c->s[a.delta_per];
-        if (dt > 1e-4f) x /= dt, y /= dt;
+        if (dt > 1e-4f) mx /= dt, my /= dt;
     }
-    put_float(sp + a.delta_x, get_float(sp + a.delta_x) + x);
-    put_float(sp + a.delta_y, get_float(sp + a.delta_y) + y);
+    const u32 sp = c->r[13];
+    put_float(sp + a.delta_x, get_float(sp + a.delta_x) + mx + sx * a.stick_speed);
+    put_float(sp + a.delta_y, get_float(sp + a.delta_y) + my - sy * a.stick_speed);  // (screen y grows downwards)
 }
 
 }  // namespace
@@ -81,19 +71,27 @@ bool update(float rsx, float rsy, float mouse_dx, float mouse_dy) {
     if (a.cond == -2) return false;
     if (!hooked) {
         hooked = true;
-        if (a.pad_on) rt_add_dispatch_hook(a.pad_on, pad_hook);
         for (u32 at : a.delta_on) rt_add_dispatch_hook(at, delta_hook);
     }
     const bool now = profile::cond(a.cond);
-    auto dz = [](float v) { return std::fabs(v) < kDeadzone ? 0.0f : (v - std::copysign(kDeadzone, v)) / (1 - kDeadzone); };
+    auto curve = [](float v) {
+        if (std::fabs(v) < kDeadzone) return 0.0f;
+        const float t = (std::fabs(v) - kDeadzone) / (1 - kDeadzone);
+        return std::copysign(t * t, v);  // (fine aiming near the centre, full speed at the rim)
+    };
+    using clock = std::chrono::steady_clock;
+    static clock::time_point last_mouse;
+    if (mouse_dx != 0 || mouse_dy != 0) last_mouse = clock::now();
+    const bool mouse_recent = std::chrono::duration<double>(clock::now() - last_mouse).count() < kMouseHold;
     {
         std::lock_guard<std::mutex> g(m);
-        stick_x = dz(rsx), stick_y = dz(rsy);
+        stick_x = curve(rsx), stick_y = curve(rsy);
         if (now) {
             mouse_x += mouse_dx, mouse_y += mouse_dy;
         } else {
             mouse_x = mouse_y = 0;
         }
+        engaged = now && (stick_x != 0 || stick_y != 0 || mouse_recent);
     }
     on = now;
     return now;
