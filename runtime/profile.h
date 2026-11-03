@@ -41,6 +41,41 @@ struct Button {
     int cond = -1;
 };
 
+// one-screen controls (runtime/onescreen.mm): host inputs bound to 3DS buttons or overlays, the hub's entries,
+// the map's part of the bottom screen, the tool ring's sources
+struct Bind {
+    std::string host;    // a gamepad input by position: a b x y l r zl zr start back ls rs dup ddown dleft dright
+                         // rs-up rs-down rs-left rs-right
+    std::string target;  // hub map tools wheel pointer none, or 3DS buttons (A+B, DUP, ...)
+    u32 buttons = 0;     // the 3DS buttons, when it is buttons
+};
+struct HubEntry {
+    std::string label;
+    enum Action { TAP, PRESS, MAP, TOOLS } action = TAP;
+    int x = 0, y = 0;       // TAP: bottom-screen pixel
+    u32 buttons = 0;        // PRESS
+    int ix = 0, iy = 0, iw = 0, ih = 0;  // its icon: a part of the bottom screen (w 0: none)
+    std::string glyph;      // or a character drawn as its icon
+    int cond = -1;          // offered when this holds
+};
+struct MapArea {
+    int x = 0, y = 0, w = 0, h = 0;  // bottom-screen pixels
+    int cond = -1;
+};
+struct Tools {
+    int pockets = -1, held = -1;  // values: the first pocket (items 4 bytes apart), the item in hand
+    u32 empty = 0x7ffe;           // the empty item
+    std::vector<std::pair<int, int>> slots;  // where each pocket is on the bottom screen while the pockets are open
+    int portrait_x = 0, portrait_y = 0;      // where an item is dropped to hold it
+    u32 open = 0;                 // the 3DS buttons that open the pockets
+    int open_cond = -1;           // the pockets are open
+    int ready_cond = -1;          // the tool ring can be used (the player is free to move)
+    std::string items;            // item records (RomFS): icon u16 and category byte per item, from "first"
+    u32 record = 0, first = 0, icon_off = 0, category_off = 0, kind_lo = 0, kind_hi = 0;
+    std::string icons;            // the icons' archive and file pattern (RomFS "file:pattern" with a %d)
+    std::string names;            // item names (RomFS MSBT, or several in a umsbt: the first)
+};
+
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none
 bool loaded();
 bool has_focus_rules();
@@ -52,11 +87,17 @@ const std::vector<Element> &elements();
 const std::vector<Icon> &icons();
 bool cond(int i);         // a condition's state this frame
 bool value(int i, s64 &v);  // a value this frame (false: its pointer chain was null)
+bool value_address(int i, u32 &a);  // where it was read this frame (guest memory values)
 const Button *button();   // the HUD action button, if it applies now
 bool keyboard_active();   // the game's own keyboard is up ("keyboard when ...")
 bool key(const std::string &k, int &x, int &y);  // where a character or named key is on the bottom screen
 const std::vector<UnsavedMark> &unsaved_marks();
 void set_runtime(const std::string &flag, s64 v);  // a "value <name> = runtime <flag>" (read at the next update)
 bool onescreen();         // "onescreen": no corner screen in the single-screen layouts
+const std::vector<Bind> &binds();
+const std::vector<HubEntry> &hub();
+const std::vector<MapArea> &map_areas();
+const Tools &tools();
+u32 button_mask(const std::string &names);  // "A+B", "DUP", ... as 3DS button bits (0: none known)
 
 }  // namespace profile

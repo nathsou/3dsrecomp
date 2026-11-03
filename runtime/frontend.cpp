@@ -25,6 +25,7 @@
 #include "kernel.h"
 #include "loader.h"
 #include "hud.h"
+#include "onescreen.h"
 #include "profile.h"
 #include "menu.h"
 #include "services/services.h"
@@ -411,6 +412,37 @@ static void write_ppm(const char *path, const u32 *px, int w, int h) {
     fclose(f);
 }
 
+// The bottom screen's picture, sampled on a grid: how much the game drew (alpha: with its background hidden by the
+// profile, the rest is transparent) and how much of it is black (a screen left black: keyed out in one-screen play,
+// so a dialog's choices on it float and an empty one shows nothing). Returns the picture to show.
+static const u32 *bottom_stats(const u32 *img, int w, int h) {
+    int cover = 0, opaque = 0, dark = 0, n = 0;
+    for (int y = h / 60; y < h; y += h / 30)
+        for (int x = w / 80; x < w; x += w / 40, n++) {
+            const u32 p = img[(size_t)y * w + x], a = p >> 24;
+            const u32 m = std::max({p & 255, p >> 8 & 255, p >> 16 & 255});
+            cover += a > 32;
+            opaque += a > 240;
+            dark += a > 32 && m < 12;
+        }
+    static std::vector<u32> keyed;
+    if (onescreen::active() && n && dark > n * 6 / 10) {
+        keyed.assign(img, img + (size_t)w * h);
+        for (u32 &p : keyed) {
+            const int m = (int)std::max({p & 255, p >> 8 & 255, p >> 16 & 255});
+            const u32 a = (u32)std::clamp((m - 8) * 24, 0, 255) * (p >> 24) / 255;
+            p = (p & 0xffffff) | a << 24;
+        }
+        img = keyed.data();
+        cover -= dark;
+        opaque = 0;
+    }
+    bottom_cover = n ? (float)cover / n : 1;
+    bottom_opaque = n ? (float)opaque / n : 1;
+    if (onescreen::active()) onescreen::bottom_image(img, w, h);
+    return img;
+}
+
 // Uploads the screen image: the GPU backend's high-resolution one when it has it, else the guest framebuffer.
 // (the high-resolution image is uploaded only when it is a new one)
 static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hires, int &hw, int &hh,
@@ -427,27 +459,17 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hir
             hw = w;
             hh = h;
         }
+        if (screen == 1) img = bottom_stats(img, w, h);
         SDL_UpdateTexture(hires, nullptr, img, w * 4);
-        if (screen == 1) {
-            int cover = 0, opaque = 0, n = 0;
-            for (int y = h / 60; y < h; y += h / 30)
-                for (int x = w / 80; x < w; x += w / 40, n++) {
-                    const u32 a = img[(size_t)y * w + x] >> 24;
-                    cover += a > 32;
-                    opaque += a > 240;
-                }
-            bottom_cover = n ? (float)cover / n : 1;
-            bottom_opaque = n ? (float)opaque / n : 1;
-        }
     });
     static u32 last_fb;
     if (screen == 0 && (ver ? ver != shown[0] : f.addr_left != last_fb)) game_frames++;  // a new image: the game's fps
     if (screen == 0) last_fb = f.addr_left;
     shown[screen] = ver;
     if (ver) return hires;
-    if (screen == 1) bottom_cover = bottom_opaque = 1;  // (the guest framebuffer has no alpha)
     convert_fb(f, width, buf);
-    SDL_UpdateTexture(native, nullptr, buf, width * 4);
+    const u32 *pic = screen == 1 ? bottom_stats(buf, width, 240) : buf;  // (opaque: no alpha in guest memory)
+    SDL_UpdateTexture(native, nullptr, pic, width * 4);
     return native;
 }
 
@@ -622,7 +644,8 @@ static void place_screens() {
         return SDL_FRect{area.x + (area.w - sw * k) / 2, area.y + (area.h - 240 * k) / 2, sw * k, 240 * k};
     };
     // the profile's panel: the bottom screen over the top one, when it shows something
-    const bool want_panel = auto_focus() == profile::FOCUS_PANEL && !manual_flip && bottom_cover > 0.01f;
+    const bool want_panel = auto_focus() == profile::FOCUS_PANEL && !manual_flip && bottom_cover > 0.01f &&
+                            !onescreen::busy();
     panel_anim = std::clamp(panel_anim + (want_panel ? 0.2f : -0.25f), 0.0f, 1.0f);
     if (auto_focus() == profile::FOCUS_PANEL || (profile::onescreen() && !manual_flip)) {
         placement.top = fit(0);
@@ -907,6 +930,8 @@ static void present() {
     place_screens();
     const Placement &pl = placement;
     const float f = present_factor();
+    onescreen::set_state(single_layout() && profile::onescreen() && !window2, pl.top,
+                         pl.panel && pl.alpha > 0.5f ? pl.bottom : SDL_FRect{});
     auto draw = [&](int screen) {
         const SDL_FRect &d = screen ? pl.bottom : pl.top;
         SDL_Texture *t = screen ? t_bottom : t_top;
@@ -952,6 +977,7 @@ static void present() {
     // the HUD over the top screen: the bottom screen's information when it is out of sight (or always)
     const bool bottom_seen = window2 || (pl.bottom.w && (pl.pip != 1 || pl.alpha > 0.5f));
     if (pl.top.w && pl.pip != 0 && (g_settings.hud == 2 || (g_settings.hud == 1 && !bottom_seen))) hud::draw(renderer, pl.top);
+    onescreen::draw(renderer, t_bottom, f);
     if (touch::enabled() && !menu::is_open() && !menu::keyboard_open()) touch::draw();
     menu::draw();
     write_window_shot(renderer, "window");
@@ -1069,7 +1095,68 @@ static void parse_script() {
     }
 }
 
+// One-screen play: the host's inputs by position (onescreen.h), the keyboard's keys standing for the gamepad's as
+// in the controls table, and the right stick (-1..1, up positive); RECOMP_LIVE's PAD commands add to them
+std::atomic<u32> g_live_host;
+static u32 host_input(float &rsx, float &rsy) {
+    using namespace onescreen;
+    const bool *k = SDL_GetKeyboardState(nullptr);
+    static const bool none[SDL_SCANCODE_COUNT] = {};
+    const bool *kb = typing ? none : k;
+    u32 h = g_live_host;
+    const std::pair<SDL_Scancode, u32> keys[] = {
+        {SDL_SCANCODE_X, H_A}, {SDL_SCANCODE_Z, H_B}, {SDL_SCANCODE_S, H_X}, {SDL_SCANCODE_A, H_Y},
+        {SDL_SCANCODE_Q, H_L}, {SDL_SCANCODE_W, H_R}, {SDL_SCANCODE_1, H_ZL}, {SDL_SCANCODE_2, H_ZR},
+        {SDL_SCANCODE_RETURN, H_START}, {SDL_SCANCODE_BACKSPACE, H_BACK}, {SDL_SCANCODE_I, H_DUP},
+        {SDL_SCANCODE_K, H_DDOWN}, {SDL_SCANCODE_J, H_DLEFT}, {SDL_SCANCODE_L, H_DRIGHT}};
+    for (auto &[sc, bit] : keys)
+        if (kb[sc]) h |= bit;
+    rsx = rsy = 0;
+    if (h & H_RSUP) rsy = 1;
+    if (h & H_RSDOWN) rsy = -1;
+    if (h & H_RSLEFT) rsx = -1;
+    if (h & H_RSRIGHT) rsx = 1;
+    if (!pad) return h;
+    const std::pair<SDL_GamepadButton, u32> btns[] = {
+        {SDL_GAMEPAD_BUTTON_EAST, H_A}, {SDL_GAMEPAD_BUTTON_SOUTH, H_B}, {SDL_GAMEPAD_BUTTON_NORTH, H_X},
+        {SDL_GAMEPAD_BUTTON_WEST, H_Y}, {SDL_GAMEPAD_BUTTON_LEFT_SHOULDER, H_L},
+        {SDL_GAMEPAD_BUTTON_RIGHT_SHOULDER, H_R}, {SDL_GAMEPAD_BUTTON_START, H_START},
+        {SDL_GAMEPAD_BUTTON_BACK, H_BACK}, {SDL_GAMEPAD_BUTTON_DPAD_UP, H_DUP},
+        {SDL_GAMEPAD_BUTTON_DPAD_DOWN, H_DDOWN}, {SDL_GAMEPAD_BUTTON_DPAD_LEFT, H_DLEFT},
+        {SDL_GAMEPAD_BUTTON_DPAD_RIGHT, H_DRIGHT}};
+    for (auto &[b, bit] : btns)
+        if (SDL_GetGamepadButton(pad, b)) h |= bit;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_LEFT_TRIGGER) > 16000) h |= H_ZL;
+    if (SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHT_TRIGGER) > 16000) h |= H_ZR;
+    const float x = SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTX) / 32767.0f,
+                y = -SDL_GetGamepadAxis(pad, SDL_GAMEPAD_AXIS_RIGHTY) / 32767.0f;
+    if (std::fabs(x) > std::fabs(rsx)) rsx = x;
+    if (std::fabs(y) > std::fabs(rsy)) rsy = y;
+    if (rsy > 0.5f) h |= H_RSUP;
+    if (rsy < -0.5f) h |= H_RSDOWN;
+    if (rsx < -0.5f) h |= H_RSLEFT;
+    if (rsx > 0.5f) h |= H_RSRIGHT;
+    return h;
+}
+
+static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty);
 static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
+    poll_input_devices(buttons, cx, cy, touch, tx, ty);
+    float rsx, rsy;
+    const u32 host = host_input(rsx, rsy);
+    if (const u32 live = g_live_host; live) {  // (scripted host input: its default buttons too)
+        static const u32 defaults[][2] = {
+            {onescreen::H_A, BTN_A}, {onescreen::H_B, BTN_B}, {onescreen::H_X, BTN_X}, {onescreen::H_Y, BTN_Y},
+            {onescreen::H_L, BTN_L}, {onescreen::H_R, BTN_R}, {onescreen::H_ZL, BTN_ZL}, {onescreen::H_ZR, BTN_ZR},
+            {onescreen::H_START, BTN_START}, {onescreen::H_BACK, BTN_SELECT}, {onescreen::H_DUP, BTN_UP},
+            {onescreen::H_DDOWN, BTN_DOWN}, {onescreen::H_DLEFT, BTN_LEFT}, {onescreen::H_DRIGHT, BTN_RIGHT}};
+        for (auto &d : defaults)
+            if (live & d[0]) buttons |= d[1];
+    }
+    onescreen::input(host, rsx, rsy, buttons, cx, cy, touch, tx, ty);
+}
+
+static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
     const bool *k = SDL_GetKeyboardState(nullptr);
     static const bool none[SDL_SCANCODE_COUNT] = {};
     const bool *kb = typing ? none : k;  // keys type while the game's keyboard is up (the arrows still move)
@@ -1386,6 +1473,12 @@ void frontend_run() {
                     hud_tap_until = frame_count + 6;
                 }
             if (!touch::enabled() && pip_mouse(ev)) continue;
+            if (ev.type == SDL_EVENT_MOUSE_BUTTON_DOWN && ev.button.button == SDL_BUTTON_LEFT &&
+                onescreen::overlay_open() && SDL_GetWindowFromID(ev.button.windowID) == window) {
+                float lx, ly;  // a click on the one-screen overlays (hub entries; elsewhere closes them)
+                SDL_RenderCoordinatesFromWindow(renderer, ev.button.x, ev.button.y, &lx, &ly);
+                if (onescreen::click(lx, ly)) continue;
+            }
             if (ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_F3) {
                 cycle_scale();
                 g_settings.scale = scale_mode > 0 ? scale_mode : 0;

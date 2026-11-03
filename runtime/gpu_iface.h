@@ -27,8 +27,8 @@ float busy();  // fraction of the last ~2 s the GPU spent on our work (0 without
 void set_texture_filter(int mode);
 int texture_filter_count();                 // modes, including 0 (off)
 const char *texture_filter_name(int mode);  // "Off", "Sharp", "Smooth"
-// (Metal) clear a render target to transparent once its picture went to the top screen, before the next draw
-// into it (see runtime/gpu/metal.mm)
+// (Metal) clear render targets to transparent after each display transfer from them, before the next draw into
+// them (see runtime/gpu/metal.mm)
 void set_clear_after_top_transfer(bool on);
 void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap, u32 flags);
 }

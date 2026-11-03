@@ -1,9 +1,14 @@
 // hid:USER / hid:SPVR: pad, circle pad, touch screen, accelerometer and gyroscope through shared memory.
+#include <algorithm>
 #include <atomic>
 #include "../service.h"
 #include "services.h"
 
 extern std::atomic<int> g_winshot_request;  // (frontend.cpp)
+extern std::atomic<u32> g_live_host;         // (frontend.cpp): host inputs for one-screen play (onescreen.h)
+namespace onescreen {
+u32 host_mask(const char *names);
+}
 
 namespace kernel {
 
@@ -35,12 +40,16 @@ static void ensure_shm() {
 // run one after the other for that many VBlanks, each followed by a few released frames; the log says when each
 // starts. A line "DUMP" writes the state of every thread to the log at once, "MEMDUMP <tag>" snapshots guest memory
 // (mem_<tag>_<address>.bin, as RECOMP_MEMDUMP), "POKE8 <hex address> <hex value>" writes a byte at once,
+// "DRAG <x>/<y> <x1>/<y1> <frames>" touches and moves (bottom-screen pixels), "PAD <host inputs> <frames>" plays host inputs by position (one-screen play: "PAD zl 6", "PAD rs-up 30"),
 // "WINSHOT" writes the whole window at the next frame (window_<frame>.ppm, as RECOMP_WINSHOT).
 namespace {
 struct LiveCmd {
     u32 buttons = 0;
     int cx = 0, cy = 0, tx = -1, ty = -1, frames = 0;
     std::string memdump;  // "MEMDUMP <tag>": guest memory as mem_<tag>_<address>.bin when the command is reached
+    u32 host = 0;         // "PAD <inputs> <frames>": host inputs by position (zl, back, dup, rs-up, ...)
+    int x1 = -1, y1 = -1;  // "DRAG <x>/<y> <x1>/<y1> <frames>": a touch moving from (tx, ty) to here
+    u64 start = 0;
 };
 struct Live {
     FILE *f = nullptr;
@@ -55,6 +64,20 @@ struct Live {
 
 LiveCmd parse_live(const std::string &line) {
     LiveCmd c;
+    if (line.rfind("DRAG ", 0) == 0) {
+        int n = 0;
+        sscanf(line.c_str() + 5, "%d/%d %d/%d %d", &c.tx, &c.ty, &c.x1, &c.y1, &n);
+        c.frames = n > 0 ? n : 1;
+        return c;
+    }
+    if (line.rfind("PAD ", 0) == 0) {
+        char names[128] = {};
+        int n = 0;
+        sscanf(line.c_str() + 4, "%127s %d", names, &n);
+        c.host = onescreen::host_mask(names);
+        c.frames = n > 0 ? n : 1;
+        return c;
+    }
     if (line == "WINSHOT") {  // the whole window at the next frame (window_<frame>.ppm)
         c.memdump = "@window";
         c.frames = 1;
@@ -121,6 +144,7 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         if (live.next >= live.queue.size()) return;
         live.cur = live.queue[live.next++];
         live.until = g_frame + live.cur.frames;
+        live.cur.start = g_frame;
         live.active = true;
         LOG("[live] command %zu starts (%d frames)\n", live.next, live.cur.frames);
         if (live.cur.memdump == "@window") {
@@ -129,6 +153,7 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
             dump_memory(("mem_" + live.cur.memdump).c_str());
         }
     }
+    g_live_host = live.active ? live.cur.host : 0;
     if (!live.active) return;
     buttons |= live.cur.buttons;
     if (live.cur.cx || live.cur.cy) {
@@ -139,6 +164,11 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         touch = true;
         tx = (u16)live.cur.tx;
         ty = (u16)live.cur.ty;
+        if (live.cur.x1 >= 0) {  // a drag: there linearly, the last frames held at the end
+            const float t = std::min(1.0f, (float)(g_frame - live.cur.start) / std::max(1, live.cur.frames - 6));
+            tx = (u16)(live.cur.tx + (live.cur.x1 - live.cur.tx) * t);
+            ty = (u16)(live.cur.ty + (live.cur.y1 - live.cur.ty) * t);
+        }
     }
 }
 }  // namespace

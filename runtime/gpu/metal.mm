@@ -2968,6 +2968,19 @@ DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, 
 }
 }  // namespace
 
+// (set_clear_after_top_transfer) a target transferred again with no draw since its clear was asked for: cleared
+// now, so the transfer shows nothing (the bottom screen's pass drew nothing over the top screen's picture)
+void clear_now(GRT &r, id<MTLCommandBuffer> cb) {
+    r.clear_next = false;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = r.tex;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+    r.ms_valid = false;
+}
+
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
     if (!active || eager_writeback || (flags & 2)) return false;
     u32 row0 = 0;
@@ -2980,6 +2993,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     const u32 TW = src->w * S, rows = (out_dims >> 16) * S;
     @autoreleasepool {
         op->cb = new_cb();
+        if (src->clear_next) clear_now(*src, op->cb);
         op->lin = take_buffer(lin_free, (size_t)src->w * src->h * 4);
         {
             std::lock_guard<std::mutex> lk(disp_mtx);
@@ -2998,7 +3012,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     }
     src->gpu_newer = false;  // the pending transfer writes it back
     src->own = false;
-    if (clear_after_top && (out_dims >> 16) >= 400) clear_overlapping(*src);  // (a top screen: 400 rows or more)
+    if (clear_after_top) clear_overlapping(*src);
     op->rt = src;
     op->in_paddr = in_paddr;
     op->out_paddr = out_paddr;
@@ -3040,6 +3054,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     }
     @autoreleasepool {
         id<MTLCommandBuffer> cb = new_cb();
+        if (src->clear_next) clear_now(*src, cb);
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         encode_rot(ce, *src, buf, rows, flags, row0);
         [ce endEncoding];
@@ -3056,13 +3071,14 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     d.incomplete = src->skipped > 0;
     src->skipped = 0;
     src->own = false;
-    if (clear_after_top && out_h0 >= 400) clear_overlapping(*src);  // (a top screen: 400 rows or more)
+    if (clear_after_top) clear_overlapping(*src);
 }
 
 // The bottom screen's pass of some games (Animal Crossing: New Leaf) reuses the render target the top screen's
 // picture came from and covers it with a background; with that background hidden (a game profile's "set"), the
-// target is cleared to transparent after each transfer to the top screen, so the bottom screen's picture keeps
-// only what its pass draws (and its alpha says where that is).
+// target is cleared to transparent after each display transfer (before the next draw into it, so a picture
+// transferred again unchanged stays), so the bottom screen's picture keeps only what its pass draws (and its
+// alpha says where that is). The top screen's pass draws all of its picture anyway.
 void set_clear_after_top_transfer(bool on) { clear_after_top = on; }
 
 namespace {

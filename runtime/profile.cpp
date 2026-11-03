@@ -14,9 +14,31 @@
 //       screen with the bottom one shown beside it (picture in picture). "panel": in the single-screen layouts,
 //       the bottom screen over the top one, as a card over the dimmed picture (or floating on its own
 //       transparency when its background is hidden, see "set"), nothing when it shows nothing.
+//   bind <host input> <target>
+//       One-screen controls (in the single-screen layouts with "onescreen"): a gamepad input by position (a b x y
+//       l r zl zr start back ls rs dup ddown dleft dright rs-up rs-down rs-left rs-right; the keyboard's keys
+//       stand for them as in the controls table) plays 3DS buttons (A+B, DUP, CUP, ...) or opens an overlay:
+//       hub, map, tools (the ring), tool-next / tool-prev (hold the next or previous tool in the pockets), tool-away
+//       (put the held tool away); "pointer" makes the right stick move a pointer over the bottom screen's panel, and the
+//       input touch where it points; "none" does nothing. Unbound inputs play their own 3DS button.
+//   hub "<label>" tap <x> <y> | press <buttons> | map | tools [icon <x> <y> <w> <h> | glyph "<c>"] [when <cond>]
+//       An entry of the hub (a phone-like launcher): tap the bottom screen there, press 3DS buttons, or open the
+//       map or the tool ring. Its icon is that part of the bottom screen, kept from the last time it showed, or a
+//       character (the map's entry shows the map, the tools' entry the tool in hand).
+//   map <x> <y> <w> <h> [when <condition>]
+//       The map overlay: that part of the bottom screen, live and enlarged (first area whose condition holds).
+//   tools pockets <value> held <value> [empty <item>]
+//   tools items <romfs file> record <bytes> first <item> icon <offset> category <offset> kinds <lo> <hi>
+//   tools icons <romfs archive>:<file pattern with %d>
+//   tools names <romfs msbt/umsbt>
+//   tools slots <x> <y> ...
+//   tools equip <portrait x> <portrait y> open <buttons> when-open <value> <op> <n> ready <value> <op> <n>
+//       The tool ring: the pockets (16 items, 4 bytes apart, from the first one's value) whose category is a
+//       tool kind, with their icons and names from the game's own files; choosing one opens the pockets and drags
+//       it onto the portrait (another tool goes back to a free pocket the same way).
 //   clearbottom
-//       The render target the top screen's picture came from is cleared to transparent before it is drawn into
-//       again: for games whose bottom screen's pass reuses it under a background, which "set" hides.
+//       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
+//       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
 //   onescreen
 //       In the single-screen layouts the bottom screen never shows in a corner: the profile's panel and overlays
 //       (hub, map, wheel, tools) stand in for it.
@@ -93,11 +115,37 @@ int keyboard_cond = -2;  // -2: no keyboard
 std::map<std::string, std::pair<int, int>> keys;  // a character (UTF-8) or a named key -> bottom-screen pixel
 std::vector<UnsavedMark> marks;
 std::vector<SetRule> set_rules;
+std::vector<Bind> bind_list;
+std::vector<HubEntry> hub_list;
+std::vector<MapArea> map_list;
+Tools tool_cfg;
 std::map<std::string, s64> runtime_flags;
 bool one_screen;
 Focus cur_focus = FOCUS_NONE;
 int trace_every;
 u64 frames;
+
+}  // namespace
+u32 button_mask(const std::string &names) {
+    static const std::pair<const char *, u32> btns[] = {
+        {"A", 1 << 0}, {"B", 1 << 1}, {"SELECT", 1 << 2}, {"START", 1 << 3}, {"DRIGHT", 1 << 4}, {"DLEFT", 1 << 5},
+        {"DUP", 1 << 6}, {"DDOWN", 1 << 7}, {"R", 1 << 8}, {"L", 1 << 9}, {"X", 1 << 10}, {"Y", 1 << 11},
+        {"ZL", 1 << 14}, {"ZR", 1 << 15}, {"CRIGHT", 1u << 28}, {"CLEFT", 1u << 29}, {"CUP", 1u << 30},
+        {"CDOWN", 1u << 31}};
+    u32 m = 0;
+    for (size_t p = 0; p <= names.size();) {
+        size_t e = names.find('+', p);
+        if (e == std::string::npos) e = names.size();
+        const std::string part = names.substr(p, e - p);
+        bool known = false;
+        for (auto &[n, bit] : btns)
+            if (part == n) m |= bit, known = true;
+        if (!known) return 0;
+        p = e + 1;
+    }
+    return m;
+}
+namespace {
 
 bool num(const std::string &t, s64 &out) {
     if (t.empty()) return false;
@@ -163,7 +211,16 @@ bool parse_line(const std::string &line, std::string &err) {
     std::vector<std::string> t;
     {
         std::istringstream ss(line.substr(0, line.find('#')));
-        for (std::string w; ss >> w;) t.push_back(w);
+        for (std::string w; ss >> w;) {
+            if (w.size() > 1 && w[0] == '"') {  // a quoted label, spaces included
+                while (w.back() != '"' || w.size() == 1) {
+                    std::string more;
+                    if (!(ss >> more)) break;
+                    w += " " + more;
+                }
+            }
+            t.push_back(w);
+        }
     }
     if (t.empty()) return true;
     const std::string &d = t[0];
@@ -242,6 +299,138 @@ bool parse_line(const std::string &line, std::string &err) {
     if (d == "onescreen") {
         one_screen = true;
         return true;
+    }
+
+    if (d == "bind") {
+        if (t.size() != 3) {
+            err = "expected 'bind <host input> <target>'";
+            return false;
+        }
+        Bind b{t[1], t[2], 0};
+        static const char *overlays[] = {"hub", "map", "tools", "tool-next", "tool-prev", "tool-away", "wheel",
+                                         "pointer", "none"};
+        if (std::find(std::begin(overlays), std::end(overlays), t[2]) == std::end(overlays) &&
+            !(b.buttons = button_mask(t[2]))) {
+            err = "unknown target " + t[2];
+            return false;
+        }
+        bind_list.push_back(b);
+        return true;
+    }
+    if (d == "hub") {
+        if (t.size() < 3 || t[1].size() < 2 || t[1][0] != '"') {
+            err = "expected 'hub \"<label>\" <action>'";
+            return false;
+        }
+        HubEntry h;
+        h.label = t[1].substr(1, t[1].size() - 2);
+        size_t i = 3;
+        s64 a, b, c2, e;
+        if (t[2] == "tap" && t.size() >= 5 && num(t[3], a) && num(t[4], b)) {
+            h.action = HubEntry::TAP;
+            h.x = (int)a, h.y = (int)b;
+            i = 5;
+        } else if (t[2] == "press" && t.size() >= 4 && (h.buttons = button_mask(t[3]))) {
+            h.action = HubEntry::PRESS;
+            i = 4;
+        } else if (t[2] == "map") {
+            h.action = HubEntry::MAP;
+        } else if (t[2] == "tools") {
+            h.action = HubEntry::TOOLS;
+        } else {
+            err = "expected tap <x> <y>, press <buttons>, map or tools";
+            return false;
+        }
+        if (i + 4 < t.size() && t[i] == "icon" && num(t[i + 1], a) && num(t[i + 2], b) && num(t[i + 3], c2) &&
+            num(t[i + 4], e)) {
+            h.ix = (int)a, h.iy = (int)b, h.iw = (int)c2, h.ih = (int)e;
+            i += 5;
+        } else if (i + 1 < t.size() && t[i] == "glyph" && t[i + 1].size() > 2 && t[i + 1][0] == '"') {
+            h.glyph = t[i + 1].substr(1, t[i + 1].size() - 2);
+            i += 2;
+        }
+        if ((h.cond = when(t, i, err)) == -2) return false;
+        hub_list.push_back(h);
+        return true;
+    }
+    if (d == "map") {
+        s64 x, y, w, h;
+        if (t.size() < 5 || !num(t[1], x) || !num(t[2], y) || !num(t[3], w) || !num(t[4], h)) {
+            err = "expected 'map <x> <y> <w> <h>'";
+            return false;
+        }
+        MapArea m{(int)x, (int)y, (int)w, (int)h, -1};
+        if ((m.cond = when(t, 5, err)) == -2) return false;
+        map_list.push_back(m);
+        return true;
+    }
+    if (d == "tools" && t.size() >= 2) {
+        Tools &c = tool_cfg;
+        auto val = [&](size_t i, int &out) {
+            if (i >= t.size() || (out = value_index(t[i])) < 0) {
+                err = "unknown value " + (i < t.size() ? t[i] : std::string());
+                return false;
+            }
+            return true;
+        };
+        auto n = [&](size_t i, u32 &out) {
+            s64 v;
+            if (i >= t.size() || !num(t[i], v)) {
+                err = "expected a number";
+                return false;
+            }
+            out = (u32)v;
+            return true;
+        };
+        if (t[1] == "pockets") {
+            if (t.size() < 5 || t[3] != "held" || !val(2, c.pockets) || !val(4, c.held)) {
+                if (err.empty()) err = "expected 'tools pockets <value> held <value> [empty <item>]'";
+                return false;
+            }
+            if (t.size() >= 7 && t[5] == "empty") return n(6, c.empty);
+            return true;
+        }
+        if (t[1] == "items") {
+            if (t.size() != 14 || t[3] != "record" || t[5] != "first" || t[7] != "icon" || t[9] != "category" ||
+                t[11] != "kinds") {
+                err = "expected 'tools items <file> record <n> first <item> icon <off> category <off> kinds <lo> <hi>'";
+                return false;
+            }
+            c.items = t[2];
+            return n(4, c.record) && n(6, c.first) && n(8, c.icon_off) && n(10, c.category_off) &&
+                   n(12, c.kind_lo) && n(13, c.kind_hi) && c.record > 0;
+        }
+        if (t[1] == "icons" && t.size() == 3) {
+            c.icons = t[2];
+            return true;
+        }
+        if (t[1] == "names" && t.size() == 3) {
+            c.names = t[2];
+            return true;
+        }
+        if (t[1] == "slots") {
+            for (size_t i = 2; i + 1 < t.size(); i += 2) {
+                u32 x, y;
+                if (!n(i, x) || !n(i + 1, y)) return false;
+                c.slots.push_back({(int)x, (int)y});
+            }
+            return true;
+        }
+        if (t[1] == "equip") {
+            u32 x, y;
+            size_t wo = std::find(t.begin(), t.end(), "when-open") - t.begin();
+            size_t rd = std::find(t.begin(), t.end(), "ready") - t.begin();
+            if (t.size() < 6 || !n(2, x) || !n(3, y) || t[4] != "open" || !(c.open = button_mask(t[5])) ||
+                wo != 6 || rd >= t.size() || rd < wo) {
+                if (err.empty()) err = "expected 'tools equip <x> <y> open <buttons> when-open <cond> ready <cond>'";
+                return false;
+            }
+            c.portrait_x = (int)x, c.portrait_y = (int)y;
+            std::vector<std::string> a(t.begin() + wo + 1, t.begin() + rd), b(t.begin() + rd + 1, t.end());
+            return (c.open_cond = parse_cond(a, 0, err)) != -2 && (c.ready_cond = parse_cond(b, 0, err)) != -2;
+        }
+        err = "unknown tools directive " + t[1];
+        return false;
     }
     if (d == "clearbottom") {
         gpu::set_clear_after_top_transfer(true);
@@ -543,7 +732,16 @@ bool value(int i, s64 &v) {
     return true;
 }
 void set_runtime(const std::string &flag, s64 v) { runtime_flags[flag] = v; }
+const std::vector<Bind> &binds() { return bind_list; }
+const std::vector<HubEntry> &hub() { return hub_list; }
+const std::vector<MapArea> &map_areas() { return map_list; }
+const Tools &tools() { return tool_cfg; }
 bool onescreen() { return one_screen; }
+bool value_address(int i, u32 &a) {
+    if (i < 0 || i >= (int)values.size() || !values[i].ok || values[i].type == 'r') return false;
+    a = values[i].at;
+    return true;
+}
 bool keyboard_active() { return keyboard_cond != -2 && (keyboard_cond == -1 || conds[keyboard_cond].state); }
 bool key(const std::string &k, int &x, int &y) {
     auto it = keys.find(k);
