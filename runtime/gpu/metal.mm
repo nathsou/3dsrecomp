@@ -296,14 +296,19 @@ fragment RDOut k_rdepth(RVOut in [[stage_in]], depth2d<float, access::read> d [[
     o.s = s.read(uint2(in.pos.xy)).r;
     return o;
 }
-// upright display image: p = texture width, rows used, flip, first row
+// upright display image: p = texture width, rows used, flip (bit 0) and black keyed out (bit 1), first row
 kernel void k_rot(texture2d<float, access::read> src [[texture(0)]], device uint *dst [[buffer(0)]],
                   constant uint4 &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.y || gid.y >= p.x) return;
-    const uint row = (p.z ? p.y - 1 - gid.x : gid.x) + p.w;
+    const uint row = ((p.z & 1) ? p.y - 1 - gid.x : gid.x) + p.w;
     const uint col = p.x - 1 - gid.y;
     const uint4 b = uint4(round(saturate(src.read(uint2(col, row))) * 255.0));
-    dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (255u << 24);
+    uint a = b.a;
+    if (p.z & 2) {  // black keyed out; what was drawn translucent over a background (now hidden) more opaque
+        a = min(255u, a * 17u / 10u);
+        a = min(a, uint(clamp((int(max(b.r, max(b.g, b.b))) - 3) * 64, 0, 255)));
+    }
+    dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (a << 24);
 }
 )";
 
@@ -402,12 +407,23 @@ struct GRT {
     u64 hash = 0;
     bool gpu_newer = false;  // depth/stencil changes not yet written to guest memory
     u32 skipped = 0;         // draws left out since its last display transfer (pipelines still compiling)
+    bool clear_next = false; // set_clear_after_top_transfer: cleared to transparent before it is drawn into again,
+    bool own = false;        // ... and its GPU copy kept (guest memory ignored) until its own next display transfer
 };
+std::atomic<bool> clear_after_top{false};
+std::atomic<bool> key_black_bottom{false};  // set_key_black_bottom
+
 std::vector<std::unique_ptr<GRT>> rts;
 
 u32 rt_bytes(const GRT &r) {
     if (r.depth) return r.w * r.h * (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4);
     return r.w * r.h * pixel_bytes(cbuf_to_pixfmt(r.fmt));
+}
+
+// (set_clear_after_top_transfer) the colour targets in the same memory as r: cleared before their next draw
+void clear_overlapping(GRT &r) {
+    for (auto &o : rts)
+        if (!o->depth && o->addr < r.addr + rt_bytes(r) && r.addr < o->addr + rt_bytes(*o)) o->clear_next = o->own = true;
 }
 
 GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
@@ -501,6 +517,11 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
     if (!p) return la;
     const u64 hv = hash_bytes(p, rt_bytes(r));
     if (r.synced && hv == r.hash) return la;
+    if (r.own) {  // (cleared after a transfer to the top screen: the top screen's write-back is not its picture)
+        r.hash = hv;
+        r.synced = true;
+        return la;
+    }
     r.synced = true;
     r.hash = hv;
     r.gpu_newer = false;
@@ -2468,7 +2489,12 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             }
             o->synced = false;
         }
-        const LoadAction cla = sync_rt(col, cb);
+        LoadAction cla = sync_rt(col, cb);
+        if (col.clear_next) {  // (set_clear_after_top_transfer)
+            col.clear_next = false;
+            cla.clear = true;
+            cla.color = 0;
+        }
         LoadAction dla;
         if (dep) dla = sync_rt(*dep, cb);
 
@@ -2914,7 +2940,8 @@ void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u3
     [ce setComputePipelineState:k_rot];
     [ce setTexture:src.tex atIndex:0];
     [ce setBuffer:dst offset:0 atIndex:0];
-    const u32 prm[4] = {TW, rows, flags & 1, row0 * S};
+    const u32 key = key_black_bottom && rows == 320 * S ? 2 : 0;  // (a bottom screen: 320 rows)
+    const u32 prm[4] = {TW, rows, (flags & 1) | key, row0 * S};
     [ce setBytes:prm length:16 atIndex:1];
     [ce dispatchThreads:MTLSizeMake(rows, TW, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
 }
@@ -2948,6 +2975,19 @@ DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, 
 }
 }  // namespace
 
+// (set_clear_after_top_transfer) a target transferred again with no draw since its clear was asked for: cleared
+// now, so the transfer shows nothing (the bottom screen's pass drew nothing over the top screen's picture)
+void clear_now(GRT &r, id<MTLCommandBuffer> cb) {
+    r.clear_next = false;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    rp.colorAttachments[0].texture = r.tex;
+    rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+    rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 0);
+    rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    [[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+    r.ms_valid = false;
+}
+
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
     if (!active || eager_writeback || (flags & 2)) return false;
     u32 row0 = 0;
@@ -2960,6 +3000,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     const u32 TW = src->w * S, rows = (out_dims >> 16) * S;
     @autoreleasepool {
         op->cb = new_cb();
+        if (src->clear_next) clear_now(*src, op->cb);
         op->lin = take_buffer(lin_free, (size_t)src->w * src->h * 4);
         {
             std::lock_guard<std::mutex> lk(disp_mtx);
@@ -2977,6 +3018,8 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         [op->cb commit];
     }
     src->gpu_newer = false;  // the pending transfer writes it back
+    src->own = false;
+    if (clear_after_top) clear_overlapping(*src);
     op->rt = src;
     op->in_paddr = in_paddr;
     op->out_paddr = out_paddr;
@@ -3018,6 +3061,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     }
     @autoreleasepool {
         id<MTLCommandBuffer> cb = new_cb();
+        if (src->clear_next) clear_now(*src, cb);
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         encode_rot(ce, *src, buf, rows, flags, row0);
         [ce endEncoding];
@@ -3033,7 +3077,20 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     d.buf = buf;
     d.incomplete = src->skipped > 0;
     src->skipped = 0;
+    src->own = false;
+    if (clear_after_top) clear_overlapping(*src);
 }
+
+// The bottom screen's pass of some games (Animal Crossing: New Leaf) reuses the render target the top screen's
+// picture came from and covers it with a background; with that background hidden (a game profile's "set"), the
+// target is cleared to transparent after each display transfer (before the next draw into it, so a picture
+// transferred again unchanged stays), so the bottom screen's picture keeps only what its pass draws (and its
+// alpha says where that is). The top screen's pass draws all of its picture anyway.
+void set_clear_after_top_transfer(bool on) { clear_after_top = on; }
+// One-screen play shows the bottom screen over the top one: black there is made transparent as the display image is
+// made (a screen left black shows nothing; a dialog's choices on it float), and what the game drew translucent, to
+// blend with a background now hidden, more opaque.
+void set_key_black_bottom(bool on) { key_black_bottom = on; }
 
 namespace {
 // The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes

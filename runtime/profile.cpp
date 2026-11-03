@@ -4,9 +4,50 @@
 //       A number in guest memory. Types: u8 u16 u32 s8 s16 s32 f32 (f32 is truncated to an integer). Each
 //       "> off" follows a pointer: the address so far is read as a u32 and off is added (a null or unmapped
 //       pointer makes the value absent, and every condition using it false). Numbers: decimal or 0x hex.
-//   focus top|bottom|both [when <condition>]
+//   value <name> = runtime <flag>
+//       A number the runtime sets: "single" is 1 while one screen is shown (the single-screen layouts).
+//   set <value> = <number> [when <condition>]
+//       Writes the number to the value's place in guest memory every frame while the condition holds (data
+//       changes only: e.g. a layout pane's visible flag).
+//   focus top|bottom|both|panel [when <condition>]
 //       Which screen matters (first rule that holds wins; none: the user's own layout). "both": the top
-//       screen with the bottom one shown beside it (picture in picture).
+//       screen with the bottom one shown beside it (picture in picture). "panel": in the single-screen layouts,
+//       the bottom screen over the top one, as a card over the dimmed picture (or floating on its own
+//       transparency when its background is hidden, see "set"), nothing when it shows nothing.
+//   bind <host input> <target>
+//       One-screen controls (in the single-screen layouts with "onescreen"): a gamepad input by position (a b x y
+//       l r zl zr start back ls rs dup ddown dleft dright rs-up rs-down rs-left rs-right; the keyboard's keys
+//       stand for them as in the controls table) plays 3DS buttons (A+B, DUP, CUP, ...) or opens an overlay:
+//       hub, map, tools (the ring), tool-next / tool-prev (hold the next or previous tool in the pockets), tool-away
+//       (put the held tool away); "pointer" makes the right stick move a pointer over the bottom screen's panel, and the
+//       input touch where it points; "none" does nothing. Unbound inputs play their own 3DS button.
+//   hub "<label>" tap <x> <y> | press <buttons> | map | tools [icon <x> <y> <w> <h> | glyph "<c>"] [when <cond>]
+//       An entry of the hub (a phone-like launcher): tap the bottom screen there, press 3DS buttons, or open the
+//       map or the tool ring. Its icon is that part of the bottom screen, kept from the last time it showed, or a
+//       character (the map's entry shows the map, the tools' entry the tool in hand).
+//   map <x> <y> <w> <h> [when <condition>]
+//       The map overlay: that part of the bottom screen, live and enlarged (first area whose condition holds).
+//   tools pockets <value> held <value> [empty <item>]
+//   tools items <romfs file> record <bytes> first <item> category <offset> kinds <lo> <hi>
+//   tools icon <size>
+//   tools names <romfs msbt/umsbt>
+//   tools slots <x> <y> ...
+//   tools equip <portrait x> <portrait y> open <buttons> when-open <value> <op> <n> ready <value> <op> <n>
+//       The tool ring: the pockets (16 items, 4 bytes apart, from the first one's value) whose category is a
+//       tool kind, with their names from the game's own files and their icons as the pockets show them (squares
+//       of that size around each pocket, kept while the pockets are open); choosing one opens the pockets out of
+//       sight, taps it and picks the first choice ("Hold"); putting the held one away taps the portrait.
+//   tools hold <function> on <address>
+//       Tools are held with the game's own request instead: <function>(&item, 0, 0) (true: the change of tools
+//       starts; the empty item puts the held one away), called on the game's thread as it dispatches to <address>
+//       (an indirect call, e.g. the player's update through its vtable). The pocket gets the tool that was in hand
+//       once the new one is.
+//   clearbottom
+//       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
+//       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
+//   onescreen
+//       In the single-screen layouts the bottom screen never shows in a corner: the profile's panel and overlays
+//       (hub, map, tools) stand in for it.
 //   hud [when <condition>]
 //       When the HUD is drawn over the top screen.
 //   icon <name> <romfs path>[:<file inside a NARC/SARC/DARC archive>] [rect <x> <y> <w> <h>] [scale <s>]
@@ -24,9 +65,9 @@
 //       What the HUD action button (keyboard E, gamepad left stick click) does: tap the bottom screen there.
 //   keyboard [when <condition>]
 //       When the game's own keyboard is on the bottom screen: the Mac's keyboard then types by tapping its keys.
-//   key <characters | space | backspace | shift | enter> at <x> <y> [step <dx>]
+//   key <characters | space | backspace | shift | enter | escape> at <x> <y> [step <dx>]
 //       Where the keys are, in bottom-screen pixels (320x240): one named key, or a row of characters <dx> apart.
-//       A letter typed in upper case taps "shift" first; Return taps "enter".
+//       A letter typed in upper case taps "shift" first; Return taps "enter", Esc "escape" (closing the keyboard).
 //   unsaved <save file> <offset> <bits> crc32c <block> <size>
 //       Bits the game sets in its save when a session starts and clears when it saves, which a session that ends
 //       without a save leaves set (Animal Crossing scolds the player for it). With the menu's "Forgive unsaved
@@ -34,7 +75,8 @@
 //       nothing is changed unless that CRC is right to begin with.
 //
 // Positions are top-screen pixels (400x240); a negative x or y counts from the right or bottom edge.
-// Conditions: <value> <op> <number> [and ...], with op one of == != < <= > >= & (any bit set) !& (none set).
+// Conditions: <value> <op> <number> [and|or ...], with op one of == != < <= > >= & (any bit set) !& (none set);
+// "and" binds tighter than "or".
 // RECOMP_PROFILE=<file> loads another profile; RECOMP_PROFILE_TRACE=<n> logs every value and the focus every
 // n frames (for writing profiles).
 #include "profile.h"
@@ -45,6 +87,7 @@
 #include <map>
 #include <sstream>
 
+#include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
 
@@ -53,14 +96,17 @@ namespace {
 
 struct Value {
     std::string name;
-    char type = 'I';  // 'b' u8, 'h' u16, 'I' u32, 'c' s8, 's' s16, 'i' s32, 'f' f32
+    char type = 'I';  // 'b' u8, 'h' u16, 'I' u32, 'c' s8, 's' s16, 'i' s32, 'f' f32; 'r' a runtime flag
+    std::string flag;  // 'r': its name
     u32 addr = 0;
+    u32 at = 0;        // where it was read (the end of the pointer chain), when ok
     std::vector<u32> offs;
     bool ok = false;
     s64 v = 0;
 };
-struct Term { int value; std::string op; s64 n; };
+struct Term { int value; std::string op; s64 n; bool or_next = false; };  // or_next: "or" follows
 struct Cond { std::vector<Term> terms; bool state = false; };
+struct SetRule { int value; s64 n; int cond; };
 struct FocusRule { Focus f; int cond; };
 
 bool is_loaded;
@@ -74,9 +120,38 @@ std::vector<Button> buttons;
 int keyboard_cond = -2;  // -2: no keyboard
 std::map<std::string, std::pair<int, int>> keys;  // a character (UTF-8) or a named key -> bottom-screen pixel
 std::vector<UnsavedMark> marks;
+std::vector<SetRule> set_rules;
+std::vector<Bind> bind_list;
+std::vector<HubEntry> hub_list;
+std::vector<MapArea> map_list;
+Tools tool_cfg;
+std::map<std::string, s64> runtime_flags;
+bool one_screen;
 Focus cur_focus = FOCUS_NONE;
 int trace_every;
 u64 frames;
+
+}  // namespace
+u32 button_mask(const std::string &names) {
+    static const std::pair<const char *, u32> btns[] = {
+        {"A", 1 << 0}, {"B", 1 << 1}, {"SELECT", 1 << 2}, {"START", 1 << 3}, {"DRIGHT", 1 << 4}, {"DLEFT", 1 << 5},
+        {"DUP", 1 << 6}, {"DDOWN", 1 << 7}, {"R", 1 << 8}, {"L", 1 << 9}, {"X", 1 << 10}, {"Y", 1 << 11},
+        {"ZL", 1 << 14}, {"ZR", 1 << 15}, {"CRIGHT", 1u << 28}, {"CLEFT", 1u << 29}, {"CUP", 1u << 30},
+        {"CDOWN", 1u << 31}};
+    u32 m = 0;
+    for (size_t p = 0; p <= names.size();) {
+        size_t e = names.find('+', p);
+        if (e == std::string::npos) e = names.size();
+        const std::string part = names.substr(p, e - p);
+        bool known = false;
+        for (auto &[n, bit] : btns)
+            if (part == n) m |= bit, known = true;
+        if (!known) return 0;
+        p = e + 1;
+    }
+    return m;
+}
+namespace {
 
 bool num(const std::string &t, s64 &out) {
     if (t.empty()) return false;
@@ -116,10 +191,11 @@ int parse_cond(const std::vector<std::string> &t, size_t i, std::string &err) {
         c.terms.push_back(term);
         i += 3;
         if (i < t.size()) {
-            if (t[i] != "and") {
-                err = "expected 'and', got " + t[i];
+            if (t[i] != "and" && t[i] != "or") {
+                err = "expected 'and' or 'or', got " + t[i];
                 return -2;
             }
+            c.terms.back().or_next = t[i] == "or";
             i++;
         }
     }
@@ -141,7 +217,16 @@ bool parse_line(const std::string &line, std::string &err) {
     std::vector<std::string> t;
     {
         std::istringstream ss(line.substr(0, line.find('#')));
-        for (std::string w; ss >> w;) t.push_back(w);
+        for (std::string w; ss >> w;) {
+            if (w.size() > 1 && w[0] == '"') {  // a quoted label, spaces included
+                while (w.back() != '"' || w.size() == 1) {
+                    std::string more;
+                    if (!(ss >> more)) break;
+                    w += " " + more;
+                }
+            }
+            t.push_back(w);
+        }
     }
     if (t.empty()) return true;
     const std::string &d = t[0];
@@ -162,6 +247,12 @@ bool parse_line(const std::string &line, std::string &err) {
         }
         Value v;
         v.name = t[1];
+        if (t[3] == "runtime") {
+            v.type = 'r';
+            v.flag = t[4];
+            values.push_back(v);
+            return true;
+        }
         static const std::pair<const char *, char> types[] = {{"u8", 'b'}, {"u16", 'h'}, {"u32", 'I'}, {"s8", 'c'},
                                                               {"s16", 's'}, {"s32", 'i'}, {"f32", 'f'}};
         v.type = 0;
@@ -185,13 +276,178 @@ bool parse_line(const std::string &line, std::string &err) {
         return true;
     }
     if (d == "focus") {
-        if (t.size() < 2 || (t[1] != "top" && t[1] != "bottom" && t[1] != "both")) {
-            err = "expected 'focus top|bottom|both'";
+        static const std::pair<const char *, Focus> kinds[] = {
+            {"top", FOCUS_TOP}, {"bottom", FOCUS_BOTTOM}, {"both", FOCUS_BOTH}, {"panel", FOCUS_PANEL}};
+        Focus f = FOCUS_NONE;
+        for (auto &[n, k] : kinds)
+            if (t.size() >= 2 && t[1] == n) f = k;
+        if (f == FOCUS_NONE) {
+            err = "expected 'focus top|bottom|both|panel'";
             return false;
         }
         const int c = when(t, 2, err);
         if (c == -2) return false;
-        focus_rules.push_back({t[1] == "top" ? FOCUS_TOP : t[1] == "bottom" ? FOCUS_BOTTOM : FOCUS_BOTH, c});
+        focus_rules.push_back({f, c});
+        return true;
+    }
+    if (d == "set") {
+        s64 n;
+        int v;
+        if (t.size() < 4 || (v = value_index(t[1])) < 0 || t[2] != "=" || !num(t[3], n) || values[v].type == 'r') {
+            err = "expected 'set <value> = <number>' (a value in guest memory)";
+            return false;
+        }
+        const int c = when(t, 4, err);
+        if (c == -2) return false;
+        set_rules.push_back({v, n, c});
+        return true;
+    }
+    if (d == "onescreen") {
+        one_screen = true;
+        return true;
+    }
+
+    if (d == "bind") {
+        if (t.size() != 3) {
+            err = "expected 'bind <host input> <target>'";
+            return false;
+        }
+        Bind b{t[1], t[2], 0};
+        static const char *overlays[] = {"hub", "map", "tools", "tool-next", "tool-prev", "tool-away", "pointer",
+                                         "none"};
+        if (std::find(std::begin(overlays), std::end(overlays), t[2]) == std::end(overlays) &&
+            !(b.buttons = button_mask(t[2]))) {
+            err = "unknown target " + t[2];
+            return false;
+        }
+        bind_list.push_back(b);
+        return true;
+    }
+    if (d == "hub") {
+        if (t.size() < 3 || t[1].size() < 2 || t[1][0] != '"') {
+            err = "expected 'hub \"<label>\" <action>'";
+            return false;
+        }
+        HubEntry h;
+        h.label = t[1].substr(1, t[1].size() - 2);
+        size_t i = 3;
+        s64 a, b, c2, e;
+        if (t[2] == "tap" && t.size() >= 5 && num(t[3], a) && num(t[4], b)) {
+            h.action = HubEntry::TAP;
+            h.x = (int)a, h.y = (int)b;
+            i = 5;
+        } else if (t[2] == "press" && t.size() >= 4 && (h.buttons = button_mask(t[3]))) {
+            h.action = HubEntry::PRESS;
+            i = 4;
+        } else if (t[2] == "map") {
+            h.action = HubEntry::MAP;
+        } else if (t[2] == "tools") {
+            h.action = HubEntry::TOOLS;
+        } else {
+            err = "expected tap <x> <y>, press <buttons>, map or tools";
+            return false;
+        }
+        if (i + 4 < t.size() && t[i] == "icon" && num(t[i + 1], a) && num(t[i + 2], b) && num(t[i + 3], c2) &&
+            num(t[i + 4], e)) {
+            h.ix = (int)a, h.iy = (int)b, h.iw = (int)c2, h.ih = (int)e;
+            i += 5;
+        } else if (i + 1 < t.size() && t[i] == "glyph" && t[i + 1].size() > 2 && t[i + 1][0] == '"') {
+            h.glyph = t[i + 1].substr(1, t[i + 1].size() - 2);
+            i += 2;
+        }
+        if ((h.cond = when(t, i, err)) == -2) return false;
+        hub_list.push_back(h);
+        return true;
+    }
+    if (d == "map") {
+        s64 x, y, w, h;
+        if (t.size() < 5 || !num(t[1], x) || !num(t[2], y) || !num(t[3], w) || !num(t[4], h)) {
+            err = "expected 'map <x> <y> <w> <h>'";
+            return false;
+        }
+        MapArea m{(int)x, (int)y, (int)w, (int)h, -1};
+        if ((m.cond = when(t, 5, err)) == -2) return false;
+        map_list.push_back(m);
+        return true;
+    }
+    if (d == "tools" && t.size() >= 2) {
+        Tools &c = tool_cfg;
+        auto val = [&](size_t i, int &out) {
+            if (i >= t.size() || (out = value_index(t[i])) < 0) {
+                err = "unknown value " + (i < t.size() ? t[i] : std::string());
+                return false;
+            }
+            return true;
+        };
+        auto n = [&](size_t i, u32 &out) {
+            s64 v;
+            if (i >= t.size() || !num(t[i], v)) {
+                err = "expected a number";
+                return false;
+            }
+            out = (u32)v;
+            return true;
+        };
+        if (t[1] == "pockets") {
+            if (t.size() < 5 || t[3] != "held" || !val(2, c.pockets) || !val(4, c.held)) {
+                if (err.empty()) err = "expected 'tools pockets <value> held <value> [empty <item>]'";
+                return false;
+            }
+            if (t.size() >= 7 && t[5] == "empty") return n(6, c.empty);
+            return true;
+        }
+        if (t[1] == "items") {
+            if (t.size() != 12 || t[3] != "record" || t[5] != "first" || t[7] != "category" || t[9] != "kinds") {
+                err = "expected 'tools items <file> record <n> first <item> category <off> kinds <lo> <hi>'";
+                return false;
+            }
+            c.items = t[2];
+            return n(4, c.record) && n(6, c.first) && n(8, c.category_off) && n(10, c.kind_lo) && n(11, c.kind_hi) &&
+                   c.record > 0;
+        }
+        if (t[1] == "icon" && t.size() == 3) {
+            u32 v;
+            if (!n(2, v) || v < 4 || v > 64) return false;
+            c.icon_size = (int)v;
+            return true;
+        }
+        if (t[1] == "names" && t.size() == 3) {
+            c.names = t[2];
+            return true;
+        }
+        if (t[1] == "slots") {
+            for (size_t i = 2; i + 1 < t.size(); i += 2) {
+                u32 x, y;
+                if (!n(i, x) || !n(i + 1, y)) return false;
+                c.slots.push_back({(int)x, (int)y});
+            }
+            return true;
+        }
+        if (t[1] == "hold") {
+            if (t.size() != 5 || t[3] != "on") {
+                err = "expected 'tools hold <function> on <address>'";
+                return false;
+            }
+            return n(2, c.hold_fn) && n(4, c.hold_on);
+        }
+        if (t[1] == "equip") {
+            u32 x, y;
+            size_t wo = std::find(t.begin(), t.end(), "when-open") - t.begin();
+            size_t rd = std::find(t.begin(), t.end(), "ready") - t.begin();
+            if (t.size() < 6 || !n(2, x) || !n(3, y) || t[4] != "open" || !(c.open = button_mask(t[5])) ||
+                wo != 6 || rd >= t.size() || rd < wo) {
+                if (err.empty()) err = "expected 'tools equip <x> <y> open <buttons> when-open <cond> ready <cond>'";
+                return false;
+            }
+            c.portrait_x = (int)x, c.portrait_y = (int)y;
+            std::vector<std::string> a(t.begin() + wo + 1, t.begin() + rd), b(t.begin() + rd + 1, t.end());
+            return (c.open_cond = parse_cond(a, 0, err)) != -2 && (c.ready_cond = parse_cond(b, 0, err)) != -2;
+        }
+        err = "unknown tools directive " + t[1];
+        return false;
+    }
+    if (d == "clearbottom") {
+        gpu::set_clear_after_top_transfer(true);
         return true;
     }
     if (d == "hud") {
@@ -312,7 +568,7 @@ bool parse_line(const std::string &line, std::string &err) {
             err = "expected 'key <characters> at <x> <y> [step <dx>]'";
             return false;
         }
-        static const char *named[] = {"space", "backspace", "shift", "enter"};
+        static const char *named[] = {"space", "backspace", "shift", "enter", "escape"};
         if (std::find(std::begin(named), std::end(named), t[1]) != std::end(named)) {
             keys[t[1]] = {(int)x, (int)y};
             return true;
@@ -342,6 +598,12 @@ bool parse_line(const std::string &line, std::string &err) {
 
 void read_value(Value &v) {
     v.ok = false;
+    if (v.type == 'r') {
+        auto it = runtime_flags.find(v.flag);
+        v.v = it == runtime_flags.end() ? 0 : it->second;
+        v.ok = true;
+        return;
+    }
     u32 a = v.addr;
     for (u32 off : v.offs) {
         if (!kernel::guest_readable(a, 4)) return;
@@ -351,6 +613,7 @@ void read_value(Value &v) {
     }
     const u32 size = v.type == 'b' || v.type == 'c' ? 1 : v.type == 'h' || v.type == 's' ? 2 : 4;
     if (!kernel::guest_readable(a, size)) return;
+    v.at = a;
     switch (v.type) {
     case 'b': v.v = r8(a); break;
     case 'c': v.v = (s8)r8(a); break;
@@ -425,9 +688,32 @@ bool has_hud() { return hud_cond != -2 && !elems.empty(); }
 void update() {
     if (!is_loaded) return;
     for (auto &v : values) read_value(v);
-    for (auto &c : conds) {
-        c.state = true;
-        for (auto &t : c.terms) c.state = c.state && eval(t);
+    for (auto &c : conds) {  // a sum of products: "and" groups joined by "or"
+        bool any = false, group = true;
+        for (auto &t : c.terms) {
+            group = group && eval(t);
+            if (t.or_next) {
+                any = any || group;
+                group = true;
+            }
+        }
+        c.state = any || group;
+    }
+    for (auto &r : set_rules) {
+        Value &v = values[r.value];
+        if (!v.ok || v.v == r.n || !cond(r.cond)) continue;
+        switch (v.type) {
+        case 'b': case 'c': w8(v.at, (u8)r.n); break;
+        case 'h': case 's': w16(v.at, (u16)r.n); break;
+        case 'f': {
+            const float f = (float)r.n;
+            u32 u;
+            memcpy(&u, &f, 4);
+            w32(v.at, u);
+            break;
+        }
+        default: w32(v.at, (u32)r.n); break;
+        }
     }
     cur_focus = FOCUS_NONE;
     for (auto &r : focus_rules)
@@ -444,7 +730,7 @@ void update() {
             else snprintf(b, sizeof b, " %s=-", v.name.c_str());
             s += b;
         }
-        static const char *fn[] = {"-", "top", "bottom", "both"};
+        static const char *fn[] = {"-", "top", "bottom", "both", "panel"};
         LOG("[profile] focus %s hud %d:%s\n", fn[cur_focus], hud_visible(), s.c_str());
     }
 }
@@ -457,6 +743,17 @@ bool cond(int i) { return i < 0 || (i < (int)conds.size() && conds[i].state); }
 bool value(int i, s64 &v) {
     if (i < 0 || i >= (int)values.size() || !values[i].ok) return false;
     v = values[i].v;
+    return true;
+}
+void set_runtime(const std::string &flag, s64 v) { runtime_flags[flag] = v; }
+const std::vector<Bind> &binds() { return bind_list; }
+const std::vector<HubEntry> &hub() { return hub_list; }
+const std::vector<MapArea> &map_areas() { return map_list; }
+const Tools &tools() { return tool_cfg; }
+bool onescreen() { return one_screen; }
+bool value_address(int i, u32 &a) {
+    if (i < 0 || i >= (int)values.size() || !values[i].ok || values[i].type == 'r') return false;
+    a = values[i].at;
     return true;
 }
 bool keyboard_active() { return keyboard_cond != -2 && (keyboard_cond == -1 || conds[keyboard_cond].state); }
