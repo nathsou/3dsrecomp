@@ -431,7 +431,7 @@ static const u32 *bottom_stats(const u32 *img, int w, int h) {
         keyed.assign(img, img + (size_t)w * h);
         for (u32 &p : keyed) {
             const int m = (int)std::max({p & 255, p >> 8 & 255, p >> 16 & 255});
-            const u32 a = (u32)std::clamp((m - 8) * 24, 0, 255) * (p >> 24) / 255;
+            const u32 a = (u32)std::clamp((m - 3) * 64, 0, 255) * (p >> 24) / 255;  // (as the GPU's: only near black)
             p = (p & 0xffffff) | a << 24;
         }
         img = keyed.data();

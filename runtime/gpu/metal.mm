@@ -304,7 +304,10 @@ kernel void k_rot(texture2d<float, access::read> src [[texture(0)]], device uint
     const uint col = p.x - 1 - gid.y;
     const uint4 b = uint4(round(saturate(src.read(uint2(col, row))) * 255.0));
     uint a = b.a;
-    if (p.z & 2) a = min(a, uint(clamp((int(max(b.r, max(b.g, b.b))) - 8) * 24, 0, 255)));  // black keyed out
+    if (p.z & 2) {  // black keyed out; what was drawn translucent over a background (now hidden) more opaque
+        a = min(255u, a * 17u / 10u);
+        a = min(a, uint(clamp((int(max(b.r, max(b.g, b.b))) - 3) * 64, 0, 255)));
+    }
     dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (a << 24);
 }
 )";
@@ -3085,7 +3088,8 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
 // alpha says where that is). The top screen's pass draws all of its picture anyway.
 void set_clear_after_top_transfer(bool on) { clear_after_top = on; }
 // One-screen play shows the bottom screen over the top one: black there is made transparent as the display image is
-// made (a screen left black shows nothing; a dialog's choices on it float).
+// made (a screen left black shows nothing; a dialog's choices on it float), and what the game drew translucent, to
+// blend with a background now hidden, more opaque.
 void set_key_black_bottom(bool on) { key_black_bottom = on; }
 
 namespace {
