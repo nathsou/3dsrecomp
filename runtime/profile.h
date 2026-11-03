@@ -8,7 +8,7 @@
 
 namespace profile {
 
-enum Focus { FOCUS_NONE, FOCUS_TOP, FOCUS_BOTTOM, FOCUS_BOTH };
+enum Focus { FOCUS_NONE, FOCUS_TOP, FOCUS_BOTTOM, FOCUS_BOTH, FOCUS_PANEL };
 
 // a HUD element, in top-screen pixels (negative x / y: from the right / bottom edge)
 struct Element {
@@ -56,5 +56,7 @@ const Button *button();   // the HUD action button, if it applies now
 bool keyboard_active();   // the game's own keyboard is up ("keyboard when ...")
 bool key(const std::string &k, int &x, int &y);  // where a character or named key is on the bottom screen
 const std::vector<UnsavedMark> &unsaved_marks();
+void set_runtime(const std::string &flag, s64 v);  // a "value <name> = runtime <flag>" (read at the next update)
+bool onescreen();         // "onescreen": no corner screen in the single-screen layouts
 
 }  // namespace profile

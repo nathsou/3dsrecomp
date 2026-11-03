@@ -1,6 +1,9 @@
 // hid:USER / hid:SPVR: pad, circle pad, touch screen, accelerometer and gyroscope through shared memory.
+#include <atomic>
 #include "../service.h"
 #include "services.h"
+
+extern std::atomic<int> g_winshot_request;  // (frontend.cpp)
 
 namespace kernel {
 
@@ -30,11 +33,14 @@ static void ensure_shm() {
 // RECOMP_LIVE=<file>: input for a running test, one command per line appended to the file while the game runs
 // ("<buttons> <frames>", buttons as in RECOMP_INPUT: A, B, A+B, CUP, CDOWN+B, T@x/y...; "WAIT <frames>"). Commands
 // run one after the other for that many VBlanks, each followed by a few released frames; the log says when each
-// starts. A line "DUMP" writes the state of every thread to the log at once.
+// starts. A line "DUMP" writes the state of every thread to the log at once, "MEMDUMP <tag>" snapshots guest memory
+// (mem_<tag>_<address>.bin, as RECOMP_MEMDUMP), "POKE8 <hex address> <hex value>" writes a byte at once,
+// "WINSHOT" writes the whole window at the next frame (window_<frame>.ppm, as RECOMP_WINSHOT).
 namespace {
 struct LiveCmd {
     u32 buttons = 0;
     int cx = 0, cy = 0, tx = -1, ty = -1, frames = 0;
+    std::string memdump;  // "MEMDUMP <tag>": guest memory as mem_<tag>_<address>.bin when the command is reached
 };
 struct Live {
     FILE *f = nullptr;
@@ -49,6 +55,16 @@ struct Live {
 
 LiveCmd parse_live(const std::string &line) {
     LiveCmd c;
+    if (line == "WINSHOT") {  // the whole window at the next frame (window_<frame>.ppm)
+        c.memdump = "@window";
+        c.frames = 1;
+        return c;
+    }
+    if (line.rfind("MEMDUMP", 0) == 0) {
+        c.memdump = line.size() > 8 ? line.substr(8) : "live";
+        c.frames = 1;
+        return c;
+    }
     char names[128] = {};
     int n = 0;
     if (sscanf(line.c_str(), "%127s %d", names, &n) < 1) return c;
@@ -90,6 +106,10 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         std::string line = live.partial.substr(0, live.partial.size() - 1);
         live.partial.clear();
         if (line == "DUMP") dump_threads();  // right away: the state of every thread in the log
+        else if (line.rfind("POKE8 ", 0) == 0) {  // right away: "POKE8 <address> <value>" writes a byte of guest memory
+            unsigned a = 0, v = 0;
+            if (sscanf(line.c_str() + 6, "%x %x", &a, &v) == 2) w8(a, (u8)v);
+        }
         else if (!line.empty()) live.queue.push_back(parse_live(line));
     }
     if (g_frame >= live.until) {
@@ -103,6 +123,11 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         live.until = g_frame + live.cur.frames;
         live.active = true;
         LOG("[live] command %zu starts (%d frames)\n", live.next, live.cur.frames);
+        if (live.cur.memdump == "@window") {
+            g_winshot_request = 1;
+        } else if (!live.cur.memdump.empty()) {
+            dump_memory(("mem_" + live.cur.memdump).c_str());
+        }
     }
     if (!live.active) return;
     buttons |= live.cur.buttons;

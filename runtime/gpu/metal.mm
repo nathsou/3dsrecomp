@@ -303,7 +303,7 @@ kernel void k_rot(texture2d<float, access::read> src [[texture(0)]], device uint
     const uint row = (p.z ? p.y - 1 - gid.x : gid.x) + p.w;
     const uint col = p.x - 1 - gid.y;
     const uint4 b = uint4(round(saturate(src.read(uint2(col, row))) * 255.0));
-    dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (255u << 24);
+    dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (b.a << 24);
 }
 )";
 
@@ -402,12 +402,22 @@ struct GRT {
     u64 hash = 0;
     bool gpu_newer = false;  // depth/stencil changes not yet written to guest memory
     u32 skipped = 0;         // draws left out since its last display transfer (pipelines still compiling)
+    bool clear_next = false; // set_clear_after_top_transfer: cleared to transparent before it is drawn into again,
+    bool own = false;        // ... and its GPU copy kept (guest memory ignored) until its own next display transfer
 };
+std::atomic<bool> clear_after_top{false};
+
 std::vector<std::unique_ptr<GRT>> rts;
 
 u32 rt_bytes(const GRT &r) {
     if (r.depth) return r.w * r.h * (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4);
     return r.w * r.h * pixel_bytes(cbuf_to_pixfmt(r.fmt));
+}
+
+// (set_clear_after_top_transfer) the colour targets in the same memory as r: cleared before their next draw
+void clear_overlapping(GRT &r) {
+    for (auto &o : rts)
+        if (!o->depth && o->addr < r.addr + rt_bytes(r) && r.addr < o->addr + rt_bytes(*o)) o->clear_next = o->own = true;
 }
 
 GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
@@ -501,6 +511,11 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
     if (!p) return la;
     const u64 hv = hash_bytes(p, rt_bytes(r));
     if (r.synced && hv == r.hash) return la;
+    if (r.own) {  // (cleared after a transfer to the top screen: the top screen's write-back is not its picture)
+        r.hash = hv;
+        r.synced = true;
+        return la;
+    }
     r.synced = true;
     r.hash = hv;
     r.gpu_newer = false;
@@ -2468,7 +2483,12 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             }
             o->synced = false;
         }
-        const LoadAction cla = sync_rt(col, cb);
+        LoadAction cla = sync_rt(col, cb);
+        if (col.clear_next) {  // (set_clear_after_top_transfer)
+            col.clear_next = false;
+            cla.clear = true;
+            cla.color = 0;
+        }
         LoadAction dla;
         if (dep) dla = sync_rt(*dep, cb);
 
@@ -2977,6 +2997,8 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         [op->cb commit];
     }
     src->gpu_newer = false;  // the pending transfer writes it back
+    src->own = false;
+    if (clear_after_top && (out_dims >> 16) >= 400) clear_overlapping(*src);  // (a top screen: 400 rows or more)
     op->rt = src;
     op->in_paddr = in_paddr;
     op->out_paddr = out_paddr;
@@ -3033,7 +3055,15 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     d.buf = buf;
     d.incomplete = src->skipped > 0;
     src->skipped = 0;
+    src->own = false;
+    if (clear_after_top && out_h0 >= 400) clear_overlapping(*src);  // (a top screen: 400 rows or more)
 }
+
+// The bottom screen's pass of some games (Animal Crossing: New Leaf) reuses the render target the top screen's
+// picture came from and covers it with a background; with that background hidden (a game profile's "set"), the
+// target is cleared to transparent after each transfer to the top screen, so the bottom screen's picture keeps
+// only what its pass draws (and its alpha says where that is).
+void set_clear_after_top_transfer(bool on) { clear_after_top = on; }
 
 namespace {
 // The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes

@@ -20,3 +20,20 @@ unsaved garden_plus.dat 0x57aa 0x02 crc32c 0xa0 0x6b84
 unsaved garden_plus.dat 0xfc2a 0x02 crc32c 0xa520 0x6b84
 unsaved garden_plus.dat 0x1a0aa 0x02 crc32c 0x149a0 0x6b84
 unsaved garden_plus.dat 0x2452a 0x02 crc32c 0x1ee20 0x6b84
+
+# ---- one screen (the "Top screen only" layout): the bottom screen never shows as such. Its menus come up as a
+# panel over the top screen, its background (the plaid wallpaper) hidden so dialogs float; the field's map and
+# tabs are reached through the hub (ZL), the map (-) and the other overlays.
+onescreen
+value single = runtime single
+value debug = runtime debug
+value map = u32 0x94fc3c                       # the BsMenuMap page (the field's map): set while it shows
+# BsMenuBg's layout: N_mvmnt_Uscrn > P_base_00 (the plaid), hidden (alpha 0: not drawn). The bottom screen's pass
+# reuses the top screen's render target, so it is cleared to transparent first ("clearbottom").
+clearbottom
+value bg_alpha = u8 0x94f708 > 0x78 > 0xbc > 0x14 > 0xb0
+set bg_alpha = 0 when single == 1
+set bg_alpha = 255 when single == 0 and debug == 0
+set bg_alpha = 0 when debug == 1
+focus top when map != 0
+focus panel

@@ -91,6 +91,9 @@ static int vsync = 0;  // presents wait for the display's refresh (no tearing) a
 static SDL_Texture *tex_bottom2, *hi_bottom2;
 static int hb2w, hb2h;
 static u64 shown_ver[2];  // display image versions already uploaded (per screen)
+// the bottom screen's picture: how much of it the game drew (alpha of its render target, sampled on a grid);
+// with its background hidden by the profile ("set"), what is left floats over the top screen
+static float bottom_cover = 1, bottom_opaque = 1;  // fractions of samples with alpha > 1/8, > 15/16
 static int shown_layout() { return window2 ? 1 : layout; }
 // Metal internal resolution: 0 auto (from the window size), 1-4 fixed; F3 cycles; -1 without Metal
 static int scale_mode = -1;
@@ -420,25 +423,40 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hir
         if (!hires || w != hw || h != hh) {
             if (hires) SDL_DestroyTexture(hires);
             hires = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
+            SDL_SetTextureBlendMode(hires, SDL_BLENDMODE_NONE);  // (the image's alpha is the render target's)
             hw = w;
             hh = h;
         }
         SDL_UpdateTexture(hires, nullptr, img, w * 4);
+        if (screen == 1) {
+            int cover = 0, opaque = 0, n = 0;
+            for (int y = h / 60; y < h; y += h / 30)
+                for (int x = w / 80; x < w; x += w / 40, n++) {
+                    const u32 a = img[(size_t)y * w + x] >> 24;
+                    cover += a > 32;
+                    opaque += a > 240;
+                }
+            bottom_cover = n ? (float)cover / n : 1;
+            bottom_opaque = n ? (float)opaque / n : 1;
+        }
     });
     static u32 last_fb;
     if (screen == 0 && (ver ? ver != shown[0] : f.addr_left != last_fb)) game_frames++;  // a new image: the game's fps
     if (screen == 0) last_fb = f.addr_left;
     shown[screen] = ver;
     if (ver) return hires;
+    if (screen == 1) bottom_cover = bottom_opaque = 1;  // (the guest framebuffer has no alpha)
     convert_fb(f, width, buf);
     SDL_UpdateTexture(native, nullptr, buf, width * 4);
     return native;
 }
 
 // RECOMP_WINSHOT="f1,f2,...": the whole window (menu included) as <prefix>_<frame>.ppm, for tests
+std::atomic<int> g_winshot_request;  // RECOMP_LIVE's WINSHOT: the window at the next present
 static void write_window_shot(SDL_Renderer *r, const char *prefix) {
     static const char *winshot = getenv("RECOMP_WINSHOT");
-    if (!winshot || (std::string(",") + winshot + ",").find("," + std::to_string(frame_count + 1) + ",") == std::string::npos)
+    const bool asked = r == renderer && g_winshot_request.exchange(0);
+    if (!asked && (!winshot || (std::string(",") + winshot + ",").find("," + std::to_string(frame_count + 1) + ",") == std::string::npos))
         return;
     SDL_Surface *s = SDL_RenderReadPixels(r, nullptr);
     if (!s) return;
@@ -459,7 +477,10 @@ struct Placement {
     SDL_FRect top{}, bottom{};  // w 0: not shown
     int pip = -1;               // the screen in the corner (-1: none)
     float alpha = 1;            // the corner screen's opacity
+    bool panel = false;         // the bottom screen is a panel over the top one (profile "focus panel")
+    bool card = false;          // ... drawn as a card (it is opaque), else floating on its own alpha
 };
+static float panel_anim;  // 0..1: the panel coming in / going out
 static Placement placement;
 static int manual_flip;                                  // Tab while the profile picks the screen
 static profile::Focus flip_for = profile::FOCUS_NONE;   // the profile's choice when Tab was pressed
@@ -552,7 +573,7 @@ static int focused_screen() {
         flip_for = f;
     }
     int s = layout == 4 ? 1 : 0;
-    if (f == profile::FOCUS_TOP || f == profile::FOCUS_BOTH) s = 0;
+    if (f == profile::FOCUS_TOP || f == profile::FOCUS_BOTH || f == profile::FOCUS_PANEL) s = 0;
     if (f == profile::FOCUS_BOTTOM) s = 1;
     return s ^ manual_flip;
 }
@@ -588,13 +609,40 @@ static SDL_FRect screen_area(const ScreenLayout &l) { return l.area.w ? l.area :
 static void place_screens() {
     const ScreenLayout &l = layouts[shown_layout()];
     placement = {l.top, l.bottom, -1, 1};
-    if (!single_layout()) return;
-    const int main = focused_screen(), other = main ^ 1;
+    profile::set_runtime("single", single_layout());
+    static const bool debug = getenv("RECOMP_PROFILE_DEBUG");  // (a "debug" runtime flag for writing profiles)
+    profile::set_runtime("debug", debug);
+    if (!single_layout()) {
+        panel_anim = 0;
+        return;
+    }
     const SDL_FRect area = screen_area(l);
     auto fit = [&](int screen) {
         const float sw = screen ? 320 : 400, k = std::min(area.w / sw, area.h / 240.0f);
         return SDL_FRect{area.x + (area.w - sw * k) / 2, area.y + (area.h - 240 * k) / 2, sw * k, 240 * k};
     };
+    // the profile's panel: the bottom screen over the top one, when it shows something
+    const bool want_panel = auto_focus() == profile::FOCUS_PANEL && !manual_flip && bottom_cover > 0.01f;
+    panel_anim = std::clamp(panel_anim + (want_panel ? 0.2f : -0.25f), 0.0f, 1.0f);
+    if (auto_focus() == profile::FOCUS_PANEL || (profile::onescreen() && !manual_flip)) {
+        placement.top = fit(0);
+        placement.bottom = {};
+        pip_rect = pip_grip = pip_handle = {};
+        if (panel_anim <= 0) return;
+        const SDL_FRect t = placement.top;
+        const float k = t.h / 240;  // render units per top-screen pixel
+        placement.card = bottom_opaque > 0.9f;
+        const float e = 1 - (1 - panel_anim) * (1 - panel_anim);  // ease out
+        // a card a bit smaller than the screen's height; floating content at its own size, where it would be
+        // on the 3DS (centred)
+        const float ph = placement.card ? 240 * k * 0.92f : 240 * k, pw = ph * 320 / 240;
+        placement.bottom = {t.x + (t.w - pw) / 2, t.y + (t.h - ph) / 2 + (1 - e) * 14 * k, pw, ph};
+        placement.panel = true;
+        placement.alpha = e;
+        return;
+    }
+    panel_anim = 0;
+    const int main = focused_screen(), other = main ^ 1;
     (main ? placement.bottom : placement.top) = fit(main);
     (other ? placement.bottom : placement.top) = {};
     // the corner screen
@@ -755,11 +803,70 @@ static bool bottom_at(float wx, float wy, int &tx, int &ty) {
     float lx, ly;
     SDL_RenderCoordinatesFromWindow(renderer, wx, wy, &lx, &ly);
     const SDL_FRect &b = placement.bottom;
-    if (!b.w || (placement.pip == 1 && placement.alpha <= 0.5f) || lx < b.x || lx >= b.x + b.w || ly < b.y || ly >= b.y + b.h)
+    if (!b.w || ((placement.pip == 1 || placement.panel) && placement.alpha <= 0.5f) || lx < b.x || lx >= b.x + b.w || ly < b.y || ly >= b.y + b.h)
         return false;
     tx = std::clamp((int)((lx - b.x) * 320 / b.w), 0, 319);
     ty = std::clamp((int)((ly - b.y) * 240 / b.h), 0, 239);
     return true;
+}
+
+// The profile's panel: the dimmed top screen with the bottom screen over it, as a card with rounded corners and a
+// soft shadow when it is opaque, else floating on its own alpha (its background hidden by the profile).
+static void rounded_rect(SDL_Renderer *r, SDL_Texture *t, const SDL_FRect &d, float rad, SDL_FColor c) {
+    constexpr int kSeg = 6;  // segments per corner
+    std::vector<SDL_Vertex> v;
+    std::vector<int> idx;
+    const float cx = d.x + d.w / 2, cy = d.y + d.h / 2;
+    auto vert = [&](float x, float y) {
+        SDL_Vertex q;
+        q.position = {x, y};
+        q.color = c;
+        q.tex_coord = {(x - d.x) / d.w, (y - d.y) / d.h};
+        v.push_back(q);
+    };
+    vert(cx, cy);
+    const float ox[4] = {d.x + d.w - rad, d.x + rad, d.x + rad, d.x + d.w - rad};
+    const float oy[4] = {d.y + rad, d.y + rad, d.y + d.h - rad, d.y + d.h - rad};
+    for (int q = 0; q < 4; q++)
+        for (int i = 0; i <= kSeg; i++) {
+            const float a = (float)M_PI / 2 * (q + (float)i / kSeg);
+            vert(ox[q] + std::cos(a) * rad, oy[q] - std::sin(a) * rad);
+        }
+    const int n = (int)v.size() - 1;
+    for (int i = 1; i <= n; i++) {
+        idx.push_back(0);
+        idx.push_back(i);
+        idx.push_back(i % n + 1);
+    }
+    SDL_RenderGeometry(r, t, v.data(), (int)v.size(), idx.data(), (int)idx.size());
+}
+
+static void draw_panel(SDL_Renderer *r, SDL_Texture *t, const SDL_FRect &top, const SDL_FRect &d, bool card,
+                       float a, float f) {
+    if (!t || !d.w) return;
+    SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    const float k = top.h / 240;
+    // the world dims behind it: fully for a card, as much as floating content covers (a menu more than a
+    // speech bubble)
+    SDL_SetRenderDrawColorFloat(r, 0, 0, 0, (card ? 0.38f : 0.45f * std::min(1.0f, bottom_cover * 1.6f)) * a);
+    SDL_RenderFillRect(r, &top);
+    if (card) {
+        for (int i = 3; i >= 1; i--) {  // a soft shadow
+            const float g = i * 2.5f * k;
+            rounded_rect(r, nullptr, {d.x - g, d.y - g + 3 * k, d.w + 2 * g, d.h + 2 * g}, 12 * k + g,
+                         {0, 0, 0, 0.12f * a});
+        }
+        rounded_rect(r, nullptr, {d.x - 1.5f * k, d.y - 1.5f * k, d.w + 3 * k, d.h + 3 * k}, 13.5f * k,
+                     {1, 1, 1, 0.9f * a});
+    }
+    set_filter(t, d.w * f, t->w);
+    // (a card is opaque: its pixels' alpha says nothing once it is in, but fades it in and out)
+    SDL_SetTextureBlendMode(t, card && a >= 1 ? SDL_BLENDMODE_NONE : SDL_BLENDMODE_BLEND);
+    SDL_SetTextureAlphaModFloat(t, a);
+    if (card) rounded_rect(r, t, d, 12 * k, {1, 1, 1, 1});
+    else SDL_RenderTexture(r, t, nullptr, &d);
+    SDL_SetTextureAlphaModFloat(t, 1);
+    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_NONE);
 }
 
 // a screenshot is due at frame n (RECOMP_SHOT / RECOMP_WINSHOT)
@@ -817,9 +924,14 @@ static void present() {
         SDL_RenderTexture(renderer, t, nullptr, &d);
         if (corner) SDL_SetTextureAlphaModFloat(t, 1);
     };
-    // the corner screen goes over the main one
-    draw(pl.pip == 0 ? 1 : 0);
-    draw(pl.pip == 0 ? 0 : 1);
+    if (pl.panel) {
+        draw(0);
+        draw_panel(renderer, t_bottom, pl.top, pl.bottom, pl.card, pl.alpha, f);
+    } else {
+        // the corner screen goes over the main one
+        draw(pl.pip == 0 ? 1 : 0);
+        draw(pl.pip == 0 ? 0 : 1);
+    }
     if (pl.pip >= 0 && (pip_hover || (touch::enabled() && pl.alpha > 0.5f))) {  // grip tab (three bars), resize handle (a diagonal)
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
         SDL_SetRenderDrawColorFloat(renderer, 0.1f, 0.1f, 0.12f, 0.85f * pl.alpha);
@@ -860,6 +972,14 @@ static void present() {
         if (f.valid && gpu::get_display_image_for(mem::vaddr_to_paddr(f.addr_left), f.stride, 400, &img, &w, &h)) {
             snprintf(name, sizeof name, "shot_top_hires_%06llu.ppm", (unsigned long long)frame_count);
             write_ppm(name, img, w, h);
+        }
+        f = kernel::gsp_framebuffer(1);
+        if (getenv("RECOMP_SHOT_ALPHA") && f.valid &&
+            gpu::get_display_image_for(mem::vaddr_to_paddr(f.addr_left), f.stride, 320, &img, &w, &h)) {
+            std::vector<u32> a(img, img + w * h);
+            for (u32 &p : a) p = (p >> 24) * 0x010101u;
+            snprintf(name, sizeof name, "shot_bottom_alpha_%06llu.ppm", (unsigned long long)frame_count);
+            write_ppm(name, a.data(), w, h);
         }
     }
 }

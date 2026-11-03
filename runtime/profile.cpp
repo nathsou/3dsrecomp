@@ -4,9 +4,22 @@
 //       A number in guest memory. Types: u8 u16 u32 s8 s16 s32 f32 (f32 is truncated to an integer). Each
 //       "> off" follows a pointer: the address so far is read as a u32 and off is added (a null or unmapped
 //       pointer makes the value absent, and every condition using it false). Numbers: decimal or 0x hex.
-//   focus top|bottom|both [when <condition>]
+//   value <name> = runtime <flag>
+//       A number the runtime sets: "single" is 1 while one screen is shown (the single-screen layouts).
+//   set <value> = <number> [when <condition>]
+//       Writes the number to the value's place in guest memory every frame while the condition holds (data
+//       changes only: e.g. a layout pane's visible flag).
+//   focus top|bottom|both|panel [when <condition>]
 //       Which screen matters (first rule that holds wins; none: the user's own layout). "both": the top
-//       screen with the bottom one shown beside it (picture in picture).
+//       screen with the bottom one shown beside it (picture in picture). "panel": in the single-screen layouts,
+//       the bottom screen over the top one, as a card over the dimmed picture (or floating on its own
+//       transparency when its background is hidden, see "set"), nothing when it shows nothing.
+//   clearbottom
+//       The render target the top screen's picture came from is cleared to transparent before it is drawn into
+//       again: for games whose bottom screen's pass reuses it under a background, which "set" hides.
+//   onescreen
+//       In the single-screen layouts the bottom screen never shows in a corner: the profile's panel and overlays
+//       (hub, map, wheel, tools) stand in for it.
 //   hud [when <condition>]
 //       When the HUD is drawn over the top screen.
 //   icon <name> <romfs path>[:<file inside a NARC/SARC/DARC archive>] [rect <x> <y> <w> <h>] [scale <s>]
@@ -34,7 +47,8 @@
 //       nothing is changed unless that CRC is right to begin with.
 //
 // Positions are top-screen pixels (400x240); a negative x or y counts from the right or bottom edge.
-// Conditions: <value> <op> <number> [and ...], with op one of == != < <= > >= & (any bit set) !& (none set).
+// Conditions: <value> <op> <number> [and|or ...], with op one of == != < <= > >= & (any bit set) !& (none set);
+// "and" binds tighter than "or".
 // RECOMP_PROFILE=<file> loads another profile; RECOMP_PROFILE_TRACE=<n> logs every value and the focus every
 // n frames (for writing profiles).
 #include "profile.h"
@@ -45,6 +59,7 @@
 #include <map>
 #include <sstream>
 
+#include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
 
@@ -53,14 +68,17 @@ namespace {
 
 struct Value {
     std::string name;
-    char type = 'I';  // 'b' u8, 'h' u16, 'I' u32, 'c' s8, 's' s16, 'i' s32, 'f' f32
+    char type = 'I';  // 'b' u8, 'h' u16, 'I' u32, 'c' s8, 's' s16, 'i' s32, 'f' f32; 'r' a runtime flag
+    std::string flag;  // 'r': its name
     u32 addr = 0;
+    u32 at = 0;        // where it was read (the end of the pointer chain), when ok
     std::vector<u32> offs;
     bool ok = false;
     s64 v = 0;
 };
-struct Term { int value; std::string op; s64 n; };
+struct Term { int value; std::string op; s64 n; bool or_next = false; };  // or_next: "or" follows
 struct Cond { std::vector<Term> terms; bool state = false; };
+struct SetRule { int value; s64 n; int cond; };
 struct FocusRule { Focus f; int cond; };
 
 bool is_loaded;
@@ -74,6 +92,9 @@ std::vector<Button> buttons;
 int keyboard_cond = -2;  // -2: no keyboard
 std::map<std::string, std::pair<int, int>> keys;  // a character (UTF-8) or a named key -> bottom-screen pixel
 std::vector<UnsavedMark> marks;
+std::vector<SetRule> set_rules;
+std::map<std::string, s64> runtime_flags;
+bool one_screen;
 Focus cur_focus = FOCUS_NONE;
 int trace_every;
 u64 frames;
@@ -116,10 +137,11 @@ int parse_cond(const std::vector<std::string> &t, size_t i, std::string &err) {
         c.terms.push_back(term);
         i += 3;
         if (i < t.size()) {
-            if (t[i] != "and") {
-                err = "expected 'and', got " + t[i];
+            if (t[i] != "and" && t[i] != "or") {
+                err = "expected 'and' or 'or', got " + t[i];
                 return -2;
             }
+            c.terms.back().or_next = t[i] == "or";
             i++;
         }
     }
@@ -162,6 +184,12 @@ bool parse_line(const std::string &line, std::string &err) {
         }
         Value v;
         v.name = t[1];
+        if (t[3] == "runtime") {
+            v.type = 'r';
+            v.flag = t[4];
+            values.push_back(v);
+            return true;
+        }
         static const std::pair<const char *, char> types[] = {{"u8", 'b'}, {"u16", 'h'}, {"u32", 'I'}, {"s8", 'c'},
                                                               {"s16", 's'}, {"s32", 'i'}, {"f32", 'f'}};
         v.type = 0;
@@ -185,13 +213,38 @@ bool parse_line(const std::string &line, std::string &err) {
         return true;
     }
     if (d == "focus") {
-        if (t.size() < 2 || (t[1] != "top" && t[1] != "bottom" && t[1] != "both")) {
-            err = "expected 'focus top|bottom|both'";
+        static const std::pair<const char *, Focus> kinds[] = {
+            {"top", FOCUS_TOP}, {"bottom", FOCUS_BOTTOM}, {"both", FOCUS_BOTH}, {"panel", FOCUS_PANEL}};
+        Focus f = FOCUS_NONE;
+        for (auto &[n, k] : kinds)
+            if (t.size() >= 2 && t[1] == n) f = k;
+        if (f == FOCUS_NONE) {
+            err = "expected 'focus top|bottom|both|panel'";
             return false;
         }
         const int c = when(t, 2, err);
         if (c == -2) return false;
-        focus_rules.push_back({t[1] == "top" ? FOCUS_TOP : t[1] == "bottom" ? FOCUS_BOTTOM : FOCUS_BOTH, c});
+        focus_rules.push_back({f, c});
+        return true;
+    }
+    if (d == "set") {
+        s64 n;
+        int v;
+        if (t.size() < 4 || (v = value_index(t[1])) < 0 || t[2] != "=" || !num(t[3], n) || values[v].type == 'r') {
+            err = "expected 'set <value> = <number>' (a value in guest memory)";
+            return false;
+        }
+        const int c = when(t, 4, err);
+        if (c == -2) return false;
+        set_rules.push_back({v, n, c});
+        return true;
+    }
+    if (d == "onescreen") {
+        one_screen = true;
+        return true;
+    }
+    if (d == "clearbottom") {
+        gpu::set_clear_after_top_transfer(true);
         return true;
     }
     if (d == "hud") {
@@ -342,6 +395,12 @@ bool parse_line(const std::string &line, std::string &err) {
 
 void read_value(Value &v) {
     v.ok = false;
+    if (v.type == 'r') {
+        auto it = runtime_flags.find(v.flag);
+        v.v = it == runtime_flags.end() ? 0 : it->second;
+        v.ok = true;
+        return;
+    }
     u32 a = v.addr;
     for (u32 off : v.offs) {
         if (!kernel::guest_readable(a, 4)) return;
@@ -351,6 +410,7 @@ void read_value(Value &v) {
     }
     const u32 size = v.type == 'b' || v.type == 'c' ? 1 : v.type == 'h' || v.type == 's' ? 2 : 4;
     if (!kernel::guest_readable(a, size)) return;
+    v.at = a;
     switch (v.type) {
     case 'b': v.v = r8(a); break;
     case 'c': v.v = (s8)r8(a); break;
@@ -425,9 +485,32 @@ bool has_hud() { return hud_cond != -2 && !elems.empty(); }
 void update() {
     if (!is_loaded) return;
     for (auto &v : values) read_value(v);
-    for (auto &c : conds) {
-        c.state = true;
-        for (auto &t : c.terms) c.state = c.state && eval(t);
+    for (auto &c : conds) {  // a sum of products: "and" groups joined by "or"
+        bool any = false, group = true;
+        for (auto &t : c.terms) {
+            group = group && eval(t);
+            if (t.or_next) {
+                any = any || group;
+                group = true;
+            }
+        }
+        c.state = any || group;
+    }
+    for (auto &r : set_rules) {
+        Value &v = values[r.value];
+        if (!v.ok || v.v == r.n || !cond(r.cond)) continue;
+        switch (v.type) {
+        case 'b': case 'c': w8(v.at, (u8)r.n); break;
+        case 'h': case 's': w16(v.at, (u16)r.n); break;
+        case 'f': {
+            const float f = (float)r.n;
+            u32 u;
+            memcpy(&u, &f, 4);
+            w32(v.at, u);
+            break;
+        }
+        default: w32(v.at, (u32)r.n); break;
+        }
     }
     cur_focus = FOCUS_NONE;
     for (auto &r : focus_rules)
@@ -444,7 +527,7 @@ void update() {
             else snprintf(b, sizeof b, " %s=-", v.name.c_str());
             s += b;
         }
-        static const char *fn[] = {"-", "top", "bottom", "both"};
+        static const char *fn[] = {"-", "top", "bottom", "both", "panel"};
         LOG("[profile] focus %s hud %d:%s\n", fn[cur_focus], hud_visible(), s.c_str());
     }
 }
@@ -459,6 +542,8 @@ bool value(int i, s64 &v) {
     v = values[i].v;
     return true;
 }
+void set_runtime(const std::string &flag, s64 v) { runtime_flags[flag] = v; }
+bool onescreen() { return one_screen; }
 bool keyboard_active() { return keyboard_cond != -2 && (keyboard_cond == -1 || conds[keyboard_cond].state); }
 bool key(const std::string &k, int &x, int &y) {
     auto it = keys.find(k);
