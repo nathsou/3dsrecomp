@@ -64,6 +64,9 @@ static std::string choose_game(const std::filesystem::path &games_dir, const std
     const auto cros = (const GuestCro *)dlsym(h, "guest_cros");  // (games with CRO modules)
     const auto cro_count = (const u32 *)dlsym(h, "guest_cro_count");
     if (cros && cro_count) set_game_cros(cros, *cro_count);
+    const auto classes = (const GuestClass *)dlsym(h, "guest_classes");
+    const auto class_count = (const u32 *)dlsym(h, "guest_class_count");
+    if (classes && class_count) set_game_classes(classes, *class_count);
     g_start_game = games[i].id;
     return games[i].dir;
 }

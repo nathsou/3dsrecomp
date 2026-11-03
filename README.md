@@ -301,6 +301,25 @@ A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `
 (`onescreen`, `focus panel`, `bind`, `hub`, `map`, `tools`, `clearbottom`, `stack`: see Animal Crossing's profile). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
 `RECOMP_PROFILE_TRACE=<n>` logs every value every n frames.
 
+**One profile for every region.** Addresses differ between a game's regions and versions, so a profile can name
+them by what they are instead (`symbol`, see `runtime/profile.cpp`), found in the running game through its C++
+classes:
+
+- **Classes:** the recompiler lists every class it finds through the game's RTTI, CRO modules included, with the
+  address its objects hold as their vtable pointer (`tools/recomp/rtti.py`, the generated `guest_classes`;
+  `python3 tools/recomp/rtti.py data/<name> [class...]` prints them).
+- **Chains:** a symbol starts from a class (`vtable BsMenuItem`) and follows its code. It can take a virtual
+  function (`slot 6`), a function that function calls (`call 3`), a static variable it loads (`global 0`), a
+  function that refers to the address (`user 4`: a class's constructors and factories), an offset (`+ 0x30`) or a
+  pointer (`> 0`).
+- **Regions:** lines whose content differs between regions, such as a keyboard's keys, take a `region USA` or
+  `region EUR` prefix.
+
+Animal Crossing: New Leaf – Welcome amiibo's profile is written this way, once, in
+`games/profiles/acnl-welcome-amiibo.txt`; each region's `games/<title id>/profile.txt` links to it. The log lists
+what every symbol came to (`[profile] symbol ...`), and a symbol that cannot be found is an error naming the line,
+with the directives that use it left out.
+
 ## How it works
 
 - `tools/extract.py` parses NCSD/NCCH, decompresses the ExeFS `.code` and strips the RomFS IVFC levels; for a

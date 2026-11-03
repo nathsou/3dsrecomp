@@ -140,6 +140,17 @@ const GuestEntry *dispatch_lookup(u32 addr) {
     return nullptr;
 }
 
+u32 function_start(u32 addr) {  // (entries are sorted; a function's own start has entry 0)
+    u32 lo = 0, hi = guest_entry_count;
+    while (lo < hi) {
+        u32 mid = (lo + hi) / 2;
+        if (guest_entries[mid].addr <= addr) lo = mid + 1;
+        else hi = mid;
+    }
+    while (lo > 0 && guest_entries[lo - 1].entry != 0) lo--;
+    return lo > 0 ? guest_entries[lo - 1].addr & ~1u : 0;
+}
+
 #define DCACHE 8192
 static thread_local struct { u32 addr; const GuestEntry *e; } dcache[DCACHE];
 

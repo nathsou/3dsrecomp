@@ -35,6 +35,12 @@ typedef struct {
     u32 entry;
 } GuestEntry;
 
+// A C++ class of the game, from its RTTI (tools/recomp/rtti.py): the address its objects' vtable pointer holds
+typedef struct {
+    const char *name;
+    u32 vptr;
+} GuestClass;
+
 // A CRO module's fixed slot: where ldr:ro puts its code so the recompiled code finds it (tools/recomp/cro.py)
 typedef struct {
     const char *name;
