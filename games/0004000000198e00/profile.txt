@@ -49,7 +49,7 @@ value pockets_open = u32 0x94f9dc > 0          # the BsMenuItem page's vtable (0
                                                 # (the pointer stays after they close; the page's memory is reused)
 value pocket0 = u32 0xaaf14c > 0x6bd0           # the current player's first pocket (16 items, 4 bytes apart)
 value held = u16 0xaaf14c > 0x26                # the item in the player's hands
-value talk = u8 0xadf8d1                        # 1 while the player is not in control (dialogs, the arrival, ...)
+value talk = u32 0xaebd28                       # set while a dialog runs (people, signs, the save menu)
 
 # Controls in the manner of a single-screen Animal Crossing: X the pockets (the game's own), ZL a hub of the bottom
 # screen's buttons, - the map, the d-pad the tools in the pockets (up: the ring; left/right: the previous/next one;
