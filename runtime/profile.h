@@ -78,6 +78,17 @@ struct Tools {
                                    // dispatches to hold_on; else the pockets are worked through out of sight
 };
 
+// ACNH-style stacks in the pockets (runtime/stacks.mm): items of these categories stack up to max in one pocket
+struct StackKind {
+    u32 kind;
+    int max;
+};
+struct Stacks {
+    std::vector<StackKind> kinds;
+    std::vector<int> owner;  // values that tell the players (and towns) apart: each keeps its own stacks
+    u32 on = 0;              // the game's thread tidies the pockets as it dispatches here (an indirect call)
+};
+
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none
 bool loaded();
 bool has_focus_rules();
@@ -100,6 +111,10 @@ const std::vector<Bind> &binds();
 const std::vector<HubEntry> &hub();
 const std::vector<MapArea> &map_areas();
 const Tools &tools();
+const Stacks &stacks();
+// read from guest memory now, from any thread (runtime flags: as of the last update)
+bool value_now(int i, s64 &v, u32 *at = nullptr);
+bool cond_now(int i);
 u32 button_mask(const std::string &names);  // "A+B", "DUP", ... as 3DS button bits (0: none known)
 
 }  // namespace profile

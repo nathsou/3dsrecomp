@@ -277,6 +277,15 @@ bottom screen never shows as such: the game plays like a single-screen Animal Cr
 - Tab, the right stick's click and the touch controls' swap button open the hub too (on iOS the hub's entries
   and the menus are tapped).
 
+**Stacks in the pockets** (the menu's "Stack items", in any layout, off by default): as in New Horizons, several of
+the same item share one pocket, with the count on it: flowers, seed bags, saplings, shrub starts, shells,
+mushrooms, stationery, wrapping paper, pitfall seeds, fertilizer, candy, lollipops, fortune cookies and coffee beans up to 10, nuggets and
+gems up to 30 (fruit already stacks in the game). An item picked up joins its stack; one dropped, sold, given or
+planted from a stack is replaced by the next once the pockets close. The game itself knows only the pocket's one
+item: the rest are kept next to its save (`savedata/recomp_stacks.txt`, written whenever the game saves, so backups
+and cloud saves carry it), for each player of each town. Turned off, the stacks go back to free pockets as room
+allows.
+
 The keyboard's keys stand for the gamepad's as in the controls table (1 is ZL, Backspace is −, I J K L the d-pad).
 
 ### Game profiles
@@ -287,7 +296,7 @@ of `runtime/profile.cpp`; it holds only addresses, numbers, RomFS paths and coor
 read from the game's own files at run time (BCLIM textures in NARC or SARC archives, Yaz0-compressed or not).
 A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `key ...`, see
 [Typing](#typing)), write values (`set`, e.g. a layout pane's visible flag) and describe one-screen play
-(`onescreen`, `focus panel`, `bind`, `hub`, `map`, `tools`, `clearbottom`: see Animal Crossing's profile). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
+(`onescreen`, `focus panel`, `bind`, `hub`, `map`, `tools`, `clearbottom`, `stack`: see Animal Crossing's profile). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
 `RECOMP_PROFILE_TRACE=<n>` logs every value every n frames.
 
 ## How it works

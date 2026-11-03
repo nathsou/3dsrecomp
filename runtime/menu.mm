@@ -229,6 +229,11 @@ std::vector<Row> rows(Page p) {
         r.push_back({"Clock", clock_text("%d %b %Y %H:%M"), "", nullptr, [] { push(CLOCK); }});
         r.push_back({"Graphics", "", "", nullptr, [] { push(GRAPHICS); }});
         r.push_back({"Speed & audio", "", "", nullptr, [] { push(SPEED); }});
+        if (!profile::stacks().kinds.empty())
+            r.push_back({"Stack items", onoff(s.stack_items),
+                         "Several of the same item share one pocket, as in New Horizons. Off: stacks go back to "
+                         "free pockets as room allows.",
+                         [&s](int) { s.stack_items = !s.stack_items; }});
         if (restart_pending()) r.push_back({"Restart to apply the graphics changes", "", "", nullptr, [] { frontend_restart(); }});
         r.push_back({"Restart game", "", "", nullptr, [] {
                          confirm("Restart the game? Progress since its last save is lost.", [] { frontend_restart(); });

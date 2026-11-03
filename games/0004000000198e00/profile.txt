@@ -86,3 +86,14 @@ tools names /Script/Str/STR_Item_name.umsbt
 tools slots 35 115 85 115 235 115 285 115 35 157 85 157 135 157 185 157 235 157 285 157 35 197 85 197 135 197 185 197 235 197 285 197
 tools equip 160 80 open X when-open pockets_open == 0x8eaf14 ready map == 0x8f92cc
 tools hold 0x5c1b6c on 0x68d0a4
+
+# stacks in the pockets (the menu's "Stack items"), as in New Horizons: stationery, seed bags, saplings, shrub
+# starts, shells, mushrooms, flowers, pitfall seeds, fertilizer, wrapping paper, candy, lollipops, fortune cookies
+# and coffee beans up to 10, nuggets and gems up to 30 (fruit stacks in the game already). Each player of each town
+# (ids next to their names in the player data) keeps their own; the pockets are tidied as the player's update runs.
+value player_id = u16 0xaaf14c > 0x55a6
+value town_id = u16 0xaaf14c > 0x55bc
+stack owner town_id player_id
+stack on 0x68d0a4
+stack kinds 0x29 0x36 0x37 0x38 0x3c 0x3e 0x40 0x41 0x46 0x49 0x52 0x53 0x5a 0x71 max 10
+stack kinds 0x42 0x43 max 30

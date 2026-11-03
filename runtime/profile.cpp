@@ -42,6 +42,15 @@
 //       starts; the empty item puts the held one away), called on the game's thread as it dispatches to <address>
 //       (an indirect call, e.g. the player's update through its vtable). The pocket gets the tool that was in hand
 //       once the new one is.
+//   stack kinds <category> ... max <n>
+//   stack owner <value> ...
+//   stack on <address>
+//       Stacks in the pockets, as in Animal Crossing: New Horizons (an option in the menu): items of those
+//       categories (as "tools items" reads them) pile up to n in one pocket, the extra ones kept by the runtime
+//       for each owner (the values tell players and towns apart) and written next to the save whenever the game
+//       writes it. The game's thread tidies the pockets as it dispatches to <address>, while the player is free
+//       and the pockets are closed ("tools equip ... when-open ... ready"): a second pocket with the same item joins the first one's stack, and a stack's
+//       pocket that empties (the item dropped, sold, given, planted) gets the next one.
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -125,6 +134,7 @@ std::vector<Bind> bind_list;
 std::vector<HubEntry> hub_list;
 std::vector<MapArea> map_list;
 Tools tool_cfg;
+Stacks stack_cfg;
 std::map<std::string, s64> runtime_flags;
 bool one_screen;
 Focus cur_focus = FOCUS_NONE;
@@ -446,6 +456,47 @@ bool parse_line(const std::string &line, std::string &err) {
         err = "unknown tools directive " + t[1];
         return false;
     }
+    if (d == "stack" && t.size() >= 2) {
+        Stacks &c = stack_cfg;
+        if (t[1] == "owner") {
+            for (size_t i = 2; i < t.size(); i++) {
+                const int v = value_index(t[i]);
+                if (v < 0) {
+                    err = "unknown value " + t[i];
+                    return false;
+                }
+                c.owner.push_back(v);
+            }
+            return !c.owner.empty();
+        }
+        s64 a;
+        if (t[1] == "on") {
+            if (t.size() != 3 || !num(t[2], a)) {
+                err = "expected 'stack on <address>'";
+                return false;
+            }
+            c.on = (u32)a;
+            return true;
+        }
+        if (t[1] == "kinds") {
+            const size_t m = std::find(t.begin(), t.end(), "max") - t.begin();
+            s64 mx;
+            if (m < 3 || m + 2 != t.size() || !num(t[m + 1], mx) || mx < 2) {
+                err = "expected 'stack kinds <category> ... max <n>'";
+                return false;
+            }
+            for (size_t i = 2; i < m; i++) {
+                if (!num(t[i], a)) {
+                    err = "expected a number";
+                    return false;
+                }
+                c.kinds.push_back({(u32)a, (int)mx});
+            }
+            return true;
+        }
+        err = "unknown stack directive " + t[1];
+        return false;
+    }
     if (d == "clearbottom") {
         gpu::set_clear_after_top_transfer(true);
         return true;
@@ -750,6 +801,41 @@ const std::vector<Bind> &binds() { return bind_list; }
 const std::vector<HubEntry> &hub() { return hub_list; }
 const std::vector<MapArea> &map_areas() { return map_list; }
 const Tools &tools() { return tool_cfg; }
+const Stacks &stacks() { return stack_cfg; }
+
+bool value_now(int i, s64 &out, u32 *at) {
+    if (i < 0 || i >= (int)values.size()) return false;
+    Value v = values[i];
+    if (v.type != 'r') read_value(v);
+    if (!v.ok) return false;
+    out = v.v;
+    if (at) *at = v.at;
+    return true;
+}
+
+bool cond_now(int i) {
+    if (i < 0) return true;
+    if (i >= (int)conds.size()) return false;
+    bool any = false, group = true;
+    for (const Term &t : conds[i].terms) {
+        s64 v;
+        bool r = false;
+        if (value_now(t.value, v)) {
+            if (t.op == "==") r = v == t.n;
+            else if (t.op == "!=") r = v != t.n;
+            else if (t.op == "<") r = v < t.n;
+            else if (t.op == "<=") r = v <= t.n;
+            else if (t.op == ">") r = v > t.n;
+            else if (t.op == ">=") r = v >= t.n;
+        }
+        group = group && r;
+        if (t.or_next) {
+            any = any || group;
+            group = true;
+        }
+    }
+    return any || group;
+}
 bool onescreen() { return one_screen; }
 bool value_address(int i, u32 &a) {
     if (i < 0 || i >= (int)values.size() || !values[i].ok || values[i].type == 'r') return false;

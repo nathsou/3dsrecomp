@@ -30,6 +30,7 @@
 #include "menu.h"
 #include "services/services.h"
 #include "settings.h"
+#include "stacks.h"
 #include "touch.h"
 #include "uiview.h"
 
@@ -213,6 +214,7 @@ void frontend_init() {
     touch::set_pip_hooks(pip_finger_at, pip_finger_gesture);
     if (g_settings.split) frontend_set_split(true);
     profile::load();
+    stacks::init();
 }
 
 // ---- what the in-game menu changes (runtime/menu.mm)
@@ -934,6 +936,7 @@ static void present() {
         SDL_GetRenderLogicalPresentationRect(renderer2, &r);
         set_filter(t_bottom, r.w > 0 ? r.w : 320, t_bottom->w);
         SDL_RenderTexture(renderer2, t_bottom, nullptr, &full);
+        stacks::draw(renderer2, full, r.w > 0 ? r.w / 320 : 1, 1);
         write_window_shot(renderer2, "window2");
         SDL_RenderPresent(renderer2);
     }
@@ -965,10 +968,13 @@ static void present() {
     if (pl.panel) {
         draw(0);
         draw_panel(renderer, t_bottom, pl.top, pl.bottom, pl.card, pl.alpha, f);
+        stacks::draw(renderer, pl.bottom, f, pl.alpha);
     } else {
         // the corner screen goes over the main one
         draw(pl.pip == 0 ? 1 : 0);
+        if (pl.pip == 0) stacks::draw(renderer, pl.bottom, f, pl.alpha);
         draw(pl.pip == 0 ? 0 : 1);
+        if (pl.pip != 0) stacks::draw(renderer, pl.bottom, f, pl.pip == 1 ? pl.alpha : 1);
     }
     if (pl.pip >= 0 && (pip_hover || (touch::enabled() && pl.alpha > 0.5f))) {  // grip tab (three bars), resize handle (a diagonal)
         SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);

@@ -290,7 +290,7 @@ void hold_call(const Tool &t) {
     static bool hooked;
     if (!hooked) {
         hooked = true;
-        rt_set_dispatch_hook(c.hold_on, hold_hook);
+        rt_add_dispatch_hook(c.hold_on, hold_hook);
     }
     std::lock_guard<std::mutex> g(hold_m);
     hold_ask = {t.slot >= 0 ? t.item : c.empty, t.slot, pockets, held};

@@ -6,6 +6,7 @@
 #include <TargetConditionals.h>
 
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 
@@ -231,13 +232,19 @@ static void trace(CPU *c, const char *why) {
     }
 }
 
-static u32 hook_addr;
-static void (*hook_fn)(CPU *);
+constexpr int kHooks = 4;
+static struct {
+    u32 addr;
+    void (*fn)(CPU *);
+} hooks[kHooks];
+static std::atomic<int> hook_count;
 constexpr u32 CALL_RETURN = 0xFFFF0004u;  // where rt_guest_call's function returns to
 
-void rt_set_dispatch_hook(u32 addr, void (*hook)(CPU *c)) {
-    hook_fn = hook;
-    hook_addr = addr;
+void rt_add_dispatch_hook(u32 addr, void (*hook)(CPU *c)) {
+    const int n = hook_count;
+    if (n == kHooks) FATAL("more than %d dispatch hooks\n", kHooks);
+    hooks[n] = {addr, hook};
+    hook_count = n + 1;  // (published once the entry is in)
 }
 
 u32 rt_guest_call(CPU *c, u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
@@ -257,7 +264,9 @@ u32 rt_guest_call(CPU *c, u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
 
 extern "C" void rt_dispatch(CPU *c, u32) {
     trace(c, "dispatch");
-    if (__builtin_expect(c->pc == hook_addr, 0) && hook_fn) hook_fn(c);
+    if (const int n = hook_count.load(std::memory_order_acquire); __builtin_expect(n, 0))
+        for (int i = 0; i < n; i++)
+            if (c->pc == hooks[i].addr) hooks[i].fn(c);
     if (__builtin_expect(c->pc == CALL_RETURN, 0)) return;  // (an indirect return from rt_guest_call's function)
     const GuestEntry *e = lookup_cached(c->pc);
     if (__builtin_expect(!e, 0)) {
