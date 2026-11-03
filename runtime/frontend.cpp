@@ -1239,13 +1239,13 @@ static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 
             tx = (u16)std::clamp(e.tx, 0, 319);
             ty = (u16)std::clamp(e.ty, 0, 239);
         }
-    if (!touch && !key_taps.empty()) {  // typed keys: each tap held 6 frames, then 6 released (the game runs at 30 fps)
-        const u64 t = frame_count - key_tap_start;
-        if (t < 6) {
+    if (!touch && !key_taps.empty()) {  // typed keys: each tap held 8 frames, then 8 released (the game reads the touch
+        const u64 t = frame_count - key_tap_start;  // screen at 30 fps, less when busy: shorter taps were lost now and then)
+        if (t < 8) {
             touch = true;
             tx = (u16)std::clamp(key_taps.front().first, 0, 319);
             ty = (u16)std::clamp(key_taps.front().second, 0, 239);
-        } else if (t >= 12) {
+        } else if (t >= 16) {
             key_taps.pop_front();
             key_tap_start = frame_count;
         }

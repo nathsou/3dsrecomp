@@ -36,7 +36,9 @@ with Tom Nook, at full speed with music and sound (built with `-DGAME=acnl` from
 is in CRO modules (relocatable code loaded from the RomFS by `ldr:ro`), which the recompiler also translates:
 see [CRO modules](#cro-modules-ldrro). The village's map and menus on the bottom screen work; saving was not
 reached in tests (the game allows it only after the first day's tutorial). amiibo, StreetPass, SpotPass, QR codes
-and online play are not supported: the services report nothing there.
+and online play are not supported: the services report nothing there. The European edition (`CTR-P-EAAP`, title
+0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
+American one has (its own addresses, and its keyboard's keys).
 
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
