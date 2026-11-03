@@ -13,6 +13,7 @@
 
 #include "profile.h"
 #include "rt.h"
+#include "settings.h"
 
 namespace aim {
 namespace {
@@ -57,8 +58,9 @@ void delta_hook(CPU *c) {
         if (dt > 1e-4f) mx /= dt, my /= dt;
     }
     const u32 sp = c->r[13];
-    put_float(sp + a.delta_x, get_float(sp + a.delta_x) + mx + sx * a.stick_speed);
-    put_float(sp + a.delta_y, get_float(sp + a.delta_y) + my - sy * a.stick_speed);  // (screen y grows downwards)
+    const float speed = a.stick_speed * g_settings.aim_speed / 100;
+    put_float(sp + a.delta_x, get_float(sp + a.delta_x) + mx + sx * speed);
+    put_float(sp + a.delta_y, get_float(sp + a.delta_y) + my - sy * speed);  // (screen y grows downwards)
 }
 
 }  // namespace

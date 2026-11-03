@@ -294,7 +294,8 @@ d-pad (or the circle pad) and A/B, and the mouse clicks them.
 In battle the reticle and the camera, which the stylus moves on a 3DS, are moved by the right stick or the mouse,
 in any layout: they go into the game's own aim (the same as its "reticle with buttons" option), so the reticle stays
 where it is put and the camera turns when it reaches the side of the screen, in the air and on land, with the game's
-settings left as they are. Nothing is played on the touch screen.
+settings left as they are. Nothing is played on the touch screen. "Aim speed" (menu: Speed & audio) sets how fast
+both aim.
 
 | Kid Icarus: Uprising | Gamepad (Switch Pro Controller, ...) | Mouse and keyboard |
 |---|---|---|

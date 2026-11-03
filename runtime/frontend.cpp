@@ -1172,7 +1172,8 @@ void frontend_live_mouse(float dx, float dy) {
 static void update_aim(float &rsx, float &rsy) {
     const float mx = aim_mx + live_mx.exchange(0) / 16.0f, my = aim_my + live_my.exchange(0) / 16.0f;
     aim_mx = aim_my = 0;
-    aiming = aim::update(rsx, rsy, mx * kMouseAim, my * kMouseAim) && !paused;
+    const float k = kMouseAim * g_settings.aim_speed / 100;
+    aiming = aim::update(rsx, rsy, mx * k, my * k) && !paused;
     const bool capture = aiming && SDL_GetKeyboardFocus() == window && !touch::enabled();
     if (capture != SDL_GetWindowRelativeMouseMode(window)) SDL_SetWindowRelativeMouseMode(window, capture);
     if (aiming) rsx = rsy = 0;  // (the right stick aims: no pointer, no binds)
