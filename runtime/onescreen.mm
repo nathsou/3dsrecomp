@@ -1,6 +1,6 @@
 // One-screen play (onescreen.h): binds, the hub, the map, the tool ring and the pointer, drawn over the top screen.
 // Everything acts on the game through its own inputs: taps on the bottom screen where its buttons are, presses,
-// and drags in its pockets, so the game's state never changes behind its back.
+// and its pockets' own menus, so the game's state never changes behind its back.
 #include "onescreen.h"
 
 #include <algorithm>
@@ -45,7 +45,7 @@ int toast_left, hint_left = -1;
 float ptr_x = 160, ptr_y = 120;
 int ptr_idle = 1000;
 
-// ---- scripted inputs the overlays play on the game: presses, waits for a condition, touches and drags
+// ---- scripted inputs the overlays play on the game: presses, waits for a condition, touches
 struct Step {
     u32 buttons = 0;
     int frames = 1;
@@ -69,7 +69,7 @@ struct Icon {
 std::vector<Icon> hub_icons;
 u64 frames_seen;
 
-// ---- the tool ring: item records, icons and names from the game's files
+// ---- the tool ring: item records (categories) and names from the game's files
 struct Items {
     bool loaded = false;
     std::vector<u8> records;
@@ -466,6 +466,15 @@ std::string clock_text() {
     return s[0] == ' ' ? s.substr(1) : s;
 }
 
+// whether an overlay target can be used now (else its input plays its own 3DS button)
+bool available(const std::string &target) {
+    if (panel_r.w) return false;  // a menu is up
+    if (target == "hub") return !offered_hub().empty();
+    if (target == "map") return map_area() != nullptr;
+    if (target.rfind("tool", 0) == 0) return profile::cond(profile::tools().ready_cond);
+    return true;
+}
+
 }  // namespace
 
 u32 host_mask(const char *names) {
@@ -541,14 +550,19 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
     } else {
         ptr_idle++;
     }
-    // binds: unbound inputs keep their default button; bound ones play their target or open an overlay
+    // binds: unbound inputs keep their default button; bound ones play their target, or open an overlay where it
+    // is available (the player free in the field: no menu, no dialog), else keep their own button too (the d-pad
+    // moves through a dialog's choices)
     for (const HostName &h : kHostNames) {
         const profile::Bind *b = bound(h.bit);
         if (!b) continue;
-        buttons &= ~default_button(h.bit);
         const bool stick = h.bit & (H_RSUP | H_RSDOWN | H_RSLEFT | H_RSRIGHT);
-        if (stick && panel) continue;  // (the right stick moves the pointer over a panel)
+        if (stick && panel) {  // (the right stick moves the pointer over a panel)
+            buttons &= ~default_button(h.bit);
+            continue;
+        }
         if (b->buttons) {
+            buttons &= ~default_button(h.bit);
             if (host & h.bit) {
                 buttons |= b->buttons & 0x0fffffff;
                 if (b->buttons & 1u << 30) cy = 155;
@@ -559,7 +573,9 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
             continue;
         }
         if (b->target == "pointer") {
-            if ((host & h.bit) && panel) {
+            if (!panel) continue;
+            buttons &= ~default_button(h.bit);
+            if (host & h.bit) {
                 touch = true;
                 tx = (u16)ptr_x;
                 ty = (u16)ptr_y;
@@ -567,10 +583,10 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
             }
             continue;
         }
-        if (!(pressed & h.bit)) continue;
         if (overlay != NONE) {  // its own input closes it
+            buttons &= ~default_button(h.bit);
             const bool mine = (overlay == HUB && b->target == "hub") || (overlay == MAP && b->target == "map");
-            if (mine) {
+            if (mine && (pressed & h.bit)) {
                 overlay = NONE;
                 prev_host |= host;  // (not seen as pressed again)
                 buttons = 0;
@@ -578,7 +594,9 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
             }
             continue;
         }
-        if (panel_r.w) continue;  // overlays are for the field: a menu is up
+        if (!available(b->target)) continue;
+        buttons &= ~default_button(h.bit);
+        if (!(pressed & h.bit)) continue;
         if (b->target == "hub") open_overlay(HUB);
         else if (b->target == "map") open_overlay(MAP);
         else if (b->target == "tools") open_overlay(TOOLS);
