@@ -246,7 +246,7 @@ game seems stuck, then send `log.txt`), Esc opens the in-game menu (Quit is ther
   its keys (capitals use its Shift key; Backspace deletes, Return taps Confirm). The keys mapped to 3DS buttons
   type instead of pressing buttons until the keyboard closes; the arrows and the gamepad still play. On iOS this
   needs a hardware keyboard (without one, the game's keyboard is tapped). Animal Crossing: New Leaf's profile maps
-  its keys but has no reliable sign of when its keyboard is up yet, so it is tapped there for now.
+  its keys (its keyboard is up while its `BsSkb` object exists).
 
 ### Playing on one screen
 
@@ -260,6 +260,21 @@ In the "top screen only" and "bottom screen only" layouts (menu: Graphics):
   ...) drawn over the top screen with the game's own icons; E (or a click of the gamepad's left stick) uses the
   stored item by tapping the bottom screen where the game expects it.
 
+**Animal Crossing: New Leaf on one screen.** In the "top screen only" layout (with "Automatic screen" on) the
+bottom screen never shows as such: the game plays like a single-screen Animal Crossing.
+- Its menus (pockets, designs, the Critterpedia, the TPC, the keyboard, shops, ...) and its dialogs' choices come up
+  over the top screen: the bottom screen's plaid background is hidden, so what the game draws there floats on the
+  dimmed world (a menu with a background of its own shows as a card). The field's map and tabs never show.
+- **X** opens the pockets (the game's own button). **ZL** opens a hub of the bottom screen's buttons: pockets,
+  designs, Critterpedia, TPC, the map, the tools, chat, save. **−** shows the town map, live and enlarged.
+- **The d-pad** holds the tools in the pockets: up opens a ring of them (with their icons and names), left and right
+  take the previous or next one, down puts the held one away. It works through the pockets' own menus, out of sight.
+- **The right stick** tilts the camera up (as L and R do) and, while a menu is up, moves a pointer over it; **ZR**
+  touches where it points (for the few things only the touch screen does). The mouse and fingers touch menus too.
+- The Mac's keyboard types into the game's own keyboard (names, letters, chat) whenever it is up.
+
+The keyboard's keys stand for the gamepad's as in the controls table (1 is ZL, Backspace is −, I J K L the d-pad).
+
 ### Game profiles
 
 `games/<title id>/profile.txt` describes, for one game, values in its memory (lives, the stored item, which
@@ -267,7 +282,8 @@ scene it is in, ...), which screen matters when, and the HUD built from them. Th
 of `runtime/profile.cpp`; it holds only addresses, numbers, RomFS paths and coordinates. The HUD's icons are
 read from the game's own files at run time (BCLIM textures in NARC or SARC archives, Yaz0-compressed or not).
 A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `key ...`, see
-[Typing](#typing)). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
+[Typing](#typing)), write values (`set`, e.g. a layout pane's visible flag) and describe one-screen play
+(`onescreen`, `focus panel`, `bind`, `hub`, `map`, `tools`, `clearbottom`: see Animal Crossing's profile). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
 `RECOMP_PROFILE_TRACE=<n>` logs every value every n frames.
 
 ## How it works
@@ -426,8 +442,12 @@ keep the Metal compiler out of gameplay:
 - `RECOMP_LIVE=<file>`: input for a running test, one command per line appended to the file while the game runs
   (`<buttons> <frames>` with the button names of `RECOMP_INPUT`, e.g. `A 6`, `CDOWN+B 60`, `T@160/120 8`, or
   `WAIT <frames>`); commands run one after another, each followed by a few released frames, and the log says when
-  each starts. A line `DUMP` writes the state of every thread to the log. With `RECOMP_SHOT`, this drives long
-  explorations step by step without replaying a script from boot.
+  each starts. Also `DRAG <x>/<y> <x1>/<y1> <frames>` (a moving touch), `PAD <host inputs> <frames>` (gamepad
+  inputs by position for one-screen play: `PAD zl 6`, `PAD rs-up 10`), `TEXT <text>` (typed on the game's own
+  keyboard), `WINSHOT` (the whole window as `window_<frame>.ppm`), `MEMDUMP <tag>` (guest memory, as
+  `RECOMP_MEMDUMP`), and, at once, `DUMP` (the state of every thread in the log) and `POKE8 <address> <value>` (a
+  byte of guest memory, hexadecimal). With `RECOMP_SHOT`, this drives long explorations step by step without
+  replaying a script from boot.
 - A jump to a null function pointer stops with the registers in the log (instead of trying to recompile it), and
   `RECOMP_WATCH` reports which code touched its page before a fatal error.
 - `tools/disasm.py <gamedir> <addr> [count] [thumb]` disassembles guest code (including CRO modules).
