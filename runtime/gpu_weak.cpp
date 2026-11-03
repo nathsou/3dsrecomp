@@ -11,6 +11,7 @@ __attribute__((weak)) bool save_state(const char *) { return false; }
 __attribute__((weak)) bool get_display_image_for(u32, u32, u32, const u32 **, int *, int *) { return false; }
 __attribute__((weak)) void set_trust_invalidations(bool) {}
 __attribute__((weak)) void set_clear_after_top_transfer(bool) {}
+__attribute__((weak)) void set_key_black_bottom(bool) {}
 __attribute__((weak)) void texture_copy(u32, u32, u32, u32, u32, u32) {}
 __attribute__((weak)) int emit_shaders(int, char **) { return 1; }
 __attribute__((weak)) void set_texture_filter(int) {}

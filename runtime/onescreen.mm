@@ -519,7 +519,8 @@ void input(u32 host, float rsx, float rsy, u32 &buttons, s16 &cx, s16 &cy, bool 
     prev_host = host;
     frames_seen++;
     if (toast_left > 0) toast_left--;
-    if (hint_left > 0 && overlay == NONE && !panel_r.w && !offered_hub().empty()) hint_left--;  // (in the field)
+    const bool field = profile::tools().ready_cond >= 0 ? profile::cond(profile::tools().ready_cond) : !offered_hub().empty();
+    if (hint_left > 0 && overlay == NONE && !panel_r.w && field) hint_left--;  // (in the field)
     if (!on) {
         macro.clear();
         return;
@@ -917,7 +918,8 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
         pill(r, toast, top_r.x + top_r.w / 2, top_r.y + top_r.h - 30 * k, px, a);
     }
     // what the controls do, for a while after one-screen play starts
-    if (hint_left > 0 && overlay == NONE && !panel_r.w && !offered_hub().empty()) {
+    const bool field = profile::tools().ready_cond >= 0 ? profile::cond(profile::tools().ready_cond) : !offered_hub().empty();
+    if (hint_left > 0 && overlay == NONE && !panel_r.w && field) {
         std::string s;
         auto add = [&](const char *target, const char *what) {
             for (auto &b : profile::binds())

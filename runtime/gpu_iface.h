@@ -30,6 +30,8 @@ const char *texture_filter_name(int mode);  // "Off", "Sharp", "Smooth"
 // (Metal) clear render targets to transparent after each display transfer from them, before the next draw into
 // them (see runtime/gpu/metal.mm)
 void set_clear_after_top_transfer(bool on);
+// (Metal) the bottom screen's display images with black made transparent (one-screen play)
+void set_key_black_bottom(bool on);
 void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap, u32 flags);
 }
 

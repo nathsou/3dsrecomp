@@ -413,8 +413,9 @@ static void write_ppm(const char *path, const u32 *px, int w, int h) {
 }
 
 // The bottom screen's picture, sampled on a grid: how much the game drew (alpha: with its background hidden by the
-// profile, the rest is transparent) and how much of it is black (a screen left black: keyed out in one-screen play,
-// so a dialog's choices on it float and an empty one shows nothing). Returns the picture to show.
+// profile, the rest is transparent). In one-screen play black is keyed out (a screen left black shows nothing, a
+// dialog's choices on it float): by the GPU in its display images (gpu::set_key_black_bottom; cheap, so the UI
+// thread keeps its timing), here for the guest framebuffer's 320x240 picture. Returns the picture to show.
 static const u32 *bottom_stats(const u32 *img, int w, int h) {
     int cover = 0, opaque = 0, dark = 0, n = 0;
     for (int y = h / 60; y < h; y += h / 30)
@@ -426,7 +427,7 @@ static const u32 *bottom_stats(const u32 *img, int w, int h) {
             dark += a > 32 && m < 12;
         }
     static std::vector<u32> keyed;
-    if (onescreen::active() && n && dark > n * 6 / 10) {
+    if (onescreen::active() && n && dark > n * 6 / 10 && w <= 320) {  // (display images: keyed by the GPU)
         keyed.assign(img, img + (size_t)w * h);
         for (u32 &p : keyed) {
             const int m = (int)std::max({p & 255, p >> 8 & 255, p >> 16 & 255});
@@ -941,6 +942,7 @@ static void present() {
     place_screens();
     const Placement &pl = placement;
     const float f = present_factor();
+    gpu::set_key_black_bottom(onescreen::active());
     onescreen::set_state(single_layout() && profile::onescreen() && !window2, pl.top,
                          pl.panel && pl.alpha > 0.5f ? pl.bottom : SDL_FRect{});
     auto draw = [&](int screen) {

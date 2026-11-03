@@ -296,14 +296,16 @@ fragment RDOut k_rdepth(RVOut in [[stage_in]], depth2d<float, access::read> d [[
     o.s = s.read(uint2(in.pos.xy)).r;
     return o;
 }
-// upright display image: p = texture width, rows used, flip, first row
+// upright display image: p = texture width, rows used, flip (bit 0) and black keyed out (bit 1), first row
 kernel void k_rot(texture2d<float, access::read> src [[texture(0)]], device uint *dst [[buffer(0)]],
                   constant uint4 &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
     if (gid.x >= p.y || gid.y >= p.x) return;
-    const uint row = (p.z ? p.y - 1 - gid.x : gid.x) + p.w;
+    const uint row = ((p.z & 1) ? p.y - 1 - gid.x : gid.x) + p.w;
     const uint col = p.x - 1 - gid.y;
     const uint4 b = uint4(round(saturate(src.read(uint2(col, row))) * 255.0));
-    dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (b.a << 24);
+    uint a = b.a;
+    if (p.z & 2) a = min(a, uint(clamp((int(max(b.r, max(b.g, b.b))) - 8) * 24, 0, 255)));  // black keyed out
+    dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (a << 24);
 }
 )";
 
@@ -406,6 +408,7 @@ struct GRT {
     bool own = false;        // ... and its GPU copy kept (guest memory ignored) until its own next display transfer
 };
 std::atomic<bool> clear_after_top{false};
+std::atomic<bool> key_black_bottom{false};  // set_key_black_bottom
 
 std::vector<std::unique_ptr<GRT>> rts;
 
@@ -2934,7 +2937,8 @@ void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u3
     [ce setComputePipelineState:k_rot];
     [ce setTexture:src.tex atIndex:0];
     [ce setBuffer:dst offset:0 atIndex:0];
-    const u32 prm[4] = {TW, rows, flags & 1, row0 * S};
+    const u32 key = key_black_bottom && rows == 320 * S ? 2 : 0;  // (a bottom screen: 320 rows)
+    const u32 prm[4] = {TW, rows, (flags & 1) | key, row0 * S};
     [ce setBytes:prm length:16 atIndex:1];
     [ce dispatchThreads:MTLSizeMake(rows, TW, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
 }
@@ -3080,6 +3084,9 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
 // transferred again unchanged stays), so the bottom screen's picture keeps only what its pass draws (and its
 // alpha says where that is). The top screen's pass draws all of its picture anyway.
 void set_clear_after_top_transfer(bool on) { clear_after_top = on; }
+// One-screen play shows the bottom screen over the top one: black there is made transparent as the display image is
+// made (a screen left black shows nothing; a dialog's choices on it float).
+void set_key_black_bottom(bool on) { key_black_bottom = on; }
 
 namespace {
 // The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes
