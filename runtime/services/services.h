@@ -13,6 +13,7 @@ void register_hid();
 void register_dsp();
 void register_misc();
 void register_ro();
+void register_y2r();
 
 std::shared_ptr<SharedMem> load_shared_font();
 // a file of a system archive (system_archives/<title id>.romfs), empty if missing

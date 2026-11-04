@@ -1070,6 +1070,7 @@ void dump_threads() {
         LOG("[thread %u] prio %d %s pc=%08x lr=%08x sp=%08x arb=%08x%s\n", t->id, t->priority, st[(int)t->status],
             t->cpu.pc, t->cpu.r[14], t->cpu.r[13], t->arb_addr, w.c_str());
     }
+    LOG("[threads] running %d, %zu deferred\n", running ? (int)running->id : -1, deferred_work.size());
 }
 
 // ---------------------------------------------------------------- boot

@@ -20,6 +20,7 @@ struct Settings {
     int speed = 100;        // game speed in percent of the 3DS's (VBlank and audio clocks)
     int volume = 100;       // percent
     bool show_fps = false;  // frame rate counter in the corner
+    int aim_speed = 100;    // percent: aiming with the right stick and the mouse (games with an "aim" profile)
     s64 clock_offset = 0;   // seconds added to the Mac's clock for the 3DS clock
     bool auto_backup = true;  // copy the save into backups/ at each launch (the last 5 are kept)
     bool forgive_unsaved = true;  // clear the profile's "unsaved" marks at launch (no scolding after a crash)

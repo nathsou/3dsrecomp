@@ -85,6 +85,16 @@
 //       underfoot" names where the player keeps the item it stands on (the 2 bytes at <offset>): with the pockets
 //       full, a stack of that item with room gives up its pocket while the player stands there, so the game picks
 //       the item up into it and it joins the stack (it goes back once the player steps off).
+//   aim delta <return address> <x offset> <y offset> [per s<n>] [active r<n> <offset>] on <address> ...
+//   aim stick <pixels per second>
+//   aim when <condition>
+//       Aiming with the right stick and the mouse (runtime/aim.cpp), while the condition holds: as the game's thread
+//       dispatches to one of the "on" addresses returning to the return address (a call made while the frame's aim
+//       delta sits on the stack, as two floats at sp + the offsets), the mouse's motion since the last frame and the
+//       right stick (at most "stick" pixels per second, default 300) are added to it. "per s<n>": the delta is a
+//       rate the game multiplies by the frame time it holds in that VFP register (the mouse's motion is divided by
+//       it). "active": the byte at that register + offset (the game's own "aim input this frame") is set while the
+//       stick is held or the mouse moved lately. The mouse is captured meanwhile.
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -188,6 +198,7 @@ std::vector<HubEntry> hub_list;
 std::vector<MapArea> map_list;
 Tools tool_cfg;
 Stacks stack_cfg;
+Aim aim_cfg;
 std::map<std::string, s64> runtime_flags;
 bool one_screen;
 Focus cur_focus = FOCUS_NONE;
@@ -670,6 +681,51 @@ bool parse_line(const std::string &line, std::string &err) {
         err = "unknown tools directive " + t[1];
         return false;
     }
+    if (d == "aim" && t.size() >= 2) {
+        Aim &c = aim_cfg;
+        s64 a = 0, b = 0, v = 0;
+        if (t[1] == "delta") {  // aim delta <return> <x off> <y off> [per s<n>] [active r<n> <off>] on <address> ...
+            const char *usage = "expected 'aim delta <return address> <x offset> <y offset> [per s<n>] [active r<n> <offset>] "
+                                "on <address> ...'";
+            if (t.size() < 7 || !num(t[2], a) || !num(t[3], b) || !num(t[4], v)) {
+                err = usage;
+                return false;
+            }
+            c.delta_ret = (u32)a, c.delta_x = (u32)b, c.delta_y = (u32)v;
+            size_t i = 5;
+            auto reg = [&](const std::string &w, char kind, s64 &n) { return w.size() > 1 && w[0] == kind && num(w.substr(1), n); };
+            for (;;) {
+                if (i + 1 < t.size() && t[i] == "per" && reg(t[i + 1], 's', a) && a < 32) {
+                    c.delta_per = (int)a;
+                    i += 2;
+                } else if (i + 2 < t.size() && t[i] == "active" && reg(t[i + 1], 'r', a) && a < 13 && num(t[i + 2], b)) {
+                    c.active_reg = (int)a, c.active_off = (u32)b;
+                    i += 3;
+                } else {
+                    break;
+                }
+            }
+            if (i + 1 >= t.size() || t[i] != "on") {
+                err = usage;
+                return false;
+            }
+            for (i++; i < t.size(); i++) {
+                if (!num(t[i], a)) {
+                    err = "expected an address";
+                    return false;
+                }
+                c.delta_on.push_back((u32)a);
+            }
+            return true;
+        }
+        if (t[1] == "stick" && t.size() == 3 && num(t[2], a) && a > 0) {
+            c.stick_speed = (float)a;
+            return true;
+        }
+        if (t[1] == "when") return (c.cond = parse_cond(t, 2, err)) != -2;
+        err = "unknown aim directive " + t[1];
+        return false;
+    }
     if (d == "stack" && t.size() >= 2) {
         Stacks &c = stack_cfg;
         if (t[1] == "owner") {
@@ -1062,6 +1118,7 @@ const std::vector<HubEntry> &hub() { return hub_list; }
 const std::vector<MapArea> &map_areas() { return map_list; }
 const Tools &tools() { return tool_cfg; }
 const Stacks &stacks() { return stack_cfg; }
+const Aim &aim() { return aim_cfg; }
 
 bool value_now(int i, s64 &out, u32 *at) {
     if (i < 0 || i >= (int)values.size()) return false;
