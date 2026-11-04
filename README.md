@@ -153,6 +153,12 @@ The same bucket and lines can serve nx (its Switch games' saves are under their 
 Tests: `RECOMP_CLOUD=<line>` uses that bucket without storing anything (`s3+http://` for a local server such as
 `moto_server`), and `RECOMP_CLOUD_DEVICE=<name>` acts as another device.
 
+**Saves from a 3DS:** `python3 tools/checkpoint_cloud.py <Checkpoint's saves folder> <file with the line> --upload`
+uploads each game's newest [Checkpoint](https://github.com/BernardoGiordano/Checkpoint) backup (copied from the
+SD card's `3ds/Checkpoint/saves`) as the saves of one more device, "3DS". A game made from the same game files as
+`data/<name>` takes it as any other device's save; the others are only kept in the bucket. Without `--upload` it
+lists what the bucket has.
+
 ### Homebrew (.3dsx)
 
 ```sh
