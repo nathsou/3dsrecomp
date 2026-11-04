@@ -78,6 +78,7 @@ struct Items {
     bool loaded = false;
     std::vector<u8> records;
     std::vector<std::string> names;
+    std::vector<u8> textures;  // the icons' darc ("tools textures")
 } items;
 // items' icons, kept from the pockets while they show (by item number)
 std::map<u32, Icon> item_icons;
@@ -136,7 +137,103 @@ void load_items() {
     const profile::Tools &c = profile::tools();
     if (!c.items.empty()) items.records = kernel::romfs_file(c.items);
     if (!c.names.empty()) items.names = msbt_names(kernel::romfs_file(c.names));
-    LOG("[onescreen] %zu item records, %zu names\n", c.record ? items.records.size() / c.record : 0, items.names.size());
+    if (!c.textures.empty()) items.textures = kernel::romfs_file(c.textures);
+    LOG("[onescreen] %zu item records, %zu names, %zu bytes of icons\n", c.record ? items.records.size() / c.record : 0,
+        items.names.size(), items.textures.size());
+}
+
+int item_field(u32 item, u32 off, int bytes);
+
+// a file of a darc archive, by its name (its folders aside): {offset, size}, or {0, 0}
+std::pair<u32, u32> darc_file(const std::vector<u8> &b, const std::string &name) {
+    auto le32 = [&](size_t o) { return o + 4 <= b.size() ? (u32)(b[o] | b[o + 1] << 8 | b[o + 2] << 16 | (u32)b[o + 3] << 24) : 0u; };
+    if (b.size() < 0x1c || memcmp(b.data(), "darc", 4)) return {0, 0};
+    const u32 table = le32(0x10), n = le32(table + 8);  // (the root entry's size: the number of entries)
+    const size_t names = table + (size_t)n * 12;
+    for (u32 i = 0; i < n; i++) {
+        const size_t e = table + (size_t)i * 12;
+        const u32 w = le32(e);
+        if (w >> 24) continue;  // a folder
+        size_t q = names + (w & 0xffffff);
+        size_t k = 0;
+        for (; k < name.size() && q + 1 < b.size() && b[q] == (u8)name[k] && !b[q + 1]; k++, q += 2) {}
+        if (k == name.size() && q + 1 < b.size() && !b[q] && !b[q + 1]) {
+            const u32 off = le32(e + 4), size = le32(e + 8);
+            return off + size <= b.size() ? std::make_pair(off, size) : std::make_pair(0u, 0u);
+        }
+    }
+    return {0, 0};
+}
+
+// a 32x32 ETC1A4 picture (8x8 tiles of four 4x4 blocks: 64 bits of alpha, then the ETC1 block) as RGBA
+bool decode_etc1a4(const u8 *d, size_t size, int w, int h, std::vector<u32> &out) {
+    if (size < (size_t)w * h) return false;
+    static const int mods[8][2] = {{2, 8}, {5, 17}, {9, 29}, {13, 42}, {18, 60}, {24, 80}, {33, 106}, {47, 183}};
+    auto get64 = [](const u8 *p) {
+        u64 v = 0;
+        for (int i = 7; i >= 0; i--) v = v << 8 | p[i];
+        return v;
+    };
+    out.assign((size_t)w * h, 0);
+    const u8 *p = d;
+    for (int ty = 0; ty < h; ty += 8)
+        for (int tx = 0; tx < w; tx += 8)
+            for (int b = 0; b < 4; b++, p += 16) {
+                const int bx = tx + (b & 1) * 4, by = ty + (b >> 1) * 4;
+                const u64 alpha = get64(p), c = get64(p + 8);
+                const u32 hi = (u32)(c >> 32), lo = (u32)c;
+                const bool diff = hi >> 1 & 1, flip = hi & 1;
+                int base[2][3];
+                for (int ch = 0; ch < 3; ch++) {
+                    const int sh = 27 - 8 * ch;
+                    if (diff) {
+                        const int v = hi >> sh & 31;
+                        int dv = hi >> (sh - 3) & 7;
+                        if (dv > 3) dv -= 8;
+                        base[0][ch] = v << 3 | v >> 2;
+                        base[1][ch] = (v + dv) << 3 | (v + dv) >> 2;
+                    } else {
+                        base[0][ch] = (hi >> (sh + 1) & 15) * 17;
+                        base[1][ch] = (hi >> (sh - 3) & 15) * 17;
+                    }
+                }
+                const int table[2] = {(int)(hi >> 5 & 7), (int)(hi >> 2 & 7)};
+                for (int x = 0; x < 4; x++)
+                    for (int y = 0; y < 4; y++) {
+                        const int i = x * 4 + y, idx = (lo >> (16 + i) & 1) << 1 | (lo >> i & 1);
+                        const int sub = flip ? y >= 2 : x >= 2;
+                        const int m = mods[table[sub]][idx & 1] * (idx & 2 ? -1 : 1);
+                        u32 px = 0;
+                        for (int ch = 0; ch < 3; ch++) px |= (u32)std::clamp(base[sub][ch] + m, 0, 255) << (8 * ch);
+                        const u32 a = (u32)(alpha >> (4 * i) & 15) * 17;
+                        out[(size_t)(by + y) * w + bx + x] = px | a << 24;
+                    }
+            }
+    return true;
+}
+
+// an item's icon from the game's textures ("tools textures"; nullptr: none)
+Icon *texture_icon(u32 item) {
+    static std::map<u32, Icon> cache;
+    const profile::Tools &c = profile::tools();
+    load_items();
+    if (items.textures.empty()) return nullptr;
+    item &= 0xffff;
+    auto it = cache.find(item);
+    if (it != cache.end()) return it->second.px.empty() ? nullptr : &it->second;
+    Icon &ic = cache[item];
+    const auto o = c.texture_of.find(item);
+    const int f = item_field(item, c.texture_field, 2);
+    const int number = o != c.texture_of.end() ? o->second : f < 0 ? -1 : f + c.texture_add;
+    if (number < 0) return nullptr;
+    char name[64];
+    snprintf(name, sizeof name, "%s%03d.bclim", c.texture_prefix.c_str(), number);
+    const auto [off, size] = darc_file(items.textures, name);
+    constexpr int kSide = 32;
+    if (!size || !decode_etc1a4(items.textures.data() + off, size, kSide, kSide, ic.px)) return nullptr;
+    ic.w = ic.h = kSide;
+    ic.dirty = true;
+    return &ic;
 }
 
 // an item's record field (-1: none)
@@ -528,6 +625,7 @@ SDL_Texture *icon_tex(SDL_Renderer *r, Icon &ic) {
 }
 
 SDL_Texture *item_icon(SDL_Renderer *r, u32 item) {
+    if (Icon *t = texture_icon(item)) return icon_tex(r, *t);
     auto it = item_icons.find(item & 0xffff);
     return it == item_icons.end() ? nullptr : icon_tex(r, it->second);
 }
@@ -828,9 +926,19 @@ bool crop(Icon &ic, const u32 *img, int w, int h, int bx, int by, int bw, int bh
     return true;
 }
 
+float slot_alpha[kSlots];  // the bottom screen's opacity at each pocket's centre, as last drawn
+
+// (opaque outside one-screen play: the bottom screen shows as it is, its pictures not looked at)
+float pocket_alpha(int slot) { return !active() ? 1 : slot >= 0 && slot < kSlots ? slot_alpha[slot] : 0; }
+
 void bottom_image(const u32 *img, int w, int h) {
     // the items' icons from the pockets while they show (they have settled once open a while)
     const profile::Tools &c = profile::tools();
+    if ((int)c.slots.size() >= kSlots)
+        for (int i = 0; i < kSlots; i++) {
+            const int x = std::clamp(c.slots[i].first * w / 320, 0, w - 1), y = std::clamp(c.slots[i].second * h / 240, 0, h - 1);
+            slot_alpha[i] = (img[(size_t)y * w + x] >> 24) / 255.0f;
+        }
     static int open_frames;
     open_frames = profile::cond(c.open_cond) && c.open_cond >= 0 ? open_frames + 1 : 0;
     // (an icon is kept when two looks 10 frames apart agree: not while the pockets slide in or out)
@@ -897,11 +1005,29 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
     const float k = top_r.w / 400;
     const SDL_Color ink{70, 52, 34, 255}, white{255, 255, 255, 255};
     SDL_SetRenderDrawBlendMode(r, SDL_BLENDMODE_BLEND);
+    // overlays ease in and out (drawn while they fade after closing): e, their opacity and growth
+    static Overlay shown = NONE;
+    static float shown_t;
+    if (overlay != NONE) {
+        shown = overlay;
+        shown_t = std::min(1.0f, shown_t + 0.14f);
+    } else {
+        shown_t = std::max(0.0f, shown_t - 0.2f);
+        if (shown_t <= 0) shown = NONE;
+    }
+    const float e = 1 - (1 - shown_t) * (1 - shown_t);
+    auto fa = [&](SDL_FColor c) { return SDL_FColor{c.r, c.g, c.b, c.a * e}; };
+    auto ca = [&](SDL_Color c) { return SDL_Color{c.r, c.g, c.b, (Uint8)(c.a * e)}; };
+    auto tex = [&](SDL_Texture *t, const SDL_FRect *src, const SDL_FRect &d) {
+        SDL_SetTextureAlphaModFloat(t, e);
+        SDL_RenderTexture(r, t, src, &d);
+        SDL_SetTextureAlphaModFloat(t, 1);
+    };
     auto dim = [&](float a) {
-        SDL_SetRenderDrawColorFloat(r, 0, 0, 0, a);
+        SDL_SetRenderDrawColorFloat(r, 0, 0, 0, a * e);
         SDL_RenderFillRect(r, &top_r);
     };
-    switch (overlay) {
+    switch (shown) {
     case MAP: {
         const profile::MapArea *a = map_area();
         if (!a || !bottom) break;
@@ -909,14 +1035,14 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
         const float s = bottom->w / 320.0f;
         const SDL_FRect src{a->x * s, a->y * s, a->w * s, a->h * s};
         const float h = top_r.h * 0.84f, w = h * a->w / a->h;
-        const SDL_FRect d{top_r.x + (top_r.w - w) / 2, top_r.y + (top_r.h - h) / 2 + 6 * k, w, h};
-        rounded_rect(r, nullptr, {d.x - 4 * k, d.y - 4 * k, d.w + 8 * k, d.h + 8 * k}, 10 * k, {1, 0.98f, 0.92f, 1});
+        const SDL_FRect d{top_r.x + (top_r.w - w) / 2, top_r.y + (top_r.h - h) / 2 + (6 + (1 - e) * 10) * k, w, h};
+        rounded_rect(r, nullptr, {d.x - 4 * k, d.y - 4 * k, d.w + 8 * k, d.h + 8 * k}, 10 * k, fa({1, 0.98f, 0.92f, 1}));
         SDL_SetTextureBlendMode(bottom, SDL_BLENDMODE_BLEND);
         SDL_SetTextureScaleMode(bottom, SDL_SCALEMODE_LINEAR);
-        SDL_RenderTexture(r, bottom, &src, &d);
+        tex(bottom, &src, d);
         SDL_SetTextureBlendMode(bottom, SDL_BLENDMODE_NONE);
-        put_text(r, "Map", d.x, top_r.y + 2 * k, 13, white, true, 0, px);
-        put_text(r, "B  Close", d.x + d.w, top_r.y + 4 * k, 10, white, false, 2, px);
+        put_text(r, "Map", d.x, top_r.y + 2 * k, 13, ca(white), true, 0, px);
+        put_text(r, "B  Close", d.x + d.w, top_r.y + 4 * k, 10, ca(white), false, 2, px);
         break;
     }
     case HUB: {
@@ -924,17 +1050,17 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
         std::vector<int> v = offered_hub();
         constexpr int kCols = 3;
         const int rows = ((int)v.size() + kCols - 1) / kCols;
-        const float pw = 168 * k, ph = (62 + rows * 54) * k, x0 = top_r.x + 16 * k, y0 = top_r.y + (top_r.h - ph) / 2;
-        rounded_rect(r, nullptr, {x0 - 2 * k, y0 + 2 * k, pw + 4 * k, ph + 4 * k}, 20 * k, {0, 0, 0, 0.25f});
-        rounded_rect(r, nullptr, {x0, y0, pw, ph}, 18 * k, {0.99f, 0.97f, 0.91f, 0.98f});
-        put_text(r, clock_text(), x0 + pw / 2, y0 + 8 * k, 14, ink, true, 1, px);
+        const float pw = 168 * k, ph = (62 + rows * 54) * k, x0 = top_r.x + (16 - (1 - e) * 12) * k, y0 = top_r.y + (top_r.h - ph) / 2;
+        rounded_rect(r, nullptr, {x0 - 2 * k, y0 + 2 * k, pw + 4 * k, ph + 4 * k}, 20 * k, fa({0, 0, 0, 0.25f}));
+        rounded_rect(r, nullptr, {x0, y0, pw, ph}, 18 * k, fa({0.99f, 0.97f, 0.91f, 0.98f}));
+        put_text(r, clock_text(), x0 + pw / 2, y0 + 8 * k, 14, ca(ink), true, 1, px);
         for (size_t i = 0; i < v.size(); i++) {
             const profile::HubEntry &e = profile::hub()[v[i]];
             const float cx0 = x0 + 14 * k + (i % kCols) * 50 * k, cy0 = y0 + 40 * k + (i / kCols) * 54 * k;
             const bool sel = (int)i == hub_sel;
-            if (sel) rounded_rect(r, nullptr, {cx0 - 2 * k, cy0 - 2 * k, 50 * k, 54 * k}, 10 * k, {0.36f, 0.76f, 0.69f, 0.9f});
+            if (sel) rounded_rect(r, nullptr, {cx0 - 2 * k, cy0 - 2 * k, 50 * k, 54 * k}, 10 * k, fa({0.36f, 0.76f, 0.69f, 0.9f}));
             rounded_rect(r, nullptr, {cx0 + 5 * k, cy0 + 2 * k, 36 * k, 32 * k}, 9 * k,
-                         sel ? SDL_FColor{1, 1, 1, 1} : SDL_FColor{0.93f, 0.89f, 0.8f, 1});
+                         fa(sel ? SDL_FColor{1, 1, 1, 1} : SDL_FColor{0.93f, 0.89f, 0.8f, 1}));
             Icon *ic = (size_t)v[i] < hub_icons.size() ? &hub_icons[v[i]] : nullptr;
             if (ic && !ic->px.empty()) icon_tex(r, *ic);
             const profile::MapArea *ma = e.action == profile::HubEntry::MAP ? map_area() : nullptr;
@@ -950,23 +1076,23 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
                 const SDL_FRect src{ma->x * sc, ma->y * sc, ma->w * sc, ma->h * sc};
                 const SDL_FRect d{cx0 + 23 * k - iw / 2, cy0 + 4 * k, iw, ih};
                 SDL_SetTextureBlendMode(bottom, SDL_BLENDMODE_BLEND);
-                SDL_RenderTexture(r, bottom, &src, &d);
+                tex(bottom, &src, d);
                 SDL_SetTextureBlendMode(bottom, SDL_BLENDMODE_NONE);
             } else if (tool_icon) {
                 const SDL_FRect d{cx0 + 9 * k, cy0 + 2 * k, 28 * k, 28 * k};
-                SDL_RenderTexture(r, tool_icon, nullptr, &d);
+                tex(tool_icon, nullptr, d);
             } else if (ic && ic->tex) {
                 const float ih = 26 * k, iw = std::min(34 * k, ih * ic->w / std::max(1, ic->h));
                 const SDL_FRect d{cx0 + 23 * k - iw / 2, cy0 + 5 * k, iw, ih};
-                SDL_RenderTexture(r, ic->tex, nullptr, &d);
+                tex(ic->tex, nullptr, d);
             } else if (!e.glyph.empty()) {
-                put_text(r, e.glyph, cx0 + 23 * k, cy0 + 6 * k, 17, ink, false, 1, px);
+                put_text(r, e.glyph, cx0 + 23 * k, cy0 + 6 * k, 17, ca(ink), false, 1, px);
             } else {
-                put_text(r, e.label.substr(0, 1), cx0 + 23 * k, cy0 + 7 * k, 16, ink, true, 1, px);
+                put_text(r, e.label.substr(0, 1), cx0 + 23 * k, cy0 + 7 * k, 16, ca(ink), true, 1, px);
             }
-            put_text(r, e.label, cx0 + 23 * k, cy0 + 36 * k, 8.5f, sel ? white : ink, true, 1, px);
+            put_text(r, e.label, cx0 + 23 * k, cy0 + 36 * k, 8.5f, ca(sel ? white : ink), true, 1, px);
         }
-        put_text(r, "A  Open     B  Close", x0 + pw / 2, y0 + ph - 17 * k, 9, ink, false, 1, px);
+        put_text(r, "A  Open     B  Close", x0 + pw / 2, y0 + ph - 17 * k, 9, ca(ink), false, 1, px);
         break;
     }
     case TOOLS: {
@@ -975,27 +1101,28 @@ void draw(SDL_Renderer *r, SDL_Texture *bottom, float px) {
         if (v.empty()) break;
         dim(0.3f);
         const int n = (int)v.size();
-        const float cx0 = top_r.x + top_r.w / 2, cy0 = top_r.y + top_r.h / 2 - 6 * k, rad = n > 1 ? 70 * k : 0;
+        const float cx0 = top_r.x + top_r.w / 2, cy0 = top_r.y + top_r.h / 2 - 6 * k;
+        const float rad = (n > 1 ? 70 * k : 0) * (0.6f + 0.4f * e);  // (the ring opens out)
         for (int i = 0; i < n; i++) {
             const float a = (float)M_PI * 2 * i / n - (float)M_PI / 2;
             const bool sel = i == tool_sel;
-            const float s = (sel ? 44 : 34) * k, x = cx0 + std::cos(a) * rad, y = cy0 + std::sin(a) * rad;
+            const float s = (sel ? 44 : 34) * k * (0.8f + 0.2f * e), x = cx0 + std::cos(a) * rad, y = cy0 + std::sin(a) * rad;
             rounded_rect(r, nullptr, {x - s / 2 - 2 * k, y - s / 2 - 2 * k, s + 4 * k, s + 4 * k}, s / 2 + 2 * k,
-                         sel ? SDL_FColor{0.36f, 0.76f, 0.69f, 1} : SDL_FColor{0, 0, 0, 0.25f});
-            rounded_rect(r, nullptr, {x - s / 2, y - s / 2, s, s}, s / 2, {1, 0.98f, 0.93f, 1});
+                         fa(sel ? SDL_FColor{0.36f, 0.76f, 0.69f, 1} : SDL_FColor{0, 0, 0, 0.25f}));
+            rounded_rect(r, nullptr, {x - s / 2, y - s / 2, s, s}, s / 2, fa({1, 0.98f, 0.93f, 1}));
             if (v[i].slot < 0) {
-                put_text(r, "\xe2\x9c\x8b", x, y - 9 * k, 14, ink, false, 1, px);  // a raised hand: put away
+                put_text(r, "\xe2\x9c\x8b", x, y - 9 * k, 14, ca(ink), false, 1, px);  // a raised hand: put away
             } else if (SDL_Texture *t = item_icon(r, v[i].item)) {
-                const SDL_FRect d{x - s * 0.45f, y - s * 0.45f, s * 0.9f, s * 0.9f};
-                SDL_RenderTexture(r, t, nullptr, &d);
+                const SDL_FRect d{x - s * 0.4f, y - s * 0.4f, s * 0.8f, s * 0.8f};
+                tex(t, nullptr, d);
             } else {  // (not seen in the pockets yet)
-                put_text(r, item_name(v[i].item).substr(0, 1), x, y - 10 * k, 16, ink, true, 1, px);
+                put_text(r, item_name(v[i].item).substr(0, 1), x, y - 10 * k, 16, ca(ink), true, 1, px);
             }
         }
         const Tool &t = v[std::clamp(tool_sel, 0, n - 1)];
         const std::string name = t.slot < 0 ? "Put away" : item_name(t.item);
-        pill(r, name, cx0, n > 1 ? cy0 - 10 * k : cy0 + 30 * k, px, 1);  // in the ring, or under a lone tool
-        put_text(r, "A  Hold     B  Close", cx0, top_r.y + top_r.h - 20 * k, 10, white, false, 1, px);
+        pill(r, name, cx0, n > 1 ? cy0 - 10 * k : cy0 + 30 * k, px, e);  // in the ring, or under a lone tool
+        put_text(r, "A  Hold     B  Close", cx0, top_r.y + top_r.h - 20 * k, 10, ca(white), false, 1, px);
         break;
     }
     case NONE: break;

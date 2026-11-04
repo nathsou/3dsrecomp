@@ -418,8 +418,11 @@ static void write_ppm(const char *path, const u32 *px, int w, int h) {
 // profile, the rest is transparent). In one-screen play black is keyed out (a screen left black shows nothing, a
 // dialog's choices on it float): by the GPU in its display images (gpu::set_key_black_bottom; cheap, so the UI
 // thread keeps its timing), here for the guest framebuffer's 320x240 picture. Returns the picture to show.
+// In one-screen play a picture that suddenly covers the whole screen for a few frames is a page's transition (Animal
+// Crossing wipes its bottom screen with its menus' pattern as they open and close): it is not shown, the last
+// picture stays (nullptr: keep the texture as it is). One that stays is a page of its own.
 static const u32 *bottom_stats(const u32 *img, int w, int h) {
-    int cover = 0, opaque = 0, dark = 0, n = 0;
+    int cover = 0, opaque = 0, dark = 0, shade = 0, n = 0;
     for (int y = h / 60; y < h; y += h / 30)
         for (int x = w / 80; x < w; x += w / 40, n++) {
             const u32 p = img[(size_t)y * w + x], a = p >> 24;
@@ -427,7 +430,21 @@ static const u32 *bottom_stats(const u32 *img, int w, int h) {
             cover += a > 32;
             opaque += a > 240;
             dark += a > 32 && m < 12;
+            shade += a > 240 && m < 100;
         }
+    // the share of dark opaque samples (percent), for profiles: "value <name> = runtime bottom_dark" (a dialog's
+    // list of choices is a dark box on a light page)
+    profile::set_runtime("bottom_dark", n ? shade * 100 / n : 0);
+    constexpr int kWipeFrames = 14;  // (Animal Crossing's last 8)
+    static int full_run;             // pictures in a row covering the whole screen
+    static bool seen_partial;        // one that did not since one-screen play began
+    if (n && cover >= n * 98 / 100) {
+        full_run++;
+    } else {
+        full_run = 0;
+        seen_partial = true;
+    }
+    if (onescreen::active() && seen_partial && full_run > 0 && full_run < kWipeFrames) return nullptr;
     static std::vector<u32> keyed;
     if (onescreen::active() && n && dark > n * 6 / 10 && w <= 320) {  // (display images: keyed by the GPU)
         keyed.assign(img, img + (size_t)w * h);
@@ -463,7 +480,7 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hir
             hh = h;
         }
         if (screen == 1) img = bottom_stats(img, w, h);
-        SDL_UpdateTexture(hires, nullptr, img, w * 4);
+        if (img) SDL_UpdateTexture(hires, nullptr, img, w * 4);
     });
     static u32 last_fb;
     if (screen == 0 && (ver ? ver != shown[0] : f.addr_left != last_fb)) game_frames++;  // a new image: the game's fps
@@ -472,7 +489,7 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hir
     if (ver) return hires;
     convert_fb(f, width, buf);
     const u32 *pic = screen == 1 ? bottom_stats(buf, width, 240) : buf;  // (opaque: no alpha in guest memory)
-    SDL_UpdateTexture(native, nullptr, pic, width * 4);
+    if (pic) SDL_UpdateTexture(native, nullptr, pic, width * 4);
     return native;
 }
 
@@ -658,8 +675,13 @@ static void place_screens() {
         return SDL_FRect{area.x + (area.w - sw * k) / 2, area.y + (area.h - 240 * k) / 2, sw * k, 240 * k};
     };
     // the profile's panel: the bottom screen over the top one, when it shows something
-    const bool want_panel = auto_focus() == profile::FOCUS_PANEL && !manual_flip && bottom_cover > 0.01f &&
-                            !onescreen::busy();
+    // (wanted a few frames in a row first: the picture of a page that is still coming up is not shown)
+    constexpr int kPanelDelay = 4;
+    static int wanted;
+    wanted = auto_focus() == profile::FOCUS_PANEL && !manual_flip && bottom_cover > 0.01f && !onescreen::busy()
+                 ? wanted + 1
+                 : 0;
+    const bool want_panel = wanted >= kPanelDelay || (panel_anim > 0 && wanted > 0);
     panel_anim = std::clamp(panel_anim + (want_panel ? 0.2f : -0.25f), 0.0f, 1.0f);
     if (auto_focus() == profile::FOCUS_PANEL || (profile::onescreen() && !manual_flip)) {
         placement.top = fit(0);

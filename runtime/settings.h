@@ -31,7 +31,7 @@ struct Settings {
     bool auto_focus = true;   // the game's profile picks the screen (e.g. the bottom one on world maps)
     int hud = 1;              // the profile's HUD over the top screen: 0 off, 1 when the bottom screen is hidden, 2 always
     int tex_filter = 0;       // texture upscaling (gpu::texture_filter_name)
-    bool stack_items = false;  // stacks in the pockets, for games whose profile has them (runtime/stacks.mm)
+    bool stack_items = true;   // stacks in the pockets, for games whose profile has them (runtime/stacks.mm)
 };
 
 extern Settings g_settings;

@@ -36,6 +36,8 @@ bool click(float x, float y);
 
 // a new bottom-screen picture (RGBA, w x h at the internal scale): the hub's icons are kept from it
 void bottom_image(const u32 *img, int w, int h);
+// the bottom screen's opacity at a pocket's centre ("tools slots") in its latest picture, 0..1
+float pocket_alpha(int slot);
 
 // over the top screen (after the panel): the overlays, the pointer
 void draw(SDL_Renderer *r, SDL_Texture *bottom, float px);  // px: window pixels per render unit
