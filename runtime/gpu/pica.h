@@ -498,9 +498,11 @@ void metal_poll();
 bool metal_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width, u32 out_gap);
 bool metal_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
 bool metal_surface_for(u32 addr, u32 w, u32 h, u32 fmt);
-// a command list starts / ended: its passes share one command buffer, committed at its end
-void metal_begin_list();
+// a command list ended: its passes share one command buffer, committed at its end
 void metal_end_list();
+// frames (VBlanks) so far: guest memory the GPU caches (decoded textures, render targets) is hashed again at most once
+// per frame unless a write to it is reported (gpu::vblank)
+extern std::atomic<u64> g_frame;
 // try to run a display transfer from a render target asynchronously (true: taken care of)
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size);
 // the display transfer's pixel conversion (src/dst: first input / output byte)

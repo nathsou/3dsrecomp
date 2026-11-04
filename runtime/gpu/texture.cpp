@@ -142,7 +142,11 @@ void invalidate_memory(u32 paddr, u32 size) {
 void texcache_new_epoch() {
     if (g_trace) LOG("gpu trace: texture cache %zu entries, %zu KiB decoded\n", cache.size(), total_bytes >> 10);
     use_counter++;
-    if (!trust_invalidations) epoch++;
+    static u64 last_frame;
+    if (!trust_invalidations && last_frame != g_frame.load(std::memory_order_relaxed)) {  // (once per frame)
+        last_frame = g_frame.load(std::memory_order_relaxed);
+        epoch++;
+    }
     texcache_trim();
 }
 

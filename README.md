@@ -387,7 +387,9 @@ constants by the recompiler. `tools/disasm.py` shows module code at slot address
   In auto mode the scale is also lowered, one step at a time, when the game drops frames (its frame rate is
   neither ~60 nor a steady ~30) while the GPU is busy over half the time, and raised again when the next scale
   should fit; heavy games (Metroid: Samus Returns) settle at 2x on an M4 Pro, others keep 4x.
-- `GPU_MSAA=1|2|4|8`: multisample anti-aliasing of the Metal render targets (default 4).
+- `GPU_MSAA=1|2|4|8`: multisample anti-aliasing of the Metal render targets (default 4). The samples live in tile
+  memory only: each pass resolves them and the next restores them from the resolved image (`GPU_MSAA_STORED=1`
+  keeps every sample in memory between passes instead, slower at high scales).
 - `GPU_ANISO=1..16`: anisotropic filtering of the textures the game filters linearly with mipmaps (default 16).
 - `GPU_TEX_FILTER=0|1|2`: texture upscaling (default 0, off; `gpu::set_texture_filter` at run time). 1 (Sharp)
   is an edge-directed 2x pass in the spirit of xBR, applied twice for 4x: hard steps stay crisp, diagonal and
@@ -434,7 +436,8 @@ keep the Metal compiler out of gameplay:
   (which fixed-function modes a draw uses), no game code or data.
 - Diagnostics: `GPU_HITCH_MS=<ms>` logs command lists slower than that; `GPU_VERIFY_KEYS=1` checks that every
   new pipeline key decodes back to the same shader; `GPU_NO_METALLIB=1` ignores the precompiled library;
-  `GPU_NO_PRECOMPILE=1 GPU_SYNC_SHADERS=1` turns all of this off for comparisons.
+  `GPU_NO_PRECOMPILE=1 GPU_SYNC_SHADERS=1` turns all of this off for comparisons; `GPU_LABELS=1` labels the Metal
+  encoders (what each does, to which guest memory) for Instruments' Metal System Trace and GPU captures.
 
 ## Debugging aids
 

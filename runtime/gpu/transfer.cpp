@@ -3,6 +3,19 @@
 
 namespace gpu {
 
+// the n-byte pattern repeated over the first len bytes of s (len rounded down to whole patterns): written once, then
+// copied over twice the length each time
+static void fill_pattern(u8 *s, u32 len, const u8 *pattern, u32 n) {
+    len -= len % n;
+    if (!len) return;
+    memcpy(s, pattern, n);
+    for (u32 done = n; done < len;) {
+        const u32 k = std::min(done, len - done);
+        memcpy(s + done, s, k);
+        done += k;
+    }
+}
+
 void memory_fill(u32 start, u32 end, u32 value, u32 control) {
     if (!(control & 1)) return;
     ensure_init();
@@ -15,18 +28,8 @@ void memory_fill(u32 start, u32 end, u32 value, u32 control) {
     }
     const u32 len = end - start;
     metal_guest_prewrite(start, len);
-    if (control & 0x100) {
-        for (u32 i = 0; i + 3 <= len; i += 3) {
-            s[i] = value;
-            s[i + 1] = value >> 8;
-            s[i + 2] = value >> 16;
-        }
-    } else if (control & 0x200) {
-        for (u32 i = 0; i + 4 <= len; i += 4) memcpy(s + i, &value, 4);
-    } else {
-        const u16 v = (u16)value;
-        for (u32 i = 0; i + 2 <= len; i += 2) memcpy(s + i, &v, 2);
-    }
+    const u8 pattern[4] = {(u8)value, (u8)(value >> 8), (u8)(value >> 16), (u8)(value >> 24)};  // little-endian
+    fill_pattern(s, len, pattern, control & 0x100 ? 3 : control & 0x200 ? 4 : 2);  // 24, 32 or 16-bit
     texcache_invalidate(start, len);
     metal_guest_written(start, len);
 }

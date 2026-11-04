@@ -10,6 +10,8 @@ namespace gpu {
 
 GpuState g;
 bool g_stats = false, g_trace = false;
+std::atomic<u64> g_frame{1};
+void vblank() { g_frame.fetch_add(1, std::memory_order_relaxed); }
 double g_t_shade = 0, g_t_setup = 0, g_t_flush = 0;
 double now_ms() {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -551,7 +553,6 @@ void process_command_list(u32 paddr, u32 size_bytes) {
     g.ds_version = 0;
     static const double hitch_ms = getenv("GPU_HITCH_MS") ? atof(getenv("GPU_HITCH_MS")) : 0;
     const double t0 = g_stats || hitch_ms ? now_ms() : 0;
-    metal_begin_list();
     cmd_run(paddr, size_bytes);
     raster_flush();
     metal_end_list();
