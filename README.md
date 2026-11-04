@@ -279,10 +279,11 @@ bottom screen never shows as such: the game plays like a single-screen Animal Cr
 - Tab, the right stick's click and the touch controls' swap button open the hub too (on iOS the hub's entries
   and the menus are tapped).
 
-**Stacks in the pockets** (the menu's "Stack items", in any layout, off by default): as in New Horizons, several of
+**Stacks in the pockets** (the menu's "Stack items", in any layout, on by default): as in New Horizons, several of
 the same item share one pocket, with the count on it: flowers, seed bags, saplings, shrub starts, shells,
-mushrooms, wrapping paper, pitfall seeds, fertilizer, candy, lollipops, fortune cookies and coffee beans up to 10,
-nuggets and gems up to 30 (fruit and stationery already stack in the game). An item picked up joins its stack, even
+mushrooms, wrapping paper, pitfall seeds, fertilizer, candy, lollipops, fortune cookies, coffee beans, cooking
+ingredients, medicine and chocolates up to 10, nuggets and gems up to 30, as in New Horizons (fruit, stationery,
+turnips and Bells already stack in the game; tools, clothes, furniture, fish and bugs stack in neither). An item picked up joins its stack, even
 with the pockets full (standing on it, its stack makes room); one dropped, sold, given or planted from a stack is
 replaced by the next as soon as the player is free again (the pockets, a dialog or a shop's screen closed). Talking
 to someone (a shop's counter, a villager) lays the stacks out in free pockets for the conversation, one pocket left
