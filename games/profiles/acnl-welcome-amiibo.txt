@@ -7,6 +7,7 @@
 # the classes whose objects the profile recognises (their vtable pointers)
 symbol BsMenuMap = vtable BsMenuMap             # the field's map page on the bottom screen
 symbol BsMenuItem = vtable BsMenuItem           # the pockets
+symbol BsMenuItemSelect = vtable BsMenuItemSelect   # the pockets as a shop's counter shows them (what to sell)
 symbol BsTitle = vtable BsTitle                 # the title screen (in a CRO module)
 # globals and functions, reached from the classes' code
 symbol skb_instance = vtable BsSkb slot 3 global 2          # the keyboard's instance (set while it is up)
@@ -18,6 +19,7 @@ symbol hold_handler = pockets_page + 0x30 > 0               # the pockets' "Hold
 symbol hold_request = hold_handler call 3                   # the request it makes: finds the player, changes tools
 symbol player = hold_handler call 0 global 0                # the current player's data
 symbol player_update = vtable AcPlayer slot 9               # AcPlayer's update
+symbol menu_pages = vtable BsMenuItem slot 7 call 0 global 0 + 4  # the open pockets-like page's holder (its +0xc)
 
 # The game's own keyboard (names, the town's name, letters, chat): BsSkb, whose instance is set while it is up.
 value skb = u32 skb_instance
@@ -113,11 +115,18 @@ tools hold hold_request on player_update
 # mushrooms, flowers, pitfall seeds, fertilizer, wrapping paper, candy, lollipops, fortune cookies and coffee beans
 # up to 10, nuggets and gems up to 30 (fruit and stationery count in the game already). Each player of each town
 # (ids next to their names in the player data) keeps their own; the pockets are tidied as the player's update runs,
-# while the player stands or walks (not in a dialog, a menu or a shop's screen).
+# while the player stands or walks (not in a dialog, a menu or a shop's screen). As a conversation starts (a shop's
+# counter, a villager) the stacks are laid out in free pockets, one left free for what it may give, so a whole stack
+# sells at once; the counts show on the shops' sell screen too (BsMenuItemSelect); with the pockets full, the stack
+# of the item the player stands on makes room for it.
 value player_id = u16 player > 0x55a6
 value town_id = u16 player > 0x55bc
 stack owner town_id player_id
 stack on player_update
 stack free 0x1a9 0x06 0x0d                     # AcPlayer's state: standing, walking (indoors too)
+stack spread 0x0f keep 1                        # ... talking (a shop's counter, a villager)
+stack underfoot 0x994                           # AcPlayer's item underfoot (its name shows over the player)
+value open_page = u32 menu_pages > 0xc > 0
+stack shown when open_page == BsMenuItemSelect
 stack kinds 0x36 0x37 0x38 0x3c 0x3e 0x40 0x41 0x46 0x49 0x52 0x53 0x5a 0x71 max 10
 stack kinds 0x42 0x43 max 30

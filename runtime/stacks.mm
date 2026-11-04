@@ -1,7 +1,10 @@
 // Stacks in the pockets (stacks.h). The game's thread tidies the pockets as it dispatches to the profile's address
-// while the player is free and the pockets are closed: a second pocket with an item that stacks joins the stack (its pocket empties), and a
-// stack's item that left the pockets (dropped, sold, given, planted, eaten) comes back from the stack into the
-// pocket it left. With the option off, the stacks empty into free pockets as room allows.
+// while the player is free and the pockets are closed: a second pocket with an item that stacks joins the stack (its
+// pocket empties), and a stack's item that left the pockets (dropped, sold, given, planted, eaten) comes back from
+// the stack into the pocket it left. With the pockets full, the stack of the item the player stands on gives up its
+// pocket so the game can pick the item up into it. As a conversation starts (a shop's counter, a villager), the extra
+// items are laid out in free pockets so the game's screens can take several, and they gather back afterwards. With
+// the option off, the stacks empty into free pockets as room allows.
 #include "stacks.h"
 
 #include <algorithm>
@@ -86,20 +89,31 @@ bool pockets_at(u32 &a) {
     return profile::value_now(profile::tools().pockets, v, &a);
 }
 
+u8 state_of(CPU *c) { return r8(c->r[0] + profile::stacks().free_off); }
+
+bool in(const std::vector<u8> &v, u8 x) { return std::find(v.begin(), v.end(), x) != v.end(); }
+
 // the player can move (no dialog, menu or shop screen, which show the pockets as they read them)
 bool player_free(CPU *c) {
     const profile::Stacks &s = profile::stacks();
     if (s.free_states.empty()) return profile::cond_now(profile::tools().ready_cond);
-    const u8 st = r8(c->r[0] + s.free_off);
-    return std::find(s.free_states.begin(), s.free_states.end(), st) != s.free_states.end();
+    return in(s.free_states, state_of(c));
 }
+
+bool laid_out;  // this conversation has laid the stacks out in free pockets
 
 void tidy(CPU *c) {
     const profile::Tools &t = profile::tools();
+    const profile::Stacks &s = profile::stacks();
     u32 pa;
-    // only while the player is free and the pockets are closed (the open pockets show what they read as they
-    // opened: a pocket changed behind them would not match)
-    if (!player_free(c) || profile::cond_now(t.open_cond) || !pockets_at(pa)) return;
+    // never while the pockets are open (they show what they read as they opened: a pocket changed behind them
+    // would not match)
+    if (profile::cond_now(t.open_cond) || !pockets_at(pa)) return;
+    const bool free = player_free(c);
+    // only while the player is free, or once as a conversation starts (before its screens read the pockets)
+    const bool lay_out = !free && !laid_out && g_settings.stack_items && in(s.spread_states, state_of(c));
+    if (free) laid_out = false;
+    if (!free && !lay_out) return;
     const std::string who = owner();
     if (who.empty()) return;
     std::lock_guard<std::mutex> g(m);
@@ -117,6 +131,35 @@ void tidy(CPU *c) {
             if ((p[i] & 0xffff) == t.empty) return i;
         return -1;
     };
+    if (lay_out) {
+        // a conversation starts: the extra items go to free pockets (but the last few, for what it may give), so a
+        // shop's screen can take a whole stack; they gather back once the player is free
+        laid_out = true;
+        int room = -s.spread_keep;
+        for (int i = 0; i < kSlots; i++) room += (p[i] & 0xffff) == t.empty;
+        for (auto it = mine.begin(); it != mine.end();) {
+            for (; it->second > 0 && room > 0; it->second--, room--) put(first_free(), it->first);
+            it = it->second > 0 ? std::next(it) : mine.erase(it);
+        }
+        return;
+    }
+    // the item the player stands on, when its stack (in the pockets, with room) could take it
+    const u32 under = s.underfoot_off && g_settings.stack_items ? r32(c->r[0] + s.underfoot_off) : t.empty;
+    auto has_room = [&](u32 item) {
+        const auto e = mine.find(item);
+        return max_of(item) > 1 + (e == mine.end() ? 0 : e->second);
+    };
+    // with the pockets full, its stack gives up its pocket while the player stands there: the game picks the item
+    // up into it, and it joins the stack (back in its pocket, one more)
+    if ((under & 0xffff) != t.empty && first_free() < 0 && has_room(under)) {
+        for (int i = 0; i < kSlots; i++) {
+            if (p[i] != under) continue;
+            where[under] = i;
+            mine[under]++;
+            put(i, t.empty);
+            break;
+        }
+    }
     // stacks whose item left the pockets: the next one comes back where it was (or to the first free pocket);
     // with the option off, the extra ones go to free pockets as room allows
     for (auto it = mine.begin(); it != mine.end();) {
@@ -124,6 +167,12 @@ void tidy(CPU *c) {
         int at = -1;
         for (int i = 0; i < kSlots && at < 0; i++)
             if (p[i] == item) at = i;
+        int frees = 0;
+        for (int i = 0; i < kSlots; i++) frees += (p[i] & 0xffff) == t.empty;
+        if (at < 0 && item == under && frees == 1) {  // (the room kept for the item stood on)
+            ++it;
+            continue;
+        }
         if (at < 0 || !g_settings.stack_items) {
             const auto w = where.find(item);
             int slot = at < 0 && w != where.end() && (p[w->second] & 0xffff) == t.empty ? w->second : first_free();
@@ -202,8 +251,9 @@ void save_written(const std::string &path) {
 
 void draw(SDL_Renderer *r, const SDL_FRect &d, float px, float alpha) {
     const profile::Tools &t = profile::tools();
-    if (profile::stacks().kinds.empty() || !d.w || alpha <= 0 || !profile::cond(t.open_cond) ||
-        (int)t.slots.size() < kSlots)
+    const profile::Stacks &st = profile::stacks();
+    if (st.kinds.empty() || !d.w || alpha <= 0 || (int)t.slots.size() < kSlots ||
+        !(profile::cond(t.open_cond) || (st.shown_cond >= 0 && profile::cond(st.shown_cond))))
         return;
     int n[kSlots];
     counts(n);

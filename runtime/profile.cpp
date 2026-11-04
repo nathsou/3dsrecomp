@@ -66,6 +66,9 @@
 //   stack owner <value> ...
 //   stack on <address>
 //   stack free <offset> <state> ...
+//   stack spread <state> ... keep <n>
+//   stack shown when <cond>
+//   stack underfoot <offset>
 //       Stacks in the pockets, as in Animal Crossing: New Horizons (an option in the menu): items of those
 //       categories (as "tools items" reads them) pile up to n in one pocket, the extra ones kept by the runtime
 //       for each owner (the values tell players and towns apart) and written next to the save whenever the game
@@ -73,7 +76,15 @@
 //       and the pockets are closed ("tools equip ... when-open ... ready"): a second pocket with the same item joins the first one's stack, and a stack's
 //       pocket that empties (the item dropped, sold, given, planted) gets the next one. With "stack free", the
 //       player is free while the byte at <offset> in the object called there (its first argument: the player) is
-//       one of the states (standing, walking: indoors too, where the ready condition may not tell).
+//       one of the states (standing, walking: indoors too, where the ready condition may not tell). With
+//       "stack spread", while that byte is one of these states (a conversation: a shop's counter, a villager), the
+//       stacks' extra items are laid out in free pockets as it starts, n of them left free for what the
+//       conversation may give, so the game's own screens can take several at once (all of a stack sold in one
+//       sale); they gather back into their stacks once the player is free. "stack shown" draws the counts while
+//       its condition holds too, for screens other than the pockets that show them in the same places. "stack
+//       underfoot" names where the player keeps the item it stands on (the 2 bytes at <offset>): with the pockets
+//       full, a stack of that item with room gives up its pocket while the player stands there, so the game picks
+//       the item up into it and it joins the stack (it goes back once the player steps off).
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -696,6 +707,36 @@ bool parse_line(const std::string &line, std::string &err) {
                 c.free_states.push_back((u8)v);
             }
             return true;
+        }
+        if (t[1] == "spread") {
+            const size_t k = std::find(t.begin(), t.end(), "keep") - t.begin();
+            s64 n;
+            if (k < 3 || k + 2 != t.size() || !num(t[k + 1], n) || n < 0) {
+                err = "expected 'stack spread <state> ... keep <n>'";
+                return false;
+            }
+            for (size_t i = 2; i < k; i++) {
+                if (!num(t[i], a)) {
+                    err = "expected a number";
+                    return false;
+                }
+                c.spread_states.push_back((u8)a);
+            }
+            c.spread_keep = (int)n;
+            return true;
+        }
+        if (t[1] == "underfoot") {
+            if (t.size() != 3 || !num(t[2], a)) {
+                err = "expected 'stack underfoot <offset>'";
+                return false;
+            }
+            c.underfoot_off = (u32)a;
+            return true;
+        }
+        if (t[1] == "shown") {
+            c.shown_cond = when(t, 2, err);
+            if (c.shown_cond < 0 && err.empty()) err = "expected 'stack shown when <cond>'";
+            return c.shown_cond >= 0;
         }
         if (t[1] == "kinds") {
             const size_t m = std::find(t.begin(), t.end(), "max") - t.begin();
