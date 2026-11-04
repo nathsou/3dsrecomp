@@ -40,6 +40,13 @@ and online play are not supported: the services report nothing there. The Europe
 0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
 American one has (its own addresses, and its keyboard's keys).
 
+**The Legend of Zelda: Ocarina of Time 3D** (EUR, `CTR-P-AQEP`, title 0004000000033600, a CIA) runs: the title
+screen and its attract scenes, file select, naming a file on the game's own keyboard, the opening (the Deku Tree,
+the nightmare, Navi's flight through Kokiri Forest) and Link's house with the touch-screen item and map panel, at
+full speed with music and sound (built with `-DGAME=oot3d` from `data/oot3d`). A real console's save loads
+(an adult Link inside Ganon's Castle, Master Quest offered on the title screen). It needed no change to the
+recompiler or the runtime.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
