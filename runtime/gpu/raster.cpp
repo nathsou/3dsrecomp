@@ -26,7 +26,22 @@ struct Batch {
     u32 tiles_x = 0, tiles_y = 0;
     std::vector<std::unique_ptr<DrawState>> states;
     std::vector<u32> active_tiles;
+    std::vector<std::pair<u32, u32>> tex;  // guest memory its draws sample (address, size)
 } batch;
+
+// Metal: batches of other render targets still open. A game that alternates between targets (the two eyes of a
+// stereoscopic frame, drawn object by object) gets one pass per target instead of one per switch: draws into
+// targets that share no memory are independent, so each target's draws stay in order and the batches are drawn
+// together when something needs them (raster_flush: any transfer, fill, cache flush or end of command list), or
+// when a target to draw into shares memory with another open one or with a texture an open batch samples.
+struct Parked {
+    RTConfig rt;
+    MBatch mb;
+    std::vector<std::unique_ptr<DrawState>> states;
+    std::vector<std::pair<u32, u32>> tex;
+};
+std::vector<Parked> parked;
+constexpr size_t kMaxParked = 8;
 
 struct TileBuf {
     u32 color[TILE * TILE];
@@ -189,13 +204,30 @@ static void rt_from_regs(RTConfig &rt) {
 
 static bool range_overlap(u32 a, u32 asz, u32 b, u32 bsz) { return a < b + bsz && b < a + asz; }
 
+static u32 color_bytes_of(const RTConfig &rt) { return rt.w * rt.h * color_bytes(rt.color_fmt & 7); }
+static u32 depth_bytes_of(const RTConfig &rt) { return rt.w * rt.h * depth_bytes(rt.depth_fmt); }
+
+// the target's colour or depth buffer overlaps [addr, addr + size)
+static bool rt_touches(const RTConfig &rt, u32 addr, u32 size) {
+    return (rt.color_addr && range_overlap(addr, size, rt.color_addr, color_bytes_of(rt))) ||
+           (rt.depth_addr && range_overlap(addr, size, rt.depth_addr, depth_bytes_of(rt)));
+}
+static bool rts_share_memory(const RTConfig &a, const RTConfig &b) {
+    return (b.color_addr && rt_touches(a, b.color_addr, color_bytes_of(b))) ||
+           (b.depth_addr && rt_touches(a, b.depth_addr, depth_bytes_of(b)));
+}
+static bool samples_rt(const std::vector<std::pair<u32, u32>> &tex, const RTConfig &rt) {
+    for (const auto &[a, n] : tex)
+        if (rt_touches(rt, a, n)) return true;
+    return false;
+}
+
+// an open batch draws into [addr, addr + size)
 static bool overlaps_rt(u32 addr, u32 size) {
+    for (const Parked &p : parked)
+        if (rt_touches(p.rt, addr, size)) return true;
     if (!batch.has_rt || !batch_nonempty()) return false;
-    const RTConfig &rt = batch.rt;
-    u32 cs = rt.w * rt.h * color_bytes(rt.color_fmt & 7);
-    u32 dsz = rt.w * rt.h * depth_bytes(rt.depth_fmt);
-    return (rt.color_addr && range_overlap(addr, size, rt.color_addr, cs)) ||
-           (rt.depth_addr && range_overlap(addr, size, rt.depth_addr, dsz));
+    return rt_touches(batch.rt, addr, size);
 }
 
 static void setup_texunit(DrawState &ds, u32 i) {
@@ -251,9 +283,17 @@ static void setup_texunit(DrawState &ds, u32 i) {
     for (u32 l = 0; l < levels; l++) total += texture_level_bytes(tu.w >> l, tu.h >> l, fmt);
     for (u32 f = 0; f < nfaces; f++)
         if (overlaps_rt(faddr[f], total)) raster_flush();
-    for (u32 f = 0; f < nfaces; f++) {
-        metal_guest_read(faddr[f], total);  // render-to-texture: GPU-only data to guest first
-        tu.face[f] = texcache_get(faddr[f], tu.w, tu.h, fmt, levels);
+    if (use_metal)
+        for (u32 f = 0; f < nfaces; f++) batch.tex.emplace_back(faddr[f], total);
+    if (use_metal && nfaces == 1 && levels == 1 && (tu.type == 0 || tu.type == 3) && metal_surface_for(addr, tu.w, tu.h, fmt)) {
+        tu.surf = true;  // render-to-texture: sampled where the GPU holds it
+        tu.surf_addr = addr;
+        tu.surf_fmt = (u8)fmt;
+    } else {
+        for (u32 f = 0; f < nfaces; f++) {
+            metal_guest_read(faddr[f], total);  // render-to-texture: GPU-only data to guest first
+            tu.face[f] = texcache_get(faddr[f], tu.w, tu.h, fmt, levels);
+        }
     }
     auto simple = [](u32 m) { return m == 0 || m == 2 || m == 6 || m == 7; };
     const bool pow2 = (tu.w & (tu.w - 1)) == 0 && (tu.h & (tu.h - 1)) == 0;
@@ -535,11 +575,41 @@ void build_draw_state(DrawState &ds) {
     ds.attr_groups = ag;
 }
 
+// Metal: switching to another render target keeps the current batch open (parked) unless the new target shares
+// memory with an open batch's target or with a texture one samples; a parked batch of the new target resumes.
+static void switch_target(const RTConfig &rt) {
+    vtx_finish_jobs();  // CPU-shaded draws still to add belong to the current target
+    bool conflict = batch_nonempty() && (rts_share_memory(rt, batch.rt) || samples_rt(batch.tex, rt));
+    for (const Parked &p : parked)
+        if ((!(p.rt == rt) && rts_share_memory(rt, p.rt)) || samples_rt(p.tex, rt)) conflict = true;
+    if (conflict || (batch_nonempty() && parked.size() >= kMaxParked)) {
+        raster_flush();
+    } else if (batch_nonempty()) {
+        parked.push_back({batch.rt, std::move(batch.mb), std::move(batch.states), std::move(batch.tex)});
+        batch.mb.clear();
+        batch.states.clear();
+        batch.tex.clear();
+    }
+    for (size_t i = 0; i < parked.size(); i++)
+        if (parked[i].rt == rt) {
+            batch.mb = std::move(parked[i].mb);
+            batch.states = std::move(parked[i].states);
+            batch.tex = std::move(parked[i].tex);
+            parked.erase(parked.begin() + i);
+            break;
+        }
+}
+
 DrawState *draw_state() {
     if (g.ds && g.ds_version == g.regs_version) return g.ds;
     RTConfig rt;
     rt_from_regs(rt);
-    if (batch.has_rt && !(rt == batch.rt) && batch_nonempty()) raster_flush();
+    if (batch.has_rt && !(rt == batch.rt)) {
+        if (use_metal)
+            switch_target(rt);
+        else if (batch_nonempty())
+            raster_flush();
+    }
     if (!batch.has_rt || !(rt == batch.rt)) {
         batch.rt = rt;
         batch.has_rt = true;
@@ -1488,6 +1558,13 @@ void process_tile(u32 item, u32 tid) {
 
 void raster_flush() {
     vtx_finish_jobs();
+    for (Parked &p : parked) {
+        metal_flush(p.rt, p.mb);
+        if (p.rt.color_addr) texcache_invalidate(p.rt.color_addr, color_bytes_of(p.rt));
+        if (p.rt.depth_addr) texcache_invalidate(p.rt.depth_addr, depth_bytes_of(p.rt));
+    }
+    parked.clear();
+    batch.tex.clear();
     if (!batch.mb.empty()) {
         const double tf = g_stats ? now_ms() : 0;
         metal_flush(batch.rt, batch.mb);

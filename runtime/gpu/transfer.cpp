@@ -102,6 +102,7 @@ void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u3
         LOG("gpu: bad display transfer %08x -> %08x\n", in_paddr, out_paddr);
         return;
     }
+    if (metal_gpu_transfer(in_paddr, out_paddr, in_dims, out_dims, flags)) return;
     const u32 hs = scaling != 0 ? 1 : 0, vs = scaling == 2 ? 1 : 0;
     const u32 out_w = out_w0 >> hs, out_h = out_h0 >> vs;
     // from a render target the GPU is still drawing: finished asynchronously
@@ -135,6 +136,7 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     const u32 out_width = out_gap == 0 ? remaining : (out_width_gap & 0xffff) * 16;
     if (!in_width || !out_width) return;
     const u32 out_total = size / out_width * (out_width + out_gap) + out_width;
+    if (metal_texture_copy(in_paddr, out_paddr, remaining, in_width, in_gap, out_width, out_gap)) return;
     metal_guest_read(in_paddr, size / in_width * (in_width + in_gap) + in_width);
     const bool from_gpu = metal_gpu_made(in_paddr, size / in_width * (in_width + in_gap) + in_width);
     metal_guest_prewrite(out_paddr, out_total);

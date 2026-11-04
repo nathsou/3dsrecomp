@@ -189,6 +189,10 @@ struct TexUnitState {
     bool fast_wrap = false;  // both wrap modes are clamp-to-edge or repeat, power-of-two size
     bool simple2d = false;   // 2D, no LOD needed, fast wrap: sample_simple2d() applies
     float mag_rho2 = 0;      // rho^2 below this certainly gives lod <= 0 (magnification)
+    // Metal: sampled from the GPU's copy of the image at surf_addr (format surf_fmt), newer than guest memory (no face)
+    bool surf = false;
+    u8 surf_fmt = 0;
+    u32 surf_addr = 0;
 };
 u32 sample_simple2d(const TexUnitState &tu, float u, float v);
 
@@ -488,6 +492,15 @@ void metal_guest_prewrite(u32 paddr, u32 size);
 void metal_writeback_all();
 // finish deferred work whose GPU part completed (called at the start of GPU operations)
 void metal_poll();
+// GPU copies of guest images (render-to-texture without going through guest memory): a texture copy or a tiled-to-tiled
+// display transfer from an image the GPU holds newer contents of, done on the GPU (true: taken care of); whether the
+// GPU holds the w x h texture (formats 0-4) at addr, newer than guest memory (draws then sample it there)
+bool metal_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width, u32 out_gap);
+bool metal_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+bool metal_surface_for(u32 addr, u32 w, u32 h, u32 fmt);
+// a command list starts / ended: its passes share one command buffer, committed at its end
+void metal_begin_list();
+void metal_end_list();
 // try to run a display transfer from a render target asynchronously (true: taken care of)
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size);
 // the display transfer's pixel conversion (src/dst: first input / output byte)

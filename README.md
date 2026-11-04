@@ -354,7 +354,11 @@ with the directives that use it left out.
     as one dispatch per kernel per batch of draws; clipping,
     culling and snapping happen in a shared vertex shader, and the fragment pipeline (TEV combiners, fragment
     lighting, fog, tests, blending) becomes MSL generated per pipeline state, rendering at an internal resolution
-    scale with guest memory kept authoritative by lazy write-back. Geometry shaders, immediate-mode vertices and
+    scale with guest memory kept authoritative by lazy write-back. Draws into different render targets stay
+    batched while the targets share no memory (a game alternating between two targets object by object gets one
+    pass per target), a command list's passes share one command buffer, and texture copies and tiled-to-tiled
+    transfers of what the GPU drew (post-processing chains) run on the GPU, with draws sampling their results
+    there. Geometry shaders, immediate-mode vertices and
     vertex programs still compiling run in the CPU interpreter (pre-decoded, 4-wide SIMD).
   - `audio/`: HLE of the DSP audio firmware, output through SDL3.
   - `frontend.cpp`: SDL3 window, input, VBlank pacing.
