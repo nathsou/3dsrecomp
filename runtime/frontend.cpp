@@ -1623,9 +1623,12 @@ void frontend_run() {
                     const double span = stats ? 2 : 30;
                     u64 lists = kernel::gx_stats.cmdlists, ns = kernel::gx_stats.gpu_ns;
                     u64 xf = kernel::gx_stats.transfers;
-                    LOG("[stats] %llu vblanks/%.0fs, %llu cmdlists, %llu display transfers, gpu %.1f ms/s\n",
-                        (unsigned long long)(frame_count - last_frames), span, (unsigned long long)(lists - last_lists),
-                        (unsigned long long)(xf - last_xfers), (ns - last_ns) / (span * 1e6));
+                    static u64 last_games;
+                    LOG("[stats] %llu vblanks/%.0fs, %llu game frames, %llu cmdlists, %llu display transfers, gpu %.1f ms/s\n",
+                        (unsigned long long)(frame_count - last_frames), span, (unsigned long long)(game_frames - last_games),
+                        (unsigned long long)(lists - last_lists), (unsigned long long)(xf - last_xfers),
+                        (ns - last_ns) / (span * 1e6));
+                    last_games = game_frames;
                     last_xfers = xf;
                     last_frames = frame_count;
                     last_lists = lists;

@@ -40,6 +40,16 @@ and online play are not supported: the services report nothing there. The Europe
 0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
 American one has (its own addresses, and its keyboard's keys).
 
+**Mario Kart 7** (EUR, `CTR-P-AMKP`, title 0004000000030700, extracted from its CIA with your console's keys, see
+below) runs: the title screen, the menus with their Mobiclip previews (converted by the `y2r` service), Grand Prix,
+Time Trials and battles with every course and arena, at full speed with music and sound (built with `-DGAME=mk7` from
+`data/mk7`; on an M4 Pro races keep the 4x resolution). It needs a Mii in Mii Maker before it starts: the runtime
+gives the console one, the Mii selector's standard Mii, in Mii Maker's database (`CFL_DB.dat` in shared extdata
+F000000B, made when it is missing), so the game's own Mii character is that Mii; its face needs the Mii data system
+archive, as in Tomodachi Life. A save from a real console (`system0.dat`, `system1.dat` and `replay/`, copied into
+the save folder) keeps its unlocked cups, characters and parts. Online play, StreetPass, SpotPass, local multiplayer
+and the Mario Kart Channel's communities are not supported.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
