@@ -92,6 +92,7 @@ FramebufferInfo gsp_framebuffer(int screen) {
 void gsp_frame_boundary();
 void gsp_vblank() {
     gsp_frame_boundary();
+    gpu::vblank();
     Lock lk(kmutex);
     update_framebuffer(0);
     update_framebuffer(1);

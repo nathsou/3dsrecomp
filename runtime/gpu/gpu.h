@@ -29,10 +29,12 @@ void flush();
 // Tell the GPU that guest memory was modified by the CPU or by DMA (e.g. on GSP FlushDataCache /
 // RequestDma), so cached decoded textures in that range are re-validated.
 void invalidate_memory(u32 paddr, u32 size);
-// By default every command list re-validates (hashes) the textures it uses, which is safe even
-// if CPU writes are never reported. Once invalidate_memory() is called for all CPU/DMA writes
-// that the GPU may read, pass true here to skip that hashing.
+// By default the textures and render targets the GPU uses are re-validated (hashed) once per frame, which is safe
+// even if CPU writes are never reported. Once invalidate_memory() is called for all CPU/DMA writes
+// that the GPU may read, pass true here to skip that hashing for textures.
 void set_trust_invalidations(bool trust);
+// A VBlank: a new frame (the epoch of that re-validation).
+void vblank();
 // Save / restore the GPU's internal state (registers, shader code and uniforms, LUTs, ...).
 // A dump tool should call save_state() whenever it snapshots guest memory, so that a replay can
 // start from the exact same state (command lists rely on registers set by earlier lists).

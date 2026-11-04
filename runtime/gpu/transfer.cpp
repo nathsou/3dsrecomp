@@ -3,6 +3,19 @@
 
 namespace gpu {
 
+// the n-byte pattern repeated over the first len bytes of s (len rounded down to whole patterns): written once, then
+// copied over twice the length each time
+static void fill_pattern(u8 *s, u32 len, const u8 *pattern, u32 n) {
+    len -= len % n;
+    if (!len) return;
+    memcpy(s, pattern, n);
+    for (u32 done = n; done < len;) {
+        const u32 k = std::min(done, len - done);
+        memcpy(s + done, s, k);
+        done += k;
+    }
+}
+
 void memory_fill(u32 start, u32 end, u32 value, u32 control) {
     if (!(control & 1)) return;
     ensure_init();
@@ -15,18 +28,8 @@ void memory_fill(u32 start, u32 end, u32 value, u32 control) {
     }
     const u32 len = end - start;
     metal_guest_prewrite(start, len);
-    if (control & 0x100) {
-        for (u32 i = 0; i + 3 <= len; i += 3) {
-            s[i] = value;
-            s[i + 1] = value >> 8;
-            s[i + 2] = value >> 16;
-        }
-    } else if (control & 0x200) {
-        for (u32 i = 0; i + 4 <= len; i += 4) memcpy(s + i, &value, 4);
-    } else {
-        const u16 v = (u16)value;
-        for (u32 i = 0; i + 2 <= len; i += 2) memcpy(s + i, &v, 2);
-    }
+    const u8 pattern[4] = {(u8)value, (u8)(value >> 8), (u8)(value >> 16), (u8)(value >> 24)};  // little-endian
+    fill_pattern(s, len, pattern, control & 0x100 ? 3 : control & 0x200 ? 4 : 2);  // 24, 32 or 16-bit
     texcache_invalidate(start, len);
     metal_guest_written(start, len);
 }
@@ -102,6 +105,7 @@ void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u3
         LOG("gpu: bad display transfer %08x -> %08x\n", in_paddr, out_paddr);
         return;
     }
+    if (metal_gpu_transfer(in_paddr, out_paddr, in_dims, out_dims, flags)) return;
     const u32 hs = scaling != 0 ? 1 : 0, vs = scaling == 2 ? 1 : 0;
     const u32 out_w = out_w0 >> hs, out_h = out_h0 >> vs;
     // from a render target the GPU is still drawing: finished asynchronously
@@ -135,6 +139,7 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     const u32 out_width = out_gap == 0 ? remaining : (out_width_gap & 0xffff) * 16;
     if (!in_width || !out_width) return;
     const u32 out_total = size / out_width * (out_width + out_gap) + out_width;
+    if (metal_texture_copy(in_paddr, out_paddr, remaining, in_width, in_gap, out_width, out_gap)) return;
     metal_guest_read(in_paddr, size / in_width * (in_width + in_gap) + in_width);
     const bool from_gpu = metal_gpu_made(in_paddr, size / in_width * (in_width + in_gap) + in_width);
     metal_guest_prewrite(out_paddr, out_total);
