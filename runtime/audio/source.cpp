@@ -274,13 +274,19 @@ void Source::generate() {
     st.filters.process(frame);
 }
 
-SourceStatus Source::tick(SourceConfig &cfg, const s16 coeffs[16]) {
+SourceStatus Source::tick(SourceConfig &cfg, const s16 coeffs[16], bool status_unread) {
     parse_config(cfg, coeffs);
     if (st.enabled) generate();
 
     SourceStatus s;
     s.is_enabled = st.enabled;
-    s.current_buffer_id_dirty = st.buffer_update ? 1 : 0;
+    // The status overwrites the previous frame's. When the application is late and has not read that one,
+    // its buffer change must not be lost: the application retires the buffers it gave the DSP only on a
+    // change, so a lost "queue ran dry" (current 0, last played) leaves them queued for good (Hey! Pikmin's
+    // stream player then recycles one still in the voice's list, which loops the list).
+    const bool update = st.buffer_update || (status_unread && st.reported_update);
+    s.current_buffer_id_dirty = update ? 1 : 0;
+    st.reported_update = update;
     st.buffer_update = false;
     s.sync_count = st.sync_count;
     s.buffer_position.set(st.pos);
