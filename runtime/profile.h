@@ -89,6 +89,10 @@ struct Stacks {
     u32 on = 0;                   // the game's thread tidies the pockets as it dispatches here (an indirect call)
     u32 free_off = 0;             // the player is free while this byte of the object called at "on" (r0)...
     std::vector<u8> free_states;  // ...is one of these (none: while the tools' ready condition holds)
+    std::vector<u8> spread_states;  // in these states (a conversation) the extra items spread into free pockets...
+    int spread_keep = 1;            // ...leaving this many free
+    int shown_cond = -1;            // the counts are drawn while this holds too (screens that show the pockets)
+    u32 underfoot_off = 0;          // the item the player stands on, at this offset in the player (0: none)
 };
 
 // aiming with a stick and the mouse through the game's own data (runtime/aim.cpp)

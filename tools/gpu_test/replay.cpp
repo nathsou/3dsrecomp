@@ -136,6 +136,7 @@ int main(int argc, char **argv) {
     }
     // extra warm-up iterations (without output) to measure steady-state cost
     for (int it = 1; it < repeat; it++) {
+        gpu::vblank();  // (each iteration a frame: what the GPU caches is re-validated as in a game)
         auto t0 = std::chrono::steady_clock::now();
         double per[4] = {0, 0, 0, 0};  // cmdlist, fill, transfer, copy
         for (auto &l : lines) {
@@ -152,6 +153,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "iteration %d: %.2f ms (cmdlists %.2f, fills %.2f, transfers %.2f, copies %.2f)\n", it,
                 std::chrono::duration<double, std::milli>(t1 - t0).count(), per[0], per[1], per[2], per[3]);
     }
+    gpu::vblank();
     char line[512];
     int presents = 0, transfers = 0;
     double gpu_ms = 0;

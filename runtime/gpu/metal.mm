@@ -2,8 +2,9 @@
 // fog, alpha / stencil / depth tests, blending, logic ops) run on the GPU at an internal resolution
 // scale (changeable while running), optionally multisampled. Vertex programs run as compute kernels;
 // clipping, culling and snapping in the shared vertex shader. Guest memory stays authoritative: render targets are synchronised with it
-// (hash-checked) before drawing and colour is written back (downsampled to 1x, PICA tiled format)
-// after every batch; depth / stencil are written back lazily when a GPU operation reads them.
+// (hash-checked, once per command list) before drawing, and written back (downsampled to 1x, PICA tiled format)
+// lazily, when a GPU operation reads them. Texture copies and tiled-to-tiled transfers of render targets, and
+// draws sampling the results, stay on the GPU. A command list's passes share one command buffer.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <mach-o/dyld.h>
@@ -259,24 +260,6 @@ static inline void vs_output(constant VsParams &P, thread float4 *o, device floa
 const char *kKernelsMSL = R"(
 #include <metal_stdlib>
 using namespace metal;
-// p: w, h (1x), scale
-kernel void k_down(texture2d<float, access::read> src [[texture(0)]], device uint *dst [[buffer(0)]],
-                   constant uint4 &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.x || gid.y >= p.y) return;
-    const uint s = p.z;
-    uint4 acc = uint4(0);
-    for (uint j = 0; j < s; j++)
-        for (uint i = 0; i < s; i++) acc += uint4(round(src.read(uint2(gid.x * s + i, gid.y * s + j)) * 255.0));
-    const uint n = s * s;
-    acc = (acc + n / 2) / n;
-    dst[gid.y * p.x + gid.x] = acc.r | (acc.g << 8) | (acc.b << 16) | (acc.a << 24);
-}
-kernel void k_up(device const uint *src [[buffer(0)]], texture2d<float, access::write> dst [[texture(0)]],
-                 constant uint4 &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
-    if (gid.x >= p.x * p.z || gid.y >= p.y * p.z) return;
-    const uint c = src[(gid.y / p.z) * p.x + gid.x / p.z];
-    dst.write(float4(c & 255u, (c >> 8) & 255u, (c >> 16) & 255u, c >> 24) / 255.0, gid);
-}
 // MSAA: fill a multisampled target from its resolved (single-sample) copy, every sample alike
 struct RVOut { float4 pos [[position]]; };
 vertex RVOut k_full(uint vid [[vertex_id]]) {
@@ -310,6 +293,128 @@ kernel void k_rot(texture2d<float, access::read> src [[texture(0)]], device uint
     }
     dst[gid.y * p.y + gid.x] = b.r | (b.g << 8) | (b.b << 16) | (a << 24);
 }
+// Guest memory formats, as gpu.cpp and transfer.cpp handle them on the CPU (bit for bit): pixel formats 0 RGBA8,
+// 1 RGB8, 2 RGB565, 3 RGB5A1, 4 RGBA4; depth formats 0 D16, 2 D24, 3 D24S8; tiled images in 8x8 tiles, Morton order.
+inline uint g_bpp(uint f) { return f == 0 ? 4u : f == 1 ? 3u : 2u; }
+inline uint g_dbpp(uint f) { return f == 0 ? 2u : f == 2 ? 3u : 4u; }
+inline uint g_tiled(uint x, uint y, uint w, uint bpp) {
+    const uint m = (x & 1) | ((y & 1) << 1) | ((x & 2) << 1) | ((y & 2) << 2) | ((x & 4) << 2) | ((y & 4) << 3);
+    return ((y & ~7u) * w + (x & ~7u) * 8 + m) * bpp;
+}
+inline uint c5to8(uint v) { return (v << 3) | (v >> 2); }
+inline uint c6to8(uint v) { return (v << 2) | (v >> 4); }
+inline uint c4to8(uint v) { return (v << 4) | v; }
+inline uint4 g_decode(uint f, device const uchar *p) {
+    const uint v = p[0] | (uint(p[1]) << 8);
+    switch (f) {
+    case 0: return uint4(p[3], p[2], p[1], p[0]);
+    case 1: return uint4(p[2], p[1], p[0], 255);
+    case 2: return uint4(c5to8(v >> 11), c6to8((v >> 5) & 63), c5to8(v & 31), 255);
+    case 3: return uint4(c5to8(v >> 11), c5to8((v >> 6) & 31), c5to8((v >> 1) & 31), (v & 1) * 255);
+    default: return uint4(c4to8(v >> 12), c4to8((v >> 8) & 15), c4to8((v >> 4) & 15), c4to8(v & 15));
+    }
+}
+inline void g_encode(uint f, uint4 c, device uchar *p) {
+    uint v;
+    switch (f) {
+    case 0: p[0] = c.a; p[1] = c.b; p[2] = c.g; p[3] = c.r; return;
+    case 1: p[0] = c.b; p[1] = c.g; p[2] = c.r; return;
+    case 2: v = ((c.r >> 3) << 11) | ((c.g >> 2) << 5) | (c.b >> 3); break;
+    case 3: v = ((c.r >> 3) << 11) | ((c.g >> 3) << 6) | ((c.b >> 3) << 1) | (c.a >> 7); break;
+    default: v = ((c.r >> 4) << 12) | ((c.g >> 4) << 8) | ((c.b >> 4) << 4) | (c.a >> 4); break;
+    }
+    p[0] = v;
+    p[1] = v >> 8;
+}
+// a colour target's GPU copy as guest memory (box-filtered to 1x): p = w, h (1x), scale, pixel format
+kernel void k_enc(texture2d<float, access::read> src [[texture(0)]], device uchar *dst [[buffer(0)]],
+                  constant uint4 &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.x || gid.y >= p.y) return;
+    const uint s = p.z;
+    uint4 acc = uint4(0);
+    for (uint j = 0; j < s; j++)
+        for (uint i = 0; i < s; i++) acc += uint4(round(src.read(uint2(gid.x * s + i, gid.y * s + j)) * 255.0));
+    const uint n = s * s;
+    g_encode(p.w, (acc + n / 2) / n, dst + g_tiled(gid.x, gid.y, p.x, g_bpp(p.w)));
+}
+// guest memory into a colour target's GPU copy (each pixel scale x scale times): p = w, h (1x), scale, pixel format
+kernel void k_dec(device const uchar *src [[buffer(0)]], texture2d<float, access::write> dst [[texture(0)]],
+                  constant uint4 &p [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.x * p.z || gid.y >= p.y * p.z) return;
+    const uint4 c = g_decode(p.w, src + g_tiled(gid.x / p.z, gid.y / p.z, p.x, g_bpp(p.w)));
+    dst.write(float4(c) / 255.0, gid);
+}
+// guest depth / stencil memory as scaled rows of depth and stencil values: p = w, h (1x), scale, depth format
+kernel void k_dec_depth(device const uchar *src [[buffer(0)]], device float *dz [[buffer(1)]], device uchar *dsn [[buffer(2)]],
+                        constant uint4 &p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    const uint W = p.x * p.z;
+    if (gid.x >= W || gid.y >= p.y * p.z) return;
+    device const uchar *q = src + g_tiled(gid.x / p.z, gid.y / p.z, p.x, g_dbpp(p.w));
+    const uint z = p.w == 0 ? (q[0] | (uint(q[1]) << 8)) : (q[0] | (uint(q[1]) << 8) | (uint(q[2]) << 16));
+    dz[gid.y * W + gid.x] = float(z) * (p.w == 0 ? 1.0 / 65536.0 : 1.0 / 16777216.0);
+    dsn[gid.y * W + gid.x] = p.w == 3 ? q[3] : 0;
+}
+// scaled rows of depth and stencil values (the top-left sample of each pixel) as guest memory: p as k_dec_depth
+kernel void k_enc_depth(device const float *dz [[buffer(0)]], device const uchar *dsn [[buffer(1)]], device uchar *dst [[buffer(2)]],
+                        constant uint4 &p [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.x || gid.y >= p.y) return;
+    const uint i = gid.y * p.z * (p.x * p.z) + gid.x * p.z;
+    const uint z = uint(dz[i] * (p.w == 0 ? 65536.0 : 16777216.0));
+    device uchar *q = dst + g_tiled(gid.x, gid.y, p.x, g_dbpp(p.w));
+    q[0] = z;
+    q[1] = z >> 8;
+    if (p.w != 0) q[2] = z >> 16;
+    if (p.w == 3) q[3] = dsn[i];
+}
+// a display transfer's conversion (transfer_convert in transfer.cpp) from a tiled image in guest format: p = input
+// width, output width and rows (after downscaling), flags; q.x = first input byte
+kernel void k_tconv(device const uchar *src [[buffer(0)]], device uchar *dst [[buffer(1)]], constant uint4 &p [[buffer(2)]],
+                    constant uint4 &q [[buffer(3)]], uint2 gid [[thread_position_in_grid]]) {
+    const uint out_w = p.y, out_h = p.z, flags = p.w;
+    if (gid.x >= out_w || gid.y >= out_h) return;
+    const bool flip = flags & 1, in_linear = (flags >> 1) & 1, dont_swizzle = (flags >> 5) & 1;
+    const uint in_fmt = (flags >> 8) & 7, out_fmt = (flags >> 12) & 7, scaling = (flags >> 24) & 3;
+    const uint ibpp = g_bpp(in_fmt), obpp = g_bpp(out_fmt);
+    const uint hs = scaling != 0 ? 1 : 0, vs = scaling == 2 ? 1 : 0;
+    const uint x = gid.x, y = gid.y, ix = x << hs, iy = y << vs, oy = flip ? out_h - 1 - y : y;
+    uint so, doff;
+    if (in_linear) {
+        so = (ix + iy * p.x) * ibpp;
+        doff = dont_swizzle ? (x + oy * out_w) * obpp : g_tiled(x, oy, out_w, obpp);
+    } else {
+        so = g_tiled(ix, iy, p.x, ibpp);
+        doff = dont_swizzle ? g_tiled(x, oy, out_w, obpp) : (x + oy * out_w) * obpp;
+    }
+    device const uchar *sp = src + q.x + so;
+    uint4 c = g_decode(in_fmt, sp);
+    if (scaling == 1) c = (c + g_decode(in_fmt, sp + ibpp)) / 2;
+    else if (scaling == 2)
+        c = (c + g_decode(in_fmt, sp + ibpp) + g_decode(in_fmt, sp + 2 * ibpp) + g_decode(in_fmt, sp + 3 * ibpp)) / 4;
+    g_encode(out_fmt, c, dst + doff);
+}
+// tiled-to-tiled display transfer between GPU copies of guest images: p = output width, rows (scaled), first source
+// row (scaled); q = horizontal and vertical downscale shifts, flip, source without alpha
+kernel void k_xfer(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+                   constant uint4 &p [[buffer(0)]], constant uint4 &q [[buffer(1)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.x || gid.y >= p.y) return;
+    const uint y = q.z ? p.y - 1 - gid.y : gid.y;
+    const uint fx = 1u << q.x, fy = 1u << q.y;
+    float4 acc = float4(0.0);
+    for (uint j = 0; j < fy; j++)
+        for (uint i = 0; i < fx; i++) acc += src.read(uint2(gid.x * fx + i, p.z + y * fy + j));
+    acc /= float(fx * fy);
+    if (q.w) acc.a = 1.0;
+    dst.write(acc, gid);
+}
+// a GPU copy of a guest image as a texture: rows upside down (the order of decoded textures), alpha opaque for formats
+// without one; p = width, rows (scaled), opaque
+kernel void k_snap(texture2d<float, access::read> src [[texture(0)]], texture2d<float, access::write> dst [[texture(1)]],
+                   constant uint4 &p [[buffer(0)]], uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.x || gid.y >= p.y) return;
+    float4 c = src.read(uint2(gid.x, p.y - 1 - gid.y));
+    if (p.z) c.a = 1.0;
+    dst.write(c, gid);
+}
 )";
 
 // C++ mirror of the MSL uniform block
@@ -334,9 +439,14 @@ static_assert(sizeof(Uni) == 16 * 12 + 8 * 112, "uniform layout");
 // ---------------------------------------------------------------- device state
 id<MTLDevice> dev;
 id<MTLCommandQueue> queue;
-id<MTLComputePipelineState> k_down, k_up, k_rot;
+id<MTLComputePipelineState> k_rot, k_xfer, k_snap, k_enc, k_dec, k_dec_depth, k_enc_depth, k_tconv;
 u32 S = 1;                     // internal resolution scale
 u32 MS = 1;                    // MSAA samples per pixel of the scaled render targets (GPU_MSAA)
+// The multisampled targets live in tile memory only (memoryless): each pass resolves them into the single-sample
+// targets and the next one restores its samples from those, instead of loading and storing every sample through
+// memory between passes (most of the GPU's time at high scales). Earlier passes' edges stay antialiased (resolved);
+// only depth loses its subsamples between passes.
+bool ms_memoryless = false;
 u32 aniso = 1;                 // max anisotropy of linearly filtered textures (GPU_ANISO)
 bool scale_fixed = false;      // GPU_SCALE given (else the frontend sizes it to the window)
 constexpr u32 kDefaultMSAA = 4, kDefaultAniso = 16;
@@ -351,10 +461,12 @@ bool tried = false;
 bool gpu_timing = true, log_timing = false;
 std::atomic<float> busy_frac{0};
 std::atomic<u64> vs_dispatches{0}, vs_verts{0}, vs_passes{0}, flushes{0};  // vertex kernel work, for the stats line
+std::atomic<u64> cbs_made{0};                                                // command buffers, for the stats line
 std::mutex busy_mtx;
 double gpu_busy = 0, busy_end = 0;  // union of the command buffers' GPU execution intervals
-id<MTLCommandBuffer> new_cb() {
+id<MTLCommandBuffer> new_cb_raw() {
     id<MTLCommandBuffer> cb = [queue commandBuffer];
+    cbs_made.fetch_add(1, std::memory_order_relaxed);
     if (gpu_timing)
         [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
             std::lock_guard<std::mutex> lk(busy_mtx);
@@ -367,6 +479,74 @@ id<MTLCommandBuffer> new_cb() {
 
 id<MTLBuffer> make_buffer(size_t n) {
     return [dev newBufferWithLength:std::max<size_t>(n, 16) options:MTLResourceStorageModeShared];
+}
+
+// The passes of a command list (and the work that prepares them) share one command buffer, committed at the end of
+// the list (metal_end_list) or as soon as other GPU work is made (new_cb), which must run after them. What the CPU
+// writes for them (vertices, indices, uniforms, uploads) is carved out of large shared chunks (arena), which go back
+// to chunk_free when the command buffer completes.
+id<MTLCommandBuffer> cur_cb;
+std::vector<id<MTLBuffer>> cur_chunks;
+size_t chunk_off = 0;
+std::mutex chunk_mtx;
+std::vector<id<MTLBuffer>> chunk_free;
+constexpr size_t kChunkBytes = 4u << 20, kMaxFreeChunks = 16;
+
+id<MTLCommandBuffer> list_cb() {
+    if (!cur_cb) cur_cb = new_cb_raw();
+    return cur_cb;
+}
+void commit_list_cb() {
+    if (!cur_cb) return;
+    std::vector<id<MTLBuffer>> chunks;
+    chunks.swap(cur_chunks);
+    chunk_off = 0;
+    [cur_cb addCompletedHandler:^(id<MTLCommandBuffer>) {
+        std::lock_guard<std::mutex> lk(chunk_mtx);
+        for (id<MTLBuffer> b : chunks)
+            if (chunk_free.size() < kMaxFreeChunks) chunk_free.push_back(b);
+    }];
+    [cur_cb commit];
+    cur_cb = nil;
+}
+// a command buffer for work that must come after everything encoded so far
+id<MTLCommandBuffer> new_cb() {
+    commit_list_cb();
+    return new_cb_raw();
+}
+
+struct Slice {
+    id<MTLBuffer> buf;
+    size_t off;
+    u8 *p;
+};
+// n bytes for the current list's command buffer (256-byte aligned)
+Slice arena(size_t n) {
+    n = (std::max<size_t>(n, 16) + 255) & ~(size_t)255;
+    list_cb();
+    if (cur_chunks.empty() || chunk_off + n > cur_chunks.back().length) {
+        id<MTLBuffer> b = nil;
+        {
+            std::lock_guard<std::mutex> lk(chunk_mtx);
+            for (size_t i = 0; i < chunk_free.size(); i++)
+                if (chunk_free[i].length >= n) {
+                    b = chunk_free[i];
+                    chunk_free.erase(chunk_free.begin() + i);
+                    break;
+                }
+        }
+        if (!b) b = make_buffer(std::max(kChunkBytes, n));
+        cur_chunks.push_back(b);
+        chunk_off = 0;
+    }
+    Slice s{cur_chunks.back(), chunk_off, (u8 *)cur_chunks.back().contents + chunk_off};
+    chunk_off += n;
+    return s;
+}
+// gives back the end of the last slice taken (only `used` bytes of it were needed)
+void arena_trim(const Slice &s, size_t used) {
+    if (!cur_chunks.empty() && s.buf == cur_chunks.back() && s.off <= chunk_off)
+        chunk_off = std::min(chunk_off, s.off + ((used + 255) & ~(size_t)255));
 }
 
 // Shared buffers for data written by the CPU while earlier command buffers may still be in
@@ -402,9 +582,12 @@ struct GRT {
     id<MTLTexture> tex;
     id<MTLTexture> stencil_view;  // tex's stencil as a texture (MSAA restore)
     id<MTLTexture> ms;       // with MSAA: the multisampled target, resolved into tex at the end of each pass
-    bool ms_valid = false;   // ms matches tex (else it is restored from tex before drawing)
+    bool ms_valid = false;   // ms matches tex (else it is restored from tex before drawing; never with ms_memoryless)
     bool synced = false;     // GPU copy corresponds to guest memory as hashed below
     u64 hash = 0;
+    u64 checked = 0;         // g_frame when guest memory last matched the hash
+    u64 id = 0;              // unique among all targets ever made
+    u64 version = 0;         // changes whenever the GPU copy does
     bool gpu_newer = false;  // depth/stencil changes not yet written to guest memory
     u32 skipped = 0;         // draws left out since its last display transfer (pipelines still compiling)
     bool clear_next = false; // set_clear_after_top_transfer: cleared to transparent before it is drawn into again,
@@ -429,7 +612,9 @@ void clear_overlapping(GRT &r) {
 GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
     for (auto &r : rts)
         if (r->addr == addr && r->w == w && r->h == h && r->fmt == fmt && r->depth == depth) return *r;
+    static u64 next_id;
     auto r = std::make_unique<GRT>();
+    r->id = ++next_id;
     r->addr = addr;
     r->w = w;
     r->h = h;
@@ -448,6 +633,7 @@ GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
         d.textureType = MTLTextureType2DMultisample;
         d.sampleCount = MS;
         d.usage = MTLTextureUsageRenderTarget;
+        if (ms_memoryless) d.storageMode = MTLStorageModeMemoryless;
         r->ms = [dev newTextureWithDescriptor:d];
     }
     rts.push_back(std::move(r));
@@ -475,29 +661,33 @@ id<MTLTexture> get_scratch_depth(u32 w, u32 h) {
     return t;
 }
 
-id<MTLBuffer> stage_color, stage_depth, stage_stencil;
+id<MTLBuffer> stage_color, stage_depth, stage_stencil, stage_dbytes;
 
-// decode a guest color target into linear 1x rows (memory order) of packed RGBA
-void guest_color_to_linear(const GRT &r, u32 *out) {
-    const u8 *p = pptr(r.addr);
-    const u32 pf = cbuf_to_pixfmt(r.fmt), bpp = pixel_bytes(pf);
-    for (u32 y = 0; y < r.h; y++)
-        for (u32 x = 0; x < r.w; x++) out[y * r.w + x] = decode_pixel(pf, p + tiled_offset(x, y, r.w, bpp));
+// GPU_LABELS=1: encoders are labelled (what they do and to which guest memory), for Instruments and GPU captures
+bool labels_on = getenv("GPU_LABELS") != nullptr;
+template <class E>
+void label(E e, const char *fmt, ...) {
+    if (!labels_on) return;
+    char b[128];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(b, sizeof b, fmt, ap);
+    va_end(ap);
+    e.label = [NSString stringWithUTF8String:b];
 }
 
-void linear_to_guest_color(const GRT &r, const u32 *in, u8 *p = nullptr) {
-    if (!p) p = pptr(r.addr);
-    const u32 pf = cbuf_to_pixfmt(r.fmt), bpp = pixel_bytes(pf);
-    if (pf == 0) {
-        for (u32 y = 0; y < r.h; y++)
-            for (u32 x = 0; x < r.w; x++) {
-                const u32 v = __builtin_bswap32(in[y * r.w + x]);
-                memcpy(p + tiled_offset(x, y, r.w, 4), &v, 4);
-            }
-        return;
-    }
-    for (u32 y = 0; y < r.h; y++)
-        for (u32 x = 0; x < r.w; x++) encode_pixel(pf, in[y * r.w + x], p + tiled_offset(x, y, r.w, bpp));
+// a dispatch of one thread per pixel of a w x h grid
+void dispatch2d(id<MTLComputeCommandEncoder> ce, u32 w, u32 h) {
+    [ce dispatchThreads:MTLSizeMake(w, h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+}
+// encodes the colour target's GPU copy as guest memory (its format, tiled, 1x) into dst
+void encode_guest_color(id<MTLComputeCommandEncoder> ce, const GRT &r, id<MTLBuffer> dst) {
+    [ce setComputePipelineState:k_enc];
+    [ce setTexture:r.tex atIndex:0];
+    [ce setBuffer:dst offset:0 atIndex:0];
+    const u32 prm[4] = {r.w, r.h, S, cbuf_to_pixfmt(r.fmt)};
+    [ce setBytes:prm length:16 atIndex:1];
+    dispatch2d(ce, r.w, r.h);
 }
 
 struct LoadAction {
@@ -515,7 +705,12 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
     LoadAction la;
     const u8 *p = pptr(r.addr);
     if (!p) return la;
+    // Checked during this frame already: writes reported since (GPU operations, cache flushes, DMA) clear synced, and a
+    // CPU write the game does not flush out of its data cache would not reach a 3DS GPU before the frame's end either.
+    const u64 frame = g_frame.load(std::memory_order_relaxed);
+    if (r.synced && r.checked == frame) return la;
     const u64 hv = hash_bytes(p, rt_bytes(r));
+    r.checked = frame;
     if (r.synced && hv == r.hash) return la;
     if (r.own) {  // (cleared after a transfer to the top screen: the top screen's write-back is not its picture)
         r.hash = hv;
@@ -525,7 +720,6 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
     r.synced = true;
     r.hash = hv;
     r.gpu_newer = false;
-    const u32 n = r.w * r.h;
     // a target filled with one value (typically a memory fill clearing it): bytes repeat every pixel
     const u32 rbpp = r.depth ? (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4) : pixel_bytes(cbuf_to_pixfmt(r.fmt));
     if (rt_bytes(r) > rbpp && memcmp(p, p + rbpp, rt_bytes(r) - rbpp) == 0) {
@@ -539,71 +733,41 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
         }
         return la;
     }
+    // otherwise the guest bytes as they are, decoded by the GPU
+    const Slice raw = arena(rt_bytes(r));
+    memcpy(raw.p, p, rt_bytes(r));
+    r.ms_valid = false;
+    r.version++;
     if (!r.depth) {
-        id<MTLBuffer> up = pool_get((size_t)n * 4, cb);
-        u32 *lin = (u32 *)up.contents;
-        guest_color_to_linear(r, lin);
-        bool uniform = true;
-        for (u32 i = 1; i < n && uniform; i++) uniform = lin[i] == lin[0];
-        if (uniform) {
-            la.clear = true;
-            la.color = lin[0];
-            return la;
-        }
-        r.ms_valid = false;
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        [ce setComputePipelineState:k_up];
-        [ce setBuffer:up offset:0 atIndex:0];
+        label(ce, "upload %08x %ux%u", r.addr, r.w, r.h);
+        [ce setComputePipelineState:k_dec];
+        [ce setBuffer:raw.buf offset:raw.off atIndex:0];
         [ce setTexture:r.tex atIndex:0];
-        const u32 prm[4] = {r.w, r.h, S, 0};
+        const u32 prm[4] = {r.w, r.h, S, cbuf_to_pixfmt(r.fmt)};
         [ce setBytes:prm length:16 atIndex:1];
-        [ce dispatchThreads:MTLSizeMake(r.w * S, r.h * S, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        dispatch2d(ce, r.w * S, r.h * S);
         [ce endEncoding];
         return la;
     }
-    // depth / stencil
-    const u32 bpp = r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4;
-    auto zat = [&](u32 x, u32 y, u32 &z, u32 &st) {
-        const u8 *q = p + tiled_offset(x, y, r.w, bpp);
-        z = r.fmt == 0 ? (u32)(q[0] | q[1] << 8) : (u32)(q[0] | q[1] << 8 | q[2] << 16);
-        st = r.fmt == 3 ? q[3] : 0;
-    };
-    u32 z0, s0;
-    zat(0, 0, z0, s0);
-    bool uniform = true;
-    for (u32 y = 0; y < r.h && uniform; y++)
-        for (u32 x = 0; x < r.w && uniform; x++) {
-            u32 z, st;
-            zat(x, y, z, st);
-            uniform = z == z0 && st == s0;
-        }
-    if (uniform) {
-        la.clear = true;
-        la.depth = (float)z0 * depth_quantum(r.fmt);
-        la.stencil = s0;
-        return la;
-    }
-    r.ms_valid = false;
+    // depth / stencil: as scaled rows of values, copied into the target
     const u32 W = r.w * S, H = r.h * S;
-    id<MTLBuffer> upd = pool_get((size_t)W * H * 4, cb), ups = pool_get((size_t)W * H, cb);
-    float *dz = (float *)upd.contents;
-    u8 *dsn = (u8 *)ups.contents;
-    const float qn = depth_quantum(r.fmt);
-    for (u32 y = 0; y < r.h; y++)
-        for (u32 x = 0; x < r.w; x++) {
-            u32 z, st;
-            zat(x, y, z, st);
-            for (u32 j = 0; j < S; j++)
-                for (u32 i = 0; i < S; i++) {
-                    dz[(size_t)(y * S + j) * W + x * S + i] = (float)z * qn;
-                    dsn[(size_t)(y * S + j) * W + x * S + i] = (u8)st;
-                }
-        }
+    const Slice upd = arena((size_t)W * H * 4), ups = arena((size_t)W * H);
+    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    label(ce, "upload depth %08x %ux%u", r.addr, r.w, r.h);
+    [ce setComputePipelineState:k_dec_depth];
+    [ce setBuffer:raw.buf offset:raw.off atIndex:0];
+    [ce setBuffer:upd.buf offset:upd.off atIndex:1];
+    [ce setBuffer:ups.buf offset:ups.off atIndex:2];
+    const u32 prm[4] = {r.w, r.h, S, r.fmt};
+    [ce setBytes:prm length:16 atIndex:3];
+    dispatch2d(ce, W, H);
+    [ce endEncoding];
     id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
-    [be copyFromBuffer:upd sourceOffset:0 sourceBytesPerRow:W * 4 sourceBytesPerImage:(NSUInteger)W * H * 4
+    [be copyFromBuffer:upd.buf sourceOffset:upd.off sourceBytesPerRow:W * 4 sourceBytesPerImage:(NSUInteger)W * H * 4
             sourceSize:MTLSizeMake(W, H, 1) toTexture:r.tex destinationSlice:0 destinationLevel:0
      destinationOrigin:MTLOriginMake(0, 0, 0) options:MTLBlitOptionDepthFromDepthStencil];
-    [be copyFromBuffer:ups sourceOffset:0 sourceBytesPerRow:W sourceBytesPerImage:(NSUInteger)W * H
+    [be copyFromBuffer:ups.buf sourceOffset:ups.off sourceBytesPerRow:W sourceBytesPerImage:(NSUInteger)W * H
             sourceSize:MTLSizeMake(W, H, 1) toTexture:r.tex destinationSlice:0 destinationLevel:0
      destinationOrigin:MTLOriginMake(0, 0, 0) options:MTLBlitOptionStencilFromDepthStencil];
     [be endEncoding];
@@ -641,20 +805,17 @@ bool guest_kept(GRT &r) {
 // write a colour target's GPU contents back to guest memory (box-filtered to 1x)
 void write_back_color(GRT &r) {
     if (!guest_kept(r)) return;
-    ensure_buffer(stage_color, (size_t)r.w * r.h * 4);
+    ensure_buffer(stage_color, rt_bytes(r));
     id<MTLCommandBuffer> cb = new_cb();
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-    [ce setComputePipelineState:k_down];
-    [ce setTexture:r.tex atIndex:0];
-    [ce setBuffer:stage_color offset:0 atIndex:0];
-    const u32 prm[4] = {r.w, r.h, S, 0};
-    [ce setBytes:prm length:16 atIndex:1];
-    [ce dispatchThreads:MTLSizeMake(r.w, r.h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    label(ce, "write-back %08x %ux%u", r.addr, r.w, r.h);
+    encode_guest_color(ce, r, stage_color);
     [ce endEncoding];
     [cb commit];
     wait_cb(cb, "colour write-back", r.addr);  // also waits for all earlier work on the queue
-    linear_to_guest_color(r, (const u32 *)stage_color.contents);
+    memcpy(pptr(r.addr), stage_color.contents, rt_bytes(r));
     r.hash = hash_bytes(pptr(r.addr), rt_bytes(r));
+    r.checked = g_frame.load(std::memory_order_relaxed);
     r.synced = true;
     r.gpu_newer = false;
 }
@@ -676,25 +837,26 @@ void write_back_depth(GRT &r) {
     destinationBytesPerRow:W destinationBytesPerImage:(NSUInteger)W * H
                 options:MTLBlitOptionStencilFromDepthStencil];
     [be endEncoding];
+    // into guest memory's format (unchanged where a format has no stencil or fewer depth bytes)
+    ensure_buffer(stage_dbytes, rt_bytes(r));
+    u8 *p = pptr(r.addr);
+    memcpy(stage_dbytes.contents, p, rt_bytes(r));
+    id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
+    label(ce, "write-back depth %08x %ux%u", r.addr, r.w, r.h);
+    [ce setComputePipelineState:k_enc_depth];
+    [ce setBuffer:stage_depth offset:0 atIndex:0];
+    [ce setBuffer:stage_stencil offset:0 atIndex:1];
+    [ce setBuffer:stage_dbytes offset:0 atIndex:2];
+    const u32 prm[4] = {r.w, r.h, S, r.fmt};
+    [ce setBytes:prm length:16 atIndex:3];
+    dispatch2d(ce, r.w, r.h);
+    [ce endEncoding];
     [cb commit];
     wait_cb(cb, "depth write-back", r.addr);
-    const float *dz = (const float *)stage_depth.contents;
-    const u8 *dsn = (const u8 *)stage_stencil.contents;
-    u8 *p = pptr(r.addr);
-    const u32 bpp = r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4;
-    const float inv = r.fmt == 0 ? 65536.0f : 16777216.0f;
-    for (u32 y = 0; y < r.h; y++)
-        for (u32 x = 0; x < r.w; x++) {
-            const size_t i = (size_t)(y * S) * W + x * S;
-            const u32 z = (u32)(dz[i] * inv);
-            u8 *q = p + tiled_offset(x, y, r.w, bpp);
-            q[0] = z;
-            q[1] = z >> 8;
-            if (r.fmt != 0) q[2] = z >> 16;
-            if (r.fmt == 3) q[3] = dsn[i];
-        }
+    memcpy(p, stage_dbytes.contents, rt_bytes(r));
     r.gpu_newer = false;
     r.hash = hash_bytes(p, rt_bytes(r));
+    r.checked = g_frame.load(std::memory_order_relaxed);
     r.synced = true;
 }
 
@@ -772,7 +934,7 @@ void tf_drop_all() {
 
 void tf_cb_begin() {
     if (tf_cb) return;
-    tf_cb = new_cb();
+    tf_cb = new_cb_raw();  // (while the list's command buffer is being encoded; committed before it)
     if (log_timing)
         [tf_cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
             std::lock_guard<std::mutex> lk(busy_mtx);
@@ -2195,22 +2357,29 @@ bool warned_shadow = false, warned_proctex = false;
 bool overlaps(u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; }
 
 // ---------------------------------------------------------------- deferred display transfers
-// A display transfer from a target with GPU work in flight is not waited for: one command buffer
-// downsamples the target (k_down) and makes the display image (k_rot); the CPU part (writing the
-// target and the transfer output to guest memory) runs once it completed, when polled at a later
+// A display transfer from a target with GPU work in flight is not waited for: one command buffer encodes the target
+// as guest memory (k_enc), converts that as the transfer does (k_tconv) and makes the display image (k_rot); the CPU
+// part (copying the target and the transfer output to guest memory) runs once it completed, when polled at a later
 // GPU call or when something touches those memory ranges.
 struct PendingXfer {
     id<MTLCommandBuffer> cb;
-    id<MTLBuffer> lin;   // target contents at 1x, linear rows
-    id<MTLBuffer> disp;  // display image
+    id<MTLBuffer> gbytes;  // the target as guest memory
+    id<MTLBuffer> obytes;  // the transfer's output
+    id<MTLBuffer> disp;    // display image
     GRT *rt = nullptr;
     bool rt_writeback = true;  // the target's memory is still to be written (not overwritten since)
     u32 in_paddr = 0, out_paddr = 0, in_dims = 0, out_dims = 0, flags = 0, out_size = 0;
 };
 std::deque<std::unique_ptr<PendingXfer>> pending;
-std::vector<id<MTLBuffer>> lin_free;   // GX thread only
+std::vector<id<MTLBuffer>> xbuf_free;  // GX thread only: gbytes / obytes buffers
 std::vector<id<MTLBuffer>> disp_free;  // under disp_mtx
-std::vector<u8> xfer_scratch;
+std::vector<id<MTLBuffer>> disp_reading;  // under disp_mtx: images the UI reads outside the lock (not reused meanwhile)
+// (disp_mtx held) a display image buffer no longer needed may go back to disp_free
+bool recyclable(id<MTLBuffer> b) {
+    for (id<MTLBuffer> r : disp_reading)
+        if (r == b) return false;
+    return disp_free.size() < 6;
+}
 
 id<MTLBuffer> take_buffer(std::vector<id<MTLBuffer>> &fl, size_t n) {
     for (size_t i = 0; i < fl.size(); i++)
@@ -2232,25 +2401,24 @@ void finalize(PendingXfer &op) {
     wait_cb(op.cb, "display transfer", op.out_paddr);
     GRT &r = *op.rt;
     const u32 nb = rt_bytes(r);
-    xfer_scratch.resize(nb);
-    linear_to_guest_color(r, (const u32 *)op.lin.contents, xfer_scratch.data());
     if (op.rt_writeback && guest_kept(r)) {
-        memcpy(pptr(r.addr), xfer_scratch.data(), nb);
-        r.hash = hash_bytes(xfer_scratch.data(), nb);
+        memcpy(pptr(r.addr), op.gbytes.contents, nb);
+        r.hash = hash_bytes(pptr(r.addr), nb);
+        r.checked = g_frame.load(std::memory_order_relaxed);
     }
-    transfer_convert(xfer_scratch.data() + (op.in_paddr - r.addr), pptr(op.out_paddr), op.in_dims, op.out_dims,
-                     op.flags);
+    memcpy(pptr(op.out_paddr), op.obytes.contents, op.out_size);
     texcache_invalidate(op.out_paddr, op.out_size);
     rts_overwritten(op.out_paddr, op.out_size);
     if (tf_mode) note_gpu_out(op.out_paddr, op.out_size);
-    lin_free.push_back(op.lin);
+    xbuf_free.push_back(op.gbytes);
+    xbuf_free.push_back(op.obytes);
     std::lock_guard<std::mutex> lk(disp_mtx);
     auto it = displays.find(op.out_paddr);
     if (it != displays.end() && it->second.cb == op.cb) {
         DisplayImage &d = it->second;
         d.out_hash = hash_bytes(pptr(d.out_addr), d.out_size);
         d.cb = nil;  // the image stays in op.disp
-    } else if (disp_free.size() < 6) {
+    } else if (recyclable(op.disp)) {
         disp_free.push_back(op.disp);  // replaced meanwhile
     }
 }
@@ -2278,6 +2446,187 @@ void drain_touching(u32 paddr, u32 size) {
             return;
         }
 }
+
+// ---------------------------------------------------------------- GPU copies of guest images
+// Texture copies and tiled-to-tiled display transfers from a render target the GPU holds newer contents of (and
+// from their own results) run on the GPU: their destinations become GPU copies too (GRTs, like render targets,
+// written back to guest memory only when something reads it there), and draws sample them directly (a snapshot,
+// surface_snapshot). A game's post-processing chain (copy a frame, shrink it a few times, blend it back) then
+// never waits for the GPU nor goes through the CPU.
+inline u32 pix_to_cbuf(u32 pf) {
+    static constexpr u8 m[8] = {0, 1, 3, 2, 4, 0, 0, 0};
+    return m[pf & 7];
+}
+inline u32 grt_bpp(const GRT &r) { return pixel_bytes(cbuf_to_pixfmt(r.fmt)); }
+
+// r's GPU copy holds its current contents: newer than guest memory, or with a write-back of them queued
+bool gpu_valid(const GRT &r) {
+    if (r.depth || !r.synced) return false;
+    if (r.gpu_newer) return true;
+    for (const auto &op : pending)
+        if (op->rt == &r && op->rt_writeback) return true;
+    return false;
+}
+
+// the GPU copy of an image at addr with this width and format (the tallest; null: none); any: also one that no
+// longer matches guest memory (synced again from it before it is drawn into)
+GRT *find_view(u32 addr, u32 w, u32 fmt, bool depth, bool any = false) {
+    GRT *best = nullptr;
+    for (auto &r : rts)
+        if (r->depth == depth && (r->synced || any) && r->addr == addr && r->w == w && r->fmt == fmt && (!best || r->h > best->h))
+            best = r.get();
+    return best;
+}
+GRT *find_color(u32 addr, u32 w, u32 fmt) { return find_view(addr, w, fmt, false); }
+
+// r's GPU copy made guest memory's contents (unless it is already)
+void fill_from_guest(GRT &r, id<MTLCommandBuffer> cb) {
+    const LoadAction la = sync_rt(r, cb);
+    if (!la.clear) return;
+    MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+    if (r.depth) {
+        rp.depthAttachment.texture = rp.stencilAttachment.texture = r.tex;
+        rp.depthAttachment.loadAction = rp.stencilAttachment.loadAction = MTLLoadActionClear;
+        rp.depthAttachment.clearDepth = la.depth;
+        rp.stencilAttachment.clearStencil = la.stencil;
+        rp.depthAttachment.storeAction = rp.stencilAttachment.storeAction = MTLStoreActionStore;
+    } else {
+        rp.colorAttachments[0].texture = r.tex;
+        rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+        const u32 c = la.color;
+        rp.colorAttachments[0].clearColor =
+            MTLClearColorMake((c & 255) / 255.0, ((c >> 8) & 255) / 255.0, ((c >> 16) & 255) / 255.0, (c >> 24) / 255.0);
+        rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+    }
+    id<MTLRenderCommandEncoder> ce = [cb renderCommandEncoderWithDescriptor:rp];
+    label(ce, "clear %08x %ux%u", r.addr, r.w, r.h);
+    [ce endEncoding];
+    r.ms_valid = false;
+    r.version++;
+}
+
+// a taller GPU copy of old's image (h rows): old's rows, then guest memory's; null if a queued transfer uses old
+GRT *grow(GRT &old, u32 h, id<MTLCommandBuffer> cb) {
+    for (const auto &op : pending)
+        if (op->rt == &old) return nullptr;
+    GRT &n = get_rt(old.addr, old.w, h, old.fmt, old.depth);
+    n.synced = false;
+    fill_from_guest(n, cb);
+    id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+    [be copyFromTexture:old.tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
+             sourceSize:MTLSizeMake(old.w * S, old.h * S, 1) toTexture:n.tex destinationSlice:0 destinationLevel:0
+      destinationOrigin:MTLOriginMake(0, 0, 0)];
+    [be endEncoding];
+    n.gpu_newer = old.gpu_newer;
+    n.ms_valid = false;
+    n.version++;
+    old.synced = false;
+    old.gpu_newer = false;
+    return &n;
+}
+
+// The GPU copy to draw a view of h rows (of an image at addr with this width and format) into, h tall: the tallest
+// copy of that image (a shorter view draws into its first rows: one copy of the memory instead of two kept in step
+// through guest memory), grown from a shorter one when this view is the tallest yet.
+GRT &target_for(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
+    GRT *t = find_view(addr, w, fmt, depth, true);
+    if (t && t->h == h) return *t;
+    if (t && t->h < h && t->gpu_newer)
+        if (GRT *n = grow(*t, h, list_cb())) return *n;
+    return get_rt(addr, w, h, fmt, depth);
+}
+
+void drop_displays(u32 paddr, u32 size, bool definite);
+
+// Before the GPU writes [paddr, paddr + size) into dst (reading src): queued CPU parts writing there go first; other
+// GPU copies of that memory go back to it (or are dropped where the write covers them) and are no longer trusted.
+// True if guest memory there changed meanwhile.
+bool claim(GRT *src, GRT *dst, u32 paddr, u32 size) {
+    drain_touching(paddr, size);
+    bool changed = false;
+    for (auto &r : rts) {
+        if (r.get() == src || r.get() == dst || !overlaps(r->addr, rt_bytes(*r), paddr, size)) continue;
+        if (r->gpu_newer) {
+            if (r->addr >= paddr && r->addr + rt_bytes(*r) <= paddr + size) {
+                r->gpu_newer = false;
+            } else {
+                if (r->depth)
+                    write_back_depth(*r);
+                else
+                    write_back_color(*r);
+                changed = true;
+            }
+        }
+        r->synced = false;
+    }
+    return changed;
+}
+
+// The GPU copy that an operation reading src writes (all or the first rows of) the w x h image at addr in (bytes: the
+// guest memory it writes); null if it can't be done on the GPU.
+GRT *dest_surface(u32 addr, u32 w, u32 h, u32 fmt, GRT *src, u32 bytes) {
+    if (overlaps(addr, bytes, src->addr, rt_bytes(*src))) return nullptr;
+    GRT *d = find_color(addr, w, fmt);
+    if (d && overlaps(d->addr, rt_bytes(*d), src->addr, rt_bytes(*src))) return nullptr;
+    if (claim(src, d, addr, bytes)) return nullptr;  // (rare: other GPU copies of it were newer; the CPU does it)
+    id<MTLCommandBuffer> cb = list_cb();  // (after claim's write-backs, which commit it)
+    if (!d) {
+        d = &get_rt(addr, w, h, fmt, false);
+        fill_from_guest(*d, cb);
+    } else if (d->h < h) {
+        d = grow(*d, h, cb);
+    }
+    return d;
+}
+
+// the GPU wrote dst's copy of [paddr, paddr + size)
+void gpu_wrote(GRT &d, u32 paddr, u32 size) {
+    d.gpu_newer = true;
+    d.ms_valid = false;
+    d.version++;
+    texcache_invalidate(paddr, size);
+    drop_displays(paddr, size, true);
+}
+
+// A texture (w x h, format fmt) at addr as its GPU copy holds it, rows in the decoded textures' order (made once per
+// change of the copy); nil without a copy.
+struct Snap {
+    id<MTLTexture> tex;
+    u64 id = 0, version = 0;
+};
+std::unordered_map<u64, Snap> snaps;
+// (ce: the compute encoder of the flush's snapshots, made on cb by the first one needed)
+id<MTLTexture> surface_snapshot(u32 addr, u32 w, u32 h, u32 fmt, id<MTLCommandBuffer> cb,
+                                id<MTLComputeCommandEncoder> __strong &ce) {
+    GRT *r = find_color(addr, w, fmt);
+    if (!r || r->h < h) return nil;
+    Snap &sn = snaps[(u64)addr << 32 ^ (u64)w << 20 ^ (u64)h << 4 ^ fmt];
+    if (!sn.tex || sn.tex.width != w * S || sn.tex.height != h * S) {
+        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                     width:w * S
+                                                                                    height:h * S
+                                                                                 mipmapped:NO];
+        d.storageMode = MTLStorageModePrivate;
+        d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+        sn.tex = [dev newTextureWithDescriptor:d];
+        sn.id = 0;
+    } else if (sn.id == r->id && sn.version == r->version) {
+        return sn.tex;
+    }
+    if (!ce) {
+        ce = [cb computeCommandEncoder];
+        label(ce, "snapshots");
+    }
+    [ce setComputePipelineState:k_snap];
+    [ce setTexture:r->tex atIndex:0];
+    [ce setTexture:sn.tex atIndex:1];
+    const u32 p[4] = {w * S, h * S, fmt == 1 || fmt == 3 ? 1u : 0u, 0};  // RGB8, RGB565: no alpha
+    [ce setBytes:p length:16 atIndex:0];
+    [ce dispatchThreads:MTLSizeMake(w * S, h * S, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    sn.id = r->id;
+    sn.version = r->version;
+    return sn.tex;
+}
 }  // namespace
 
 // ---------------------------------------------------------------- public backend interface
@@ -2299,10 +2648,18 @@ bool metal_init() {
             LOG("gpu metal: kernel compile failed: %s\n", err.localizedDescription.UTF8String);
             return false;
         }
-        k_down = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_down"] error:&err];
-        k_up = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_up"] error:&err];
         k_rot = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_rot"] error:&err];
-        if (!k_down || !k_up || !k_rot) return false;
+        k_xfer = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_xfer"] error:&err];
+        k_snap = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_snap"] error:&err];
+        k_enc = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_enc"] error:&err];
+        k_dec = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_dec"] error:&err];
+        k_dec_depth = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_dec_depth"] error:&err];
+        k_enc_depth = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_enc_depth"] error:&err];
+        k_tconv = [dev newComputePipelineStateWithFunction:[lib newFunctionWithName:@"k_tconv"] error:&err];
+        if (!k_rot || !k_xfer || !k_snap || !k_enc || !k_dec || !k_dec_depth || !k_enc_depth || !k_tconv) {
+            LOG("gpu metal: kernel pipelines failed: %s\n", err.localizedDescription.UTF8String);
+            return false;
+        }
         // GPU_SCALE: 1-4, or auto (default): the frontend picks it from the window size (set_scale)
         const char *sc = getenv("GPU_SCALE");
         scale_fixed = sc && atoi(sc) > 0;
@@ -2310,6 +2667,7 @@ bool metal_init() {
         const char *ms = getenv("GPU_MSAA");
         MS = ms ? (u32)std::clamp(atoi(ms), 1, 8) : kDefaultMSAA;
         while (MS > 1 && ((MS & (MS - 1)) || ![dev supportsTextureSampleCount:MS])) MS--;
+        ms_memoryless = [dev supportsFamily:MTLGPUFamilyApple1] && !getenv("GPU_MSAA_STORED");
         if (MS > 1) {
             MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
             pd.vertexFunction = [lib newFunctionWithName:@"k_full"];
@@ -2470,9 +2828,20 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
     }
     flush_no++;
     @autoreleasepool {
-        id<MTLCommandBuffer> cb = new_cb();
-        GRT &col = get_rt(rt.color_addr, rt.w, rt.h, rt.color_fmt, false);
-        GRT *dep = rt.depth_addr && pptr(rt.depth_addr) ? &get_rt(rt.depth_addr, rt.w, rt.h, rt.depth_fmt, true) : nullptr;
+        // a view shorter than an image the game drew taller before (the bottom screen's pass in the first rows of the
+        // top screen's target) draws into that taller copy, if its depth buffer has one as tall too (the attachments
+        // of a pass are as tall as each other)
+        // a batch whose draws neither test nor write depth or stencil (full-screen post-processing) leaves the depth
+        // buffer out of the pass: no restore, load or resolve of it
+        bool uses_depth = false;
+        for (const MSeg &seg : mb.segs) uses_depth |= seg.ds->depth_test || seg.ds->depth_write || seg.ds->stencil;
+        const bool has_dep = uses_depth && rt.depth_addr && pptr(rt.depth_addr);
+        const GRT *tall_c = find_view(rt.color_addr, rt.w, rt.color_fmt, false, true);
+        const GRT *tall_d = has_dep ? find_view(rt.depth_addr, rt.w, rt.depth_fmt, true, true) : nullptr;
+        const u32 hc = std::max(rt.h, tall_c ? tall_c->h : 0u), hd = has_dep ? std::max(rt.h, tall_d ? tall_d->h : 0u) : hc;
+        const u32 H = hc == hd ? hc : rt.h;
+        GRT &col = target_for(rt.color_addr, rt.w, H, rt.color_fmt, false);
+        GRT *dep = has_dep ? &target_for(rt.depth_addr, rt.w, H, rt.depth_fmt, true) : nullptr;
         // pending transfers still to write these targets' memory (sync_rt below hashes it)
         drain_touching(col.addr, rt_bytes(col));
         if (dep) drain_touching(dep->addr, rt_bytes(*dep));
@@ -2489,6 +2858,19 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             }
             o->synced = false;
         }
+        // textures sampled from GPU copies (TexUnitState::surf): a copy gone meanwhile (scale change) is written back
+        // and decoded instead
+        std::unordered_map<u64, const TexEntry *> surf_decoded;
+        auto surf_key = [](const TexUnitState &t) { return (u64)t.surf_addr << 32 ^ (u64)t.w << 20 ^ (u64)t.h << 4 ^ t.surf_fmt; };
+        for (const MSeg &seg : mb.segs)
+            for (const TexUnitState &t : seg.ds->tex) {
+                if (!t.surf || surf_decoded.count(surf_key(t))) continue;
+                GRT *r = find_color(t.surf_addr, t.w, t.surf_fmt);
+                if (r && r->h >= t.h) continue;
+                metal_guest_read(t.surf_addr, t.w * t.h * pixel_bytes(cbuf_to_pixfmt(t.surf_fmt)));
+                surf_decoded[surf_key(t)] = texcache_get(t.surf_addr, t.w, t.h, t.surf_fmt, 1);
+            }
+        id<MTLCommandBuffer> cb = list_cb();  // (after the write-backs above, which commit it)
         LoadAction cla = sync_rt(col, cb);
         if (col.clear_next) {  // (set_clear_after_top_transfer)
             col.clear_next = false;
@@ -2500,15 +2882,15 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
 
         // vertices: compute kernels shade the draws' vertex arrays into gbuf; the CPU's are in cbuf
         auto upload = [&](const void *p, size_t n) {
-            id<MTLBuffer> b = pool_get(n, cb);
-            if (n) memcpy(b.contents, p, n);
-            return b;
+            const Slice sl = arena(n);
+            if (n) memcpy(sl.p, p, n);
+            return sl;
         };
-        id<MTLBuffer> gbuf = pool_get((size_t)mb.gpu_verts * sizeof(OutVertex), cb);
-        id<MTLBuffer> cbuf = upload(mb.cverts.data(), mb.cverts.size() * sizeof(OutVertex));
-        id<MTLBuffer> ibuf = upload(mb.idx.data(), mb.idx.size() * 4);
+        const Slice gbuf = arena((size_t)mb.gpu_verts * sizeof(OutVertex));
+        const Slice cbuf = upload(mb.cverts.data(), mb.cverts.size() * sizeof(OutVertex));
+        const Slice ibuf = upload(mb.idx.data(), mb.idx.size() * 4);
         if (!mb.jobs.empty()) {
-            id<MTLBuffer> dbuf = upload(mb.vdata.data(), mb.vdata.size());
+            const Slice dbuf = upload(mb.vdata.data(), mb.vdata.size());
             // one dispatch per kernel: its draws' vertices one after the other, with their parameter blocks
             // in a buffer and each thread's draw in tj (draws are often only a few vertices, and a dispatch
             // per draw costs far more GPU time than the shading). The draws write disjoint ranges of gbuf.
@@ -2533,22 +2915,34 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                 g->tj.insert(g->tj.end(), j.p.nverts, (u32)g->params.size() - 1);
             }
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
-            [ce setBuffer:dbuf offset:0 atIndex:0];
-            [ce setBuffer:gbuf offset:0 atIndex:3];
+            label(ce, "vertex kernels %08x", rt.color_addr);
+            [ce setBuffer:dbuf.buf offset:dbuf.off atIndex:0];
+            [ce setBuffer:gbuf.buf offset:gbuf.off atIndex:3];
             vs_dispatches += groups.size();
             vs_passes++;
             vs_verts += mb.vids.size();
             for (const Group &g : groups) {
                 if (g.vids.empty()) continue;
                 [ce setComputePipelineState:g.ps];
-                [ce setBuffer:upload(g.vids.data(), g.vids.size() * 4) offset:0 atIndex:1];
-                [ce setBuffer:upload(g.params.data(), g.params.size() * sizeof(VsParamsG)) offset:0 atIndex:2];
-                [ce setBuffer:upload(g.tj.data(), g.tj.size() * 4) offset:0 atIndex:4];
+                const Slice vb = upload(g.vids.data(), g.vids.size() * 4);
+                const Slice pb = upload(g.params.data(), g.params.size() * sizeof(VsParamsG));
+                const Slice tb = upload(g.tj.data(), g.tj.size() * 4);
+                [ce setBuffer:vb.buf offset:vb.off atIndex:1];
+                [ce setBuffer:pb.buf offset:pb.off atIndex:2];
+                [ce setBuffer:tb.buf offset:tb.off atIndex:4];
                 const NSUInteger tg = std::min<NSUInteger>(64, g.ps.maxTotalThreadsPerThreadgroup);
                 [ce dispatchThreads:MTLSizeMake(g.vids.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
             }
             [ce endEncoding];
         }
+
+        std::unordered_map<u64, id<MTLTexture>> surf_tex;
+        id<MTLComputeCommandEncoder> snap_ce = nil;
+        for (const MSeg &seg : mb.segs)
+            for (const TexUnitState &t : seg.ds->tex)
+                if (t.surf && !surf_decoded.count(surf_key(t)) && !surf_tex.count(surf_key(t)))
+                    surf_tex[surf_key(t)] = surface_snapshot(t.surf_addr, t.w, t.h, t.surf_fmt, cb, snap_ce);
+        if (snap_ce) [snap_ce endEncoding];
 
         // with MSAA the pass draws into the multisampled targets and resolves them into the single-sample
         // ones (which everything else reads); a multisampled target older than its resolved copy (guest
@@ -2564,9 +2958,10 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         rp.colorAttachments[0].clearColor =
             MTLClearColorMake((cla.color & 255) / 255.0, ((cla.color >> 8) & 255) / 255.0,
                               ((cla.color >> 16) & 255) / 255.0, (cla.color >> 24) / 255.0);
-        rp.colorAttachments[0].storeAction = msaa ? MTLStoreActionStoreAndMultisampleResolve : MTLStoreActionStore;
+        const MTLStoreAction ms_store = ms_memoryless ? MTLStoreActionMultisampleResolve : MTLStoreActionStoreAndMultisampleResolve;
+        rp.colorAttachments[0].storeAction = msaa ? ms_store : MTLStoreActionStore;
         if (msaa) rp.colorAttachments[0].resolveTexture = col.tex;
-        id<MTLTexture> dt = dep ? (msaa ? dep->ms : dep->tex) : get_scratch_depth(rt.w, rt.h);
+        id<MTLTexture> dt = dep ? (msaa ? dep->ms : dep->tex) : get_scratch_depth(rt.w, H);
         rp.depthAttachment.texture = dt;
         rp.stencilAttachment.texture = dt;
         if (dep) {
@@ -2576,8 +2971,8 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             rp.depthAttachment.clearDepth = dla.depth;
             rp.stencilAttachment.clearStencil = dla.stencil;
             if (msaa) {
-                rp.depthAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
-                rp.stencilAttachment.storeAction = MTLStoreActionStoreAndMultisampleResolve;
+                rp.depthAttachment.storeAction = ms_store;
+                rp.stencilAttachment.storeAction = ms_store;
                 rp.depthAttachment.resolveTexture = dep->tex;
                 rp.stencilAttachment.resolveTexture = dep->tex;
                 rp.depthAttachment.depthResolveFilter = MTLMultisampleDepthResolveFilterSample0;
@@ -2593,12 +2988,13 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             rp.stencilAttachment.storeAction = MTLStoreActionDontCare;
         }
         id<MTLRenderCommandEncoder> re = [cb renderCommandEncoderWithDescriptor:rp];
-        [re setViewport:(MTLViewport){0, 0, (double)rt.w * S, (double)rt.h * S, 0, 1}];
+        label(re, "draw %08x %ux%u (%zu runs of draws)", rt.color_addr, rt.w, rt.h, mb.segs.size());
+        [re setViewport:(MTLViewport){0, 0, (double)rt.w * S, (double)H * S, 0, 1}];  // (the restores: all of it)
         [re setDepthClipMode:MTLDepthClipModeClamp];
         [re setFrontFacingWinding:MTLWindingCounterClockwise];
-        [re setVertexBuffer:gbuf offset:0 atIndex:0];
-        [re setVertexBuffer:cbuf offset:0 atIndex:1];
-        [re setVertexBuffer:ibuf offset:0 atIndex:2];
+        [re setVertexBuffer:gbuf.buf offset:gbuf.off atIndex:0];
+        [re setVertexBuffer:cbuf.buf offset:cbuf.off atIndex:1];
+        [re setVertexBuffer:ibuf.buf offset:ibuf.off atIndex:2];
         if (restore_c) {
             [re setRenderPipelineState:p_rcolor];
             [re setDepthStencilState:dss_off];
@@ -2613,8 +3009,9 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             [re setFragmentTexture:dep->stencil_view atIndex:1];
             [re drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
         }
-        col.ms_valid = true;
-        if (dep) dep->ms_valid = true;
+        col.ms_valid = !ms_memoryless;
+        if (dep) dep->ms_valid = !ms_memoryless;
+        [re setViewport:(MTLViewport){0, 0, (double)rt.w * S, (double)rt.h * S, 0, 1}];
 
         // per-draw uniforms and LUTs go into one shared buffer
         size_t uoff = 0;
@@ -2626,8 +3023,9 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         };
         // first pass: size
         const size_t need = mb.segs.size() * (256 + sizeof(Uni) + 256 + 24 * 256 * 8 + 256 + 128 * 8);
-        id<MTLBuffer> ubuf = pool_get(need, cb);
-        u8 *ub = (u8 *)ubuf.contents;
+        const Slice us = arena(need);
+        id<MTLBuffer> ubuf = us.buf;
+        u8 *ub = us.p;
         std::unordered_map<const void *, size_t> lut_map;
         bool wrote_color = false, wrote_depth = false;
         for (const MSeg &seg : mb.segs) {
@@ -2731,7 +3129,7 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                 } else {
                     lo = it->second;
                 }
-                [re setFragmentBuffer:ubuf offset:lo atIndex:1];
+                [re setFragmentBuffer:ubuf offset:us.off + lo atIndex:1];
             }
             if (ds.fog) {
                 const void *fk = ds.fog_lut.get();
@@ -2748,9 +3146,9 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                 } else {
                     fo = it->second;
                 }
-                [re setFragmentBuffer:ubuf offset:fo atIndex:2];
+                [re setFragmentBuffer:ubuf offset:us.off + fo atIndex:2];
             }
-            [re setFragmentBuffer:ubuf offset:uo atIndex:0];
+            [re setFragmentBuffer:ubuf offset:us.off + uo atIndex:0];
             // textures
             if (ds.need_shade) {
                 for (int k = 0; k < 3; k++) {
@@ -2759,7 +3157,15 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                     // upscaling (texture filter): 2D and projected textures only (not cube or shadow maps)
                     const bool up = tf_mode && (k != 0 || t.type == 0 || t.type == 3);
                     u32 ul = 0;
-                    id<MTLTexture> tex = get_texture(t.face[0], up ? &t : nullptr, &ul);
+                    id<MTLTexture> tex = nil;
+                    if (t.surf) {
+                        auto si = surf_tex.find(surf_key(t));
+                        if (si != surf_tex.end()) tex = si->second;
+                        auto di = surf_decoded.find(surf_key(t));
+                        if (di != surf_decoded.end()) tex = get_texture(di->second);
+                    } else {
+                        tex = get_texture(t.face[0], up ? &t : nullptr, &ul);
+                    }
                     if (!tex) {
                         // missing texture data: bind a 1x1 black texture
                         static id<MTLTexture> black;
@@ -2789,13 +3195,17 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             if (ds.depth_write || (ds.stencil && ds.st_mask_w)) wrote_depth = true;
         }
         [re endEncoding];
+        arena_trim(us, uoff);
         const double t1 = g_stats ? now_ms() : 0;
         if (tf_cb) {  // texture upscaling, before the draws that sample the results
             [tf_cb commit];
             tf_cb = nil;
         }
-        [cb commit];  // no wait: write-back happens when something reads the target
+        // no wait: write-back happens when something reads the target. With a texture filter, the passes go now:
+        // a later flush's upscaling (committed before the list's command buffer) may update textures they sample
+        if (tf_mode) commit_list_cb();
         if (wrote_color) col.gpu_newer = true;
+        col.version++;
         if (dep && wrote_depth) dep->gpu_newer = true;
         if (eager_writeback) {
             if (col.gpu_newer) write_back_color(col);
@@ -2822,9 +3232,10 @@ void metal_poll() {
             }
             busy_frac = (float)(b * 1000 / (t - last));
             if (log_timing)
-                LOG("[gpu] GPU busy %.1f ms/s (scale %u, MSAA %ux), %llu passes (%llu with vertex kernels: %llu "
-                    "dispatches, %llu vertices)\n",
-                    b * 1000 / ((t - last) / 1000), S, MS, (unsigned long long)flushes.exchange(0),
+                LOG("[gpu] GPU busy %.1f ms/s (scale %u, MSAA %ux), %llu command buffers, %llu passes (%llu with vertex "
+                    "kernels: %llu dispatches, %llu vertices)\n",
+                    b * 1000 / ((t - last) / 1000), S, MS, (unsigned long long)cbs_made.exchange(0),
+                    (unsigned long long)flushes.exchange(0),
                     (unsigned long long)vs_passes.exchange(0), (unsigned long long)vs_dispatches.exchange(0),
                     (unsigned long long)vs_verts.exchange(0));
             if (log_timing) {
@@ -2848,6 +3259,13 @@ void metal_poll() {
         const MTLCommandBufferStatus st = pending.front()->cb.status;
         if (st != MTLCommandBufferStatusCompleted && st != MTLCommandBufferStatusError) break;
         drain(0);
+    }
+}
+
+void metal_end_list() {
+    if (!active) return;
+    @autoreleasepool {
+        commit_list_cb();
     }
 }
 
@@ -2903,6 +3321,12 @@ void metal_guest_written(u32 paddr, u32 size, bool definite) {
         if (overlaps(r->addr, rt_bytes(*r), paddr, size)) {
             if (definite || !r->synced || hash_bytes(pptr(r->addr), rt_bytes(*r)) != r->hash) r->synced = false;
         }
+    drop_displays(paddr, size, definite);
+}
+
+namespace {
+// display images made from guest memory in [paddr, paddr + size): dropped if it was written (definite: certainly)
+void drop_displays(u32 paddr, u32 size, bool definite) {
     std::lock_guard<std::mutex> lk(disp_mtx);
     for (auto it = displays.begin(); it != displays.end();) {
         const DisplayImage &d = it->second;
@@ -2910,13 +3334,14 @@ void metal_guest_written(u32 paddr, u32 size, bool definite) {
             if (g_stats)
                 LOG("gpu metal: display image %08x dropped (%s write %08x+%x)\n", d.out_addr, definite ? "GPU" : "CPU",
                     paddr, size);
-            if (!d.cb && disp_free.size() < 6) disp_free.push_back(d.buf);
+            if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
             it = displays.erase(it);
         } else {
             ++it;
         }
     }
 }
+}  // namespace
 
 namespace {
 // the colour target a display transfer reads, starting at one of its tile rows (row0)
@@ -2952,7 +3377,7 @@ DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, 
     const u32 out_h0 = out_dims >> 16;
     for (auto it = displays.begin(); it != displays.end();) {
         if (overlaps(it->second.out_addr, it->second.out_size, out_paddr, out_size)) {
-            if (!it->second.cb && disp_free.size() < 6) disp_free.push_back(it->second.buf);
+            if (!it->second.cb && recyclable(it->second.buf)) disp_free.push_back(it->second.buf);
             it = displays.erase(it);
         } else {
             ++it;
@@ -3001,18 +3426,24 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     @autoreleasepool {
         op->cb = new_cb();
         if (src->clear_next) clear_now(*src, op->cb);
-        op->lin = take_buffer(lin_free, (size_t)src->w * src->h * 4);
+        op->gbytes = take_buffer(xbuf_free, rt_bytes(*src));
+        op->obytes = take_buffer(xbuf_free, out_size);
         {
             std::lock_guard<std::mutex> lk(disp_mtx);
             op->disp = take_buffer(disp_free, (size_t)TW * rows * 4);
         }
         id<MTLComputeCommandEncoder> ce = [op->cb computeCommandEncoder];
-        [ce setComputePipelineState:k_down];
-        [ce setTexture:src->tex atIndex:0];
-        [ce setBuffer:op->lin offset:0 atIndex:0];
-        const u32 prm[4] = {src->w, src->h, S, 0};
-        [ce setBytes:prm length:16 atIndex:1];
-        [ce dispatchThreads:MTLSizeMake(src->w, src->h, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        label(ce, "display transfer %08x -> %08x", in_paddr, out_paddr);
+        encode_guest_color(ce, *src, op->gbytes);
+        [ce setComputePipelineState:k_tconv];
+        [ce setBuffer:op->gbytes offset:0 atIndex:0];
+        [ce setBuffer:op->obytes offset:0 atIndex:1];
+        const u32 scaling = (flags >> 24) & 3;
+        const u32 out_w = (out_dims & 0xffff) >> (scaling ? 1 : 0), out_h = (out_dims >> 16) >> (scaling == 2 ? 1 : 0);
+        const u32 tp[4] = {in_dims & 0xffff, out_w, out_h, flags}, tq[4] = {in_paddr - src->addr, 0, 0, 0};
+        [ce setBytes:tp length:16 atIndex:2];
+        [ce setBytes:tq length:16 atIndex:3];
+        dispatch2d(ce, out_w, out_h);
         encode_rot(ce, *src, op->disp, rows, flags, row0);
         [ce endEncoding];
         [op->cb commit];
@@ -3037,6 +3468,104 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     }
     pending.push_back(std::move(op));
     return true;
+}
+
+bool metal_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width, u32 out_gap) {
+    if (!active || !size) return false;
+    // the source: a GPU copy the copy starts in at one of its tile rows
+    GRT *src = nullptr;
+    u32 row = 0, bpp = 0;
+    for (auto &r : rts) {
+        if (!gpu_valid(*r) || in_paddr < r->addr || in_paddr >= r->addr + rt_bytes(*r)) continue;
+        const u32 b = grt_bpp(*r), rw = r->w * 8 * b;
+        if ((in_paddr - r->addr) % rw) continue;
+        src = r.get();
+        row = rw;
+        bpp = b;
+        break;
+    }
+    if (!src || src->clear_next) return false;
+    // whole tiles of the first columns of whole tile rows (a contiguous copy: whole tile rows)
+    if (in_gap && in_width + in_gap != row) return false;
+    const u32 line = in_gap ? in_width : row;
+    if (line % (64 * bpp) || size % line) return false;
+    const u32 cols = line / (8 * bpp), rows = size / line * 8, sy0 = (in_paddr - src->addr) / row * 8;
+    if (sy0 + rows > src->h) return false;
+    // into the first columns of an image as wide as the output's rows with their gaps (contiguous: packed)
+    if (out_gap && (out_width != line || (out_width + out_gap) % (64 * bpp))) return false;
+    const u32 wd = out_gap ? (out_width + out_gap) / (8 * bpp) : cols;
+    const u32 bytes = (rows / 8 - 1) * wd * 8 * bpp + line;
+    GRT *d = dest_surface(out_paddr, wd, rows, src->fmt, src, bytes);
+    if (!d) return false;
+    @autoreleasepool {
+        id<MTLBlitCommandEncoder> be = [list_cb() blitCommandEncoder];
+        label(be, "copy %08x -> %08x", in_paddr, out_paddr);
+        [be copyFromTexture:src->tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, sy0 * S, 0)
+                 sourceSize:MTLSizeMake(cols * S, rows * S, 1) toTexture:d->tex destinationSlice:0 destinationLevel:0
+          destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [be endEncoding];
+    }
+    gpu_wrote(*d, out_paddr, bytes);
+    return true;
+}
+
+bool metal_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
+    if (!active || (flags & 2) || !(flags & 0x20) || (flags & 4)) return false;  // tiled to tiled, not cropped
+    const u32 in_w = in_dims & 0xffff, in_h = in_dims >> 16, out_w0 = out_dims & 0xffff, out_h0 = out_dims >> 16;
+    const u32 in_fmt = (flags >> 8) & 7, out_fmt = (flags >> 12) & 7, scaling = (flags >> 24) & 3;
+    if (in_w != out_w0 || in_h != out_h0 || in_fmt > 4 || out_fmt > 4 || scaling > 2 || in_w % 8 || in_h % 8) return false;
+    const u32 hs = scaling ? 1 : 0, vs = scaling == 2 ? 1 : 0;
+    const u32 out_w = out_w0 >> hs, out_h = out_h0 >> vs;
+    if (!out_w || !out_h || out_w % 8 || out_h % 8) return false;
+    const u32 sfmt = pix_to_cbuf(in_fmt), rw = in_w * 8 * pixel_bytes(in_fmt);
+    GRT *src = nullptr;
+    u32 sy0 = 0;
+    for (auto &r : rts) {
+        if (r->w != in_w || r->fmt != sfmt || !gpu_valid(*r) || in_paddr < r->addr || in_paddr >= r->addr + rt_bytes(*r) ||
+            (in_paddr - r->addr) % rw)
+            continue;
+        src = r.get();
+        sy0 = (in_paddr - r->addr) / rw * 8;
+        break;
+    }
+    if (!src || src->clear_next) return false;
+    if (sy0 + in_h > src->h) {  // (an image read taller than what was copied there)
+        if (sy0) return false;
+        @autoreleasepool {
+            src = grow(*src, in_h, list_cb());
+        }
+        if (!src) return false;
+    }
+    const u32 bytes = out_w * out_h * pixel_bytes(out_fmt);
+    GRT *d = dest_surface(out_paddr, out_w, out_h, pix_to_cbuf(out_fmt), src, bytes);
+    if (!d) return false;
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> ce = [list_cb() computeCommandEncoder];
+        label(ce, "transfer %08x -> %08x", in_paddr, out_paddr);
+        [ce setComputePipelineState:k_xfer];
+        [ce setTexture:src->tex atIndex:0];
+        [ce setTexture:d->tex atIndex:1];
+        const u32 p[4] = {out_w * S, out_h * S, sy0 * S, 0};
+        const u32 q[4] = {hs, vs, flags & 1, in_fmt == 1 || in_fmt == 2 ? 1u : 0u};  // RGB8, RGB565: no alpha
+        [ce setBytes:p length:16 atIndex:0];
+        [ce setBytes:q length:16 atIndex:1];
+        [ce dispatchThreads:MTLSizeMake(out_w * S, out_h * S, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [ce endEncoding];
+    }
+    gpu_wrote(*d, out_paddr, bytes);
+    return true;
+}
+
+bool metal_surface_for(u32 addr, u32 w, u32 h, u32 fmt) {
+    if (!active || fmt > 4) return false;
+    GRT *r = find_color(addr, w, fmt);
+    if (!r || !gpu_valid(*r) || r->clear_next) return false;
+    if (r->h < h) {
+        @autoreleasepool {
+            r = grow(*r, h, list_cb());
+        }
+    }
+    return r != nullptr;
 }
 
 void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
@@ -3119,23 +3648,40 @@ bool find_view(u32 fb, u32 stride, u32 lines, DisplayView &v) {
     }
     return false;
 }
+// The image for the framebuffer finished on the GPU, waited for without disp_mtx held (the GX thread takes it to
+// finish transfers and to replace images meanwhile); false: no image there.
+bool wait_for_view(u32 fb, u32 stride, u32 lines) {
+    id<MTLCommandBuffer> cb;
+    {
+        std::lock_guard<std::mutex> lk(disp_mtx);
+        DisplayView v;
+        if (!find_view(fb, stride, lines, v)) return false;
+        cb = v.d->cb;
+    }
+    if (cb) [cb waitUntilCompleted];
+    return true;
+}
 // calls fn with the view's pixels (rows of v.w), copied out of the image only when it is a part of it
-void with_view(const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
-    if (v.d->cb) [v.d->cb waitUntilCompleted];
-    const u32 *px = (const u32 *)v.d->buf.contents;
-    if (v.x0 == 0 && v.y0 == 0 && v.w == v.d->w && v.h == v.d->h) {
+// (px: the image's pixels, rows of dw, dh rows)
+void view_pixels(const u32 *px, u32 dw, u32 dh, const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
+    if (v.x0 == 0 && v.y0 == 0 && v.w == dw && v.h == dh) {
         fn(px, (int)v.w, (int)v.h);
         return;
     }
     thread_local std::vector<u32> part;
     part.resize((size_t)v.w * v.h);
-    for (u32 y = 0; y < v.h; y++) memcpy(&part[(size_t)y * v.w], px + (size_t)(v.y0 + y) * v.d->w + v.x0, v.w * 4);
+    for (u32 y = 0; y < v.h; y++) memcpy(&part[(size_t)y * v.w], px + (size_t)(v.y0 + y) * dw + v.x0, v.w * 4);
     fn(part.data(), (int)v.w, (int)v.h);
+}
+void with_view(const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
+    if (v.d->cb) [v.d->cb waitUntilCompleted];
+    view_pixels((const u32 *)v.d->buf.contents, v.d->w, v.d->h, v, fn);
 }
 }  // namespace
 
 bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h) {
     thread_local std::vector<u32> out;
+    if (!wait_for_view(fb_paddr, stride, lines)) return false;
     std::lock_guard<std::mutex> lk(disp_mtx);
     DisplayView v;
     if (!find_view(fb_paddr, stride, lines, v)) return false;
@@ -3150,20 +3696,38 @@ bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba
 
 u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
                       const std::function<void(const u32 *, int, int)> &fn) {
-    std::lock_guard<std::mutex> lk(disp_mtx);
+    if (!wait_for_view(fb_paddr, stride, lines)) return 0;
+    // fn (an upload to the UI's texture: slow for a large image) runs without disp_mtx held, the buffer kept from
+    // being reused meanwhile
     DisplayView v;
-    if (!find_view(fb_paddr, stride, lines, v)) return 0;
-    if (v.key == have) return have;
-    // a frame drawn while new pipelines were compiling lacks those draws (often most of the scene: a flash of
-    // the clear colour); keep showing the last image instead, for a few frames at most
-    static int held[2];
-    int &h = held[lines == 400 ? 0 : 1];
-    if (v.d->incomplete && have && h < 6) {
-        h++;
-        return have;
+    id<MTLBuffer> buf;
+    u32 dw, dh;
+    {
+        std::unique_lock<std::mutex> lk(disp_mtx);
+        if (!find_view(fb_paddr, stride, lines, v)) return 0;
+        if (v.key == have) return have;
+        // a frame drawn while new pipelines were compiling lacks those draws (often most of the scene: a flash of
+        // the clear colour); keep showing the last image instead, for a few frames at most
+        static int held[2];
+        int &h = held[lines == 400 ? 0 : 1];
+        if (v.d->incomplete && have && h < 6) {
+            h++;
+            return have;
+        }
+        h = 0;
+        if (v.d->cb) [v.d->cb waitUntilCompleted];  // (an image made since wait_for_view: rare)
+        buf = v.d->buf;
+        dw = v.d->w;
+        dh = v.d->h;
+        disp_reading.push_back(buf);
     }
-    h = 0;
-    with_view(v, fn);
+    view_pixels((const u32 *)buf.contents, dw, dh, v, fn);
+    std::lock_guard<std::mutex> lk(disp_mtx);
+    for (size_t i = 0; i < disp_reading.size(); i++)
+        if (disp_reading[i] == buf) {
+            disp_reading.erase(disp_reading.begin() + i);
+            break;
+        }
     return v.key;
 }
 

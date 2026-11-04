@@ -310,11 +310,15 @@ both aim.
 **Stacks in the pockets** (the menu's "Stack items", in any layout, off by default): as in New Horizons, several of
 the same item share one pocket, with the count on it: flowers, seed bags, saplings, shrub starts, shells,
 mushrooms, wrapping paper, pitfall seeds, fertilizer, candy, lollipops, fortune cookies and coffee beans up to 10,
-nuggets and gems up to 30 (fruit and stationery already stack in the game). An item picked up joins its stack; one
-dropped, sold, given or planted from a stack is replaced by the next as soon as the player is free again (the
-pockets, a dialog or a shop's screen closed). The game itself knows only the pocket's one item: the rest are kept
-next to its save (`savedata/recomp_stacks.txt`, written whenever the game saves, so backups and cloud saves carry
-it), for each player of each town. Turned off, the stacks go back to free pockets as room allows.
+nuggets and gems up to 30 (fruit and stationery already stack in the game). An item picked up joins its stack, even
+with the pockets full (standing on it, its stack makes room); one dropped, sold, given or planted from a stack is
+replaced by the next as soon as the player is free again (the pockets, a dialog or a shop's screen closed). Talking
+to someone (a shop's counter, a villager) lays the stacks out in free pockets for the conversation, one pocket left
+free for what it may give, so the game's own screens take several at once: a whole stack sells in one sale. The
+counts show on the shops' sell screen too, for what stays stacked. The game itself knows only the pocket's one item:
+the rest are kept next to its save (`savedata/recomp_stacks.txt`, written whenever the game saves, so backups and
+cloud saves carry it), for each player of each town. Turned off, the stacks go back to free pockets as room
+allows.
 
 The keyboard's keys stand for the gamepad's as in the controls table (1 is ZL, Backspace is −, I J K L the d-pad).
 
@@ -328,6 +332,25 @@ A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `
 [Typing](#typing)), write values (`set`, e.g. a layout pane's visible flag) and describe one-screen play
 (`onescreen`, `focus panel`, `bind`, `hub`, `map`, `tools`, `clearbottom`, `stack`: see Animal Crossing's profile). To write one: `RECOMP_MEMDUMP` snapshots memory for diffing, `RECOMP_PROFILE=<file>` loads a draft and
 `RECOMP_PROFILE_TRACE=<n>` logs every value every n frames.
+
+**One profile for every region.** Addresses differ between a game's regions and versions, so a profile can name
+them by what they are instead (`symbol`, see `runtime/profile.cpp`), found in the running game through its C++
+classes:
+
+- **Classes:** the recompiler lists every class it finds through the game's RTTI, CRO modules included, with the
+  address its objects hold as their vtable pointer (`tools/recomp/rtti.py`, the generated `guest_classes`;
+  `python3 tools/recomp/rtti.py data/<name> [class...]` prints them).
+- **Chains:** a symbol starts from a class (`vtable BsMenuItem`) and follows its code. It can take a virtual
+  function (`slot 6`), a function that function calls (`call 3`), a static variable it loads (`global 0`), a
+  function that refers to the address (`user 4`: a class's constructors and factories), an offset (`+ 0x30`) or a
+  pointer (`> 0`).
+- **Regions:** lines whose content differs between regions, such as a keyboard's keys, take a `region USA` or
+  `region EUR` prefix.
+
+Animal Crossing: New Leaf – Welcome amiibo's profile is written this way, once, in
+`games/profiles/acnl-welcome-amiibo.txt`; each region's `games/<title id>/profile.txt` links to it. The log lists
+what every symbol came to (`[profile] symbol ...`), and a symbol that cannot be found is an error naming the line,
+with the directives that use it left out.
 
 ## How it works
 
@@ -363,7 +386,11 @@ A profile can also map the game's own on-screen keyboard (`keyboard when ...`, `
     as one dispatch per kernel per batch of draws; clipping,
     culling and snapping happen in a shared vertex shader, and the fragment pipeline (TEV combiners, fragment
     lighting, fog, tests, blending) becomes MSL generated per pipeline state, rendering at an internal resolution
-    scale with guest memory kept authoritative by lazy write-back. Geometry shaders, immediate-mode vertices and
+    scale with guest memory kept authoritative by lazy write-back. Draws into different render targets stay
+    batched while the targets share no memory (a game alternating between two targets object by object gets one
+    pass per target), a command list's passes share one command buffer, and texture copies and tiled-to-tiled
+    transfers of what the GPU drew (post-processing chains) run on the GPU, with draws sampling their results
+    there. Geometry shaders, immediate-mode vertices and
     vertex programs still compiling run in the CPU interpreter (pre-decoded, 4-wide SIMD).
   - `audio/`: HLE of the DSP audio firmware, output through SDL3.
   - `frontend.cpp`: SDL3 window, input, VBlank pacing.
@@ -392,7 +419,9 @@ constants by the recompiler. `tools/disasm.py` shows module code at slot address
   In auto mode the scale is also lowered, one step at a time, when the game drops frames (its frame rate is
   neither ~60 nor a steady ~30) while the GPU is busy over half the time, and raised again when the next scale
   should fit; heavy games (Metroid: Samus Returns) settle at 2x on an M4 Pro, others keep 4x.
-- `GPU_MSAA=1|2|4|8`: multisample anti-aliasing of the Metal render targets (default 4).
+- `GPU_MSAA=1|2|4|8`: multisample anti-aliasing of the Metal render targets (default 4). The samples live in tile
+  memory only: each pass resolves them and the next restores them from the resolved image (`GPU_MSAA_STORED=1`
+  keeps every sample in memory between passes instead, slower at high scales).
 - `GPU_ANISO=1..16`: anisotropic filtering of the textures the game filters linearly with mipmaps (default 16).
 - `GPU_TEX_FILTER=0|1|2`: texture upscaling (default 0, off; `gpu::set_texture_filter` at run time). 1 (Sharp)
   is an edge-directed 2x pass in the spirit of xBR, applied twice for 4x: hard steps stay crisp, diagonal and
@@ -439,7 +468,8 @@ keep the Metal compiler out of gameplay:
   (which fixed-function modes a draw uses), no game code or data.
 - Diagnostics: `GPU_HITCH_MS=<ms>` logs command lists slower than that; `GPU_VERIFY_KEYS=1` checks that every
   new pipeline key decodes back to the same shader; `GPU_NO_METALLIB=1` ignores the precompiled library;
-  `GPU_NO_PRECOMPILE=1 GPU_SYNC_SHADERS=1` turns all of this off for comparisons.
+  `GPU_NO_PRECOMPILE=1 GPU_SYNC_SHADERS=1` turns all of this off for comparisons; `GPU_LABELS=1` labels the Metal
+  encoders (what each does, to which guest memory) for Instruments' Metal System Trace and GPU captures.
 
 ## Debugging aids
 

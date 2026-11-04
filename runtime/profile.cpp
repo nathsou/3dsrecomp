@@ -1,5 +1,25 @@
 // Per-game profiles. A profile is a text file, one directive per line ('#' starts a comment):
 //
+//   symbol <name> = <start> [<step>]...
+//       A number found in the game rather than written down, so that one profile serves every region and version of
+//       a game. Wherever a number goes, a symbol's name may stand instead (defined on an earlier line). Start:
+//         vtable <class>   the address a class's objects hold as their vtable pointer, from the game's RTTI
+//                          (classes outside namespaces with one primary vtable, CRO modules' too)
+//         <symbol> | <n>   an earlier symbol, or a number
+//       Steps, each on the address so far:
+//         slot <n>         the function in its n-th word (a vtable's n-th virtual function)
+//         call <k>         the k-th function the function there calls (bl / blx, in order, from 0)
+//         global <k>       the k-th distinct address in the program's data or bss that the function there loads from
+//                          its literal pool (its static variables, in order of first use)
+//         user <k>         the k-th function (in address order) whose literal pool holds the address (for a
+//                          vtable: the class's constructors, destructors and factories)
+//         + <n>, - <n>     an offset
+//         > <n>            the word there, plus n (a pointer in the program's initialised data)
+//       A function is read from its start up to its first literal pool. A symbol that cannot be found is an error
+//       (the directives using it are left out), and the log lists every symbol's value.
+//   region <JPN|USA|EUR|AUS|CHN|KOR|TWN>[,...] <directive>
+//       The directive only for those regions (the game's own, from its icon's region lockout): e.g. keyboards
+//       whose keys differ.
 //   value <name> = <type> <address> [> <offset>]...
 //       A number in guest memory. Types: u8 u16 u32 s8 s16 s32 f32 (f32 is truncated to an integer). Each
 //       "> off" follows a pointer: the address so far is read as a u32 and off is added (a null or unmapped
@@ -46,6 +66,9 @@
 //   stack owner <value> ...
 //   stack on <address>
 //   stack free <offset> <state> ...
+//   stack spread <state> ... keep <n>
+//   stack shown when <cond>
+//   stack underfoot <offset>
 //       Stacks in the pockets, as in Animal Crossing: New Horizons (an option in the menu): items of those
 //       categories (as "tools items" reads them) pile up to n in one pocket, the extra ones kept by the runtime
 //       for each owner (the values tell players and towns apart) and written next to the save whenever the game
@@ -53,7 +76,15 @@
 //       and the pockets are closed ("tools equip ... when-open ... ready"): a second pocket with the same item joins the first one's stack, and a stack's
 //       pocket that empties (the item dropped, sold, given, planted) gets the next one. With "stack free", the
 //       player is free while the byte at <offset> in the object called there (its first argument: the player) is
-//       one of the states (standing, walking: indoors too, where the ready condition may not tell).
+//       one of the states (standing, walking: indoors too, where the ready condition may not tell). With
+//       "stack spread", while that byte is one of these states (a conversation: a shop's counter, a villager), the
+//       stacks' extra items are laid out in free pockets as it starts, n of them left free for what the
+//       conversation may give, so the game's own screens can take several at once (all of a stack sold in one
+//       sale); they gather back into their stacks once the player is free. "stack shown" draws the counts while
+//       its condition holds too, for screens other than the pockets that show them in the same places. "stack
+//       underfoot" names where the player keeps the item it stands on (the 2 bytes at <offset>): with the pockets
+//       full, a stack of that item with room gives up its pocket while the player stands there, so the game picks
+//       the item up into it and it joins the stack (it goes back once the player steps off).
 //   aim delta <return address> <x offset> <y offset> [per s<n>] [active r<n> <offset>] on <address> ...
 //   aim stick <pixels per second>
 //   aim when <condition>
@@ -112,6 +143,25 @@
 #include "gpu_iface.h"
 #include "kernel.h"
 #include "loader.h"
+
+// the game's classes (tools/recomp/rtti.py), for symbols
+#ifdef RECOMP_MODULES  // several games in one app: the loaded game's (set_game_classes)
+static const GuestClass *game_classes;
+static u32 game_class_count;
+void set_game_classes(const GuestClass *c, u32 count) {
+    game_classes = c;
+    game_class_count = count;
+}
+#else
+extern "C" {
+extern const GuestClass guest_classes[];
+extern const u32 guest_class_count;
+__attribute__((weak)) const GuestClass guest_classes[1] = {};
+__attribute__((weak)) const u32 guest_class_count = 0;
+}
+static const GuestClass *const game_classes = guest_classes;
+static const u32 &game_class_count = guest_class_count;
+#endif
 
 namespace profile {
 namespace {
@@ -177,11 +227,141 @@ u32 button_mask(const std::string &names) {
 }
 namespace {
 
+std::map<std::string, s64> symbols;
+
 bool num(const std::string &t, s64 &out) {
     if (t.empty()) return false;
+    if (auto it = symbols.find(t); it != symbols.end()) {
+        out = it->second;
+        return true;
+    }
     char *e;
     out = strtoll(t.c_str(), &e, 0);
     return *e == 0;
+}
+
+// ---- symbols: addresses found through the game's RTTI and its code
+
+const GuestClass *find_class(const std::string &name) {
+    for (u32 i = 0; i < game_class_count; i++)
+        if (name == game_classes[i].name) return &game_classes[i];
+    return nullptr;
+}
+
+bool program_global(u32 a) { return a >= g_game.data_addr && a < g_game.data_addr + g_game.data_size + g_game.bss_size; }
+
+// The function at fn (Thumb with bit 0) from its start up to its first literal pool: the program globals it loads
+// from the pool (distinct, in order of first use) and the functions it calls (bl / blx, in order).
+void scan_function(u32 fn, std::vector<u32> &globals, std::vector<u32> &calls) {
+    auto global = [&](u32 lit) {
+        if (!kernel::guest_readable(lit, 4)) return;
+        const u32 v = r32(lit);
+        if (program_global(v) && std::find(globals.begin(), globals.end(), v) == globals.end()) globals.push_back(v);
+    };
+    u32 pool = ~0u;
+    if (fn & 1) {
+        for (u32 pc = fn & ~1u, n = 0; n < 4096 && pc < pool && kernel::guest_readable(pc, 4); n++, pc += 2) {
+            const u16 h = r16(pc);
+            if ((h & 0xF800) == 0x4800) {  // ldr rX, [pc, #imm]
+                const u32 lit = ((pc + 4) & ~3u) + (h & 0xFF) * 4;
+                pool = std::min(pool, lit);
+                global(lit);
+            } else if ((h & 0xF800) == 0xF000) {  // bl / blx: two halves
+                const u16 h2 = r16(pc + 2);
+                s32 off = (s32)(((h & 0x7FF) << 12) | ((h2 & 0x7FF) << 1));
+                if (off & 0x400000) off -= 0x800000;
+                if ((h2 & 0xF800) == 0xF800) calls.push_back((pc + 4 + off) | 1);
+                else if ((h2 & 0xF800) == 0xE800) calls.push_back((pc + 4 + off) & ~3u);
+                pc += 2;
+            }
+        }
+        return;
+    }
+    for (u32 pc = fn, n = 0; n < 4096 && pc < pool && kernel::guest_readable(pc, 4); n++, pc += 4) {
+        const u32 w = r32(pc), cond = w >> 28;
+        if (cond != 0xF && (w & 0x0F7F0000) == 0x051F0000) {  // ldr rX, [pc, #+-imm]
+            const u32 lit = pc + 8 + ((w & (1u << 23)) ? (w & 0xFFF) : -(w & 0xFFF));
+            if (lit > pc) pool = std::min(pool, lit);
+            global(lit);
+        } else if ((w & 0x0E000000) == 0x0A000000 && (cond == 0xF || (w & 0x01000000))) {  // bl, blx #imm
+            s32 off = (s32)(w & 0xFFFFFF);
+            if (off & 0x800000) off -= 0x1000000;
+            const u32 t = pc + 8 + off * 4;
+            calls.push_back(cond == 0xF ? (t | ((w >> 23) & 2) | 1) : t);
+        }
+    }
+}
+
+// the functions whose literal pool holds v, in address order
+std::vector<u32> users_of(u32 v) {
+    std::vector<u32> fs;
+    for (u32 a = g_game.text_addr; a + 4 <= g_game.text_addr + g_game.text_size; a += 4)
+        if (r32(a) == v)
+            if (const u32 f = function_start(a); f && std::find(fs.begin(), fs.end(), f) == fs.end()) fs.push_back(f);
+    std::sort(fs.begin(), fs.end());
+    return fs;
+}
+
+// "<start> [<step>]..." from t[i..]
+bool resolve(const std::vector<std::string> &t, size_t i, s64 &out, std::string &err) {
+    if (i >= t.size()) {
+        err = "expected 'vtable <class>', a symbol or a number";
+        return false;
+    }
+    u32 a;
+    if (t[i] == "vtable") {
+        const GuestClass *c = i + 1 < t.size() ? find_class(t[i + 1]) : nullptr;
+        if (!c) {
+            err = "no class " + (i + 1 < t.size() ? t[i + 1] : std::string("named")) + " in the game's RTTI";
+            return false;
+        }
+        a = c->vptr;
+        i += 2;
+    } else {
+        s64 n;
+        if (!num(t[i], n)) {
+            err = "unknown symbol " + t[i];
+            return false;
+        }
+        a = (u32)n;
+        i++;
+    }
+    char at[16];
+    for (; i < t.size(); i += 2) {
+        s64 n;
+        if (i + 1 >= t.size() || !num(t[i + 1], n)) {
+            err = "expected a number after " + t[i];
+            return false;
+        }
+        const std::string &s = t[i];
+        snprintf(at, sizeof at, "%08x", a);
+        if (s == "+") a += (u32)n;
+        else if (s == "-") a -= (u32)n;
+        else if (s == "slot" || s == ">") {
+            const u32 w = s == "slot" ? a + 4 * (u32)n : a;
+            if (!kernel::guest_readable(w, 4)) {
+                err = "nothing at " + std::string(at);
+                return false;
+            }
+            a = r32(w) + (s == ">" ? (u32)n : 0);
+        } else if (s == "call" || s == "global" || s == "user") {
+            std::vector<u32> globals, calls, users;
+            if (s == "user") users = users_of(a);
+            else scan_function(a, globals, calls);
+            const auto &list = s == "call" ? calls : s == "global" ? globals : users;
+            if ((u64)n >= list.size()) {
+                err = std::string(at) + " has " + std::to_string(list.size()) + " " + s + (list.size() == 1 ? "" : "s") +
+                      ", not " + std::to_string(n + 1);
+                return false;
+            }
+            a = list[n];
+        } else {
+            err = "unknown step " + s;
+            return false;
+        }
+    }
+    out = a;
+    return true;
 }
 
 int value_index(const std::string &n) {
@@ -253,7 +433,38 @@ bool parse_line(const std::string &line, std::string &err) {
         }
     }
     if (t.empty()) return true;
+    if (t[0] == "region") {  // "region EUR,AUS <directive>": only for those regions
+        static const char *names[] = {"JPN", "USA", "EUR", "AUS", "CHN", "KOR", "TWN"};
+        if (t.size() < 3) {
+            err = "expected 'region <names> <directive>'";
+            return false;
+        }
+        bool mine = false;
+        std::istringstream rs(t[1]);
+        for (std::string r; std::getline(rs, r, ',');) {
+            bool known = false;
+            for (int i = 0; i < 7; i++)
+                if (r == names[i]) known = true, mine |= g_game.region == i;
+            if (!known) {
+                err = "unknown region " + r;
+                return false;
+            }
+        }
+        if (!mine) return true;
+        t.erase(t.begin(), t.begin() + 2);
+    }
     const std::string &d = t[0];
+    if (d == "symbol") {
+        s64 v;
+        if (t.size() < 4 || t[2] != "=") {
+            err = "expected 'symbol <name> = <start> [<step>]...'";
+            return false;
+        }
+        if (!resolve(t, 3, v, err)) return false;
+        symbols[t[1]] = v;
+        LOG("[profile] symbol %s = %08llx\n", t[1].c_str(), (unsigned long long)v);
+        return true;
+    }
     auto at = [&](size_t i, int &x, int &y) {  // "at <x> <y>" at t[i]
         s64 a, b;
         if (i + 2 >= t.size() || t[i] != "at" || !num(t[i + 1], a) || !num(t[i + 2], b)) {
@@ -284,7 +495,7 @@ bool parse_line(const std::string &line, std::string &err) {
             if (t[3] == n) v.type = c;
         s64 a;
         if (!v.type || !num(t[4], a)) {
-            err = "bad type or address";
+            err = v.type ? "unknown address or symbol " + t[4] : "bad type " + t[3];
             return false;
         }
         v.addr = (u32)a;
@@ -552,6 +763,36 @@ bool parse_line(const std::string &line, std::string &err) {
                 c.free_states.push_back((u8)v);
             }
             return true;
+        }
+        if (t[1] == "spread") {
+            const size_t k = std::find(t.begin(), t.end(), "keep") - t.begin();
+            s64 n;
+            if (k < 3 || k + 2 != t.size() || !num(t[k + 1], n) || n < 0) {
+                err = "expected 'stack spread <state> ... keep <n>'";
+                return false;
+            }
+            for (size_t i = 2; i < k; i++) {
+                if (!num(t[i], a)) {
+                    err = "expected a number";
+                    return false;
+                }
+                c.spread_states.push_back((u8)a);
+            }
+            c.spread_keep = (int)n;
+            return true;
+        }
+        if (t[1] == "underfoot") {
+            if (t.size() != 3 || !num(t[2], a)) {
+                err = "expected 'stack underfoot <offset>'";
+                return false;
+            }
+            c.underfoot_off = (u32)a;
+            return true;
+        }
+        if (t[1] == "shown") {
+            c.shown_cond = when(t, 2, err);
+            if (c.shown_cond < 0 && err.empty()) err = "expected 'stack shown when <cond>'";
+            return c.shown_cond >= 0;
         }
         if (t[1] == "kinds") {
             const size_t m = std::find(t.begin(), t.end(), "max") - t.begin();
