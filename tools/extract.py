@@ -8,10 +8,12 @@
   info.json      the parsed layout
 
 Encrypted dumps (an encrypted NCCH, a CIA with its ticket) are decrypted while they are read, with keys from
-your own console: --boot9 boot9.bin and, for a CIA's title key, --keys aes_keys.txt (see tools/ctrcrypto.py).
+your own console: --boot9 boot9.bin and, for a CIA's title key, --keys aes_keys.txt; titles that use seed crypto
+also need their seed, --seeddb seeddb.bin (see tools/ctrcrypto.py).
 A .3dsx is relocated to 0x00100000 and gets a synthetic exheader, as if it were an application started by the
 system (see extract_3dsx).
 Usage: extract.py <dump> <outdir> [--no-unpack] [--argv0 sdmc:/3ds/<name>.3dsx] [--boot9 <file>] [--keys <file>]
+                   [--seeddb <file> | --seed <hex>]
 """
 import json
 import os
@@ -246,7 +248,7 @@ def main():
     UNPACK = '--no-unpack' not in sys.argv
 
     def opt(name): return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
-    keys = ctrcrypto.Keys(opt('--boot9'), opt('--keys'))
+    keys = ctrcrypto.Keys(opt('--boot9'), opt('--keys'), opt('--seeddb'), opt('--seed'))
     os.makedirs(outdir, exist_ok=True)
     with open(src, 'rb') as fh:
         if fh.read(4) == b'3DSX':

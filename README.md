@@ -70,7 +70,9 @@ python3 -m venv .venv && .venv/bin/pip install capstone unicorn   # only for too
    decrypted while they are read, with keys from your own console: `--boot9 boot9.bin` (boot9strap dumps it to
    the SD card's `boot9strap/` folder when the console is powered on with Start + Select + X held) and, for a
    CIA, `--keys aes_keys.txt` in the Citra/Azahar format with the ticket's common KeyY (`common0=...`). Titles
-   that use seed crypto are not supported. See `tools/ctrcrypto.py`.
+   that use seed crypto (released for firmware 9.6 and later, such as Hey! Pikmin) also need their seed:
+   `--seeddb seeddb.bin`, which GodMode9 writes to `gm9/out/` with "Build support files" (HOME menu > More...)
+   from the titles installed on the console, or `--seed <32 hex digits>`. See `tools/ctrcrypto.py`.
 
 2. **Recompile** the code to C (`generated/<name>/`, a few seconds):
 
