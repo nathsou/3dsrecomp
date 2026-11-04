@@ -1159,10 +1159,15 @@ static u32 host_input(float &rsx, float &rsy) {
 }
 
 static void poll_input_devices(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty);
-static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
+// sx, sy: the right stick as the second circle pad (Circle Pad Pro), unless one-screen play uses it
+static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty, s16 &sx, s16 &sy) {
     poll_input_devices(buttons, cx, cy, touch, tx, ty);
     float rsx, rsy;
     const u32 host = host_input(rsx, rsy);
+    constexpr float CSTICK_RADIUS = 0x7FF;
+    const bool own = onescreen::active();
+    sx = own ? 0 : (s16)(rsx * CSTICK_RADIUS);
+    sy = own ? 0 : (s16)(rsy * CSTICK_RADIUS);
     if (const u32 live = g_live_host; live) {  // (scripted host input: its default buttons too)
         static const u32 defaults[][2] = {
             {onescreen::H_A, BTN_A}, {onescreen::H_B, BTN_B}, {onescreen::H_X, BTN_X}, {onescreen::H_Y, BTN_Y},
@@ -1310,7 +1315,7 @@ static void gpu_thread() {
 
 // The HID module refreshes the pad shared memory at 234 Hz like the real one; the main loop polls the host
 // devices at VBlank and publishes a snapshot.
-struct InputSnapshot { u32 buttons; s16 cx, cy; bool touch; u16 tx, ty; };
+struct InputSnapshot { u32 buttons; s16 cx, cy; bool touch; u16 tx, ty; s16 sx, sy; };
 static std::mutex input_m;
 static InputSnapshot input_now{};
 
@@ -1326,7 +1331,7 @@ static void hid_thread() {
             std::lock_guard<std::mutex> lk(input_m);
             s = input_now;
         }
-        kernel::hid_update(s.buttons, s.cx, s.cy, s.touch, s.tx, s.ty);
+        kernel::hid_update(s.buttons, s.cx, s.cy, s.touch, s.tx, s.ty, s.sx, s.sy);
     }
 }
 
@@ -1556,11 +1561,12 @@ void frontend_run() {
             s16 cx, cy;
             bool touch;
             u16 tx = 0, ty = 0;
-            poll_input(b, cx, cy, touch, tx, ty);
-            if (paused || menu::keyboard_open()) b = 0, cx = cy = 0, touch = false;
+            s16 sx, sy;
+            poll_input(b, cx, cy, touch, tx, ty, sx, sy);
+            if (paused || menu::keyboard_open()) b = 0, cx = cy = sx = sy = 0, touch = false;
             {
                 std::lock_guard<std::mutex> lk(input_m);
-                input_now = {b, cx, cy, touch, tx, ty};
+                input_now = {b, cx, cy, touch, tx, ty, sx, sy};
             }
             if (!paused) kernel::gsp_vblank();  // the game waits for VBlank, so it stops while the menu is open
             profile::update();

@@ -40,6 +40,13 @@ and online play are not supported: the services report nothing there. The Europe
 0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
 American one has (its own addresses, and its keyboard's keys).
 
+**The Legend of Zelda: Majora's Mask 3D** (EUR, `CTR-P-AJRP`, title 0004000000125600, an eShop CIA) runs: the
+title screen and its attract scenes, the file select, naming Link on the software keyboard, the opening in the Lost
+Woods with Skull Kid, then Link on foot with the bottom-screen HUD (items, masks, map), at full speed with music
+and sound (built with `-DGAME=mm3d` from `data/mm3d`). It supports the Circle Pad Pro, which the runtime presents
+(see [Controls](#controls)): at start, ZR (2, or the right trigger) takes it, and the right stick then turns the
+camera; "Don't Use" plays without it. Beyond the first steps in the Lost Woods it was not tested by scripts.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
@@ -228,8 +235,13 @@ On a Mac, `RECOMP_TOUCH=1` shows the touch controls and layout in the window, th
 | A / B / X / Y | X / Z / S / A | East / South / North / West |
 | L / R | Q / W | Shoulders |
 | ZL / ZR | 1 / 2 | Triggers |
+| Circle Pad Pro's circle pad (C-stick) | | Right stick |
 | Start / Select | Enter / Backspace | Start / Back |
 | Touch screen | Mouse on the bottom screen | |
+
+The runtime presents an old 3DS with a Circle Pad Pro attached (as a New 3DS does for older games): games that
+support it (Majora's Mask 3D, ...) get ZL, ZR and the second circle pad through `ir:USER`. A
+game that asks for it at start ("press ZR on your Circle Pad Pro") takes it once ZR is pressed.
 
 F11 toggles fullscreen, F2 cycles the screen layout (stacked, top screen only, side by side, large top with a small bottom, bottom screen
 only, stacked with the bottom screen first; the window takes the layout's shape and the mouse touches the bottom
