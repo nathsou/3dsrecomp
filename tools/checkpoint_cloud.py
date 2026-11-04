@@ -2,12 +2,16 @@
 """Upload Checkpoint's save backups to the cloud saves' bucket, as one more device's saves.
 
   python3 tools/checkpoint_cloud.py <Checkpoint saves folder> <file with the s3:// line> [--upload] [--device NAME]
+                                    [--as <unique id>=<name>]...
 
 Checkpoint (a 3DS homebrew app) backs saves up as <saves>/0x<unique id> <title>/<YYYYMMDD-HHMMSS>/<files>. Each
 game's newest backup becomes <title id>/<device id>.3dssave, as runtime/cloud.mm writes it: savedata/ as a tar
 (no times, sorted names), the device's name, when it was saved (the backup's name, local time), which game files
 (a hash of data/<name>/code.bin, for the games here with that title id; none otherwise, so no app uses it) and the
 tar's SHA-256 as metadata. Without --upload it only lists what the bucket has and what it would upload.
+
+--as 0x01BFB=metroid also uploads that game's save as data/metroid's (another region's version of the game: its
+title id and game files), for an app to use it. Whether a save works in another version is up to the game.
 
 A game whose save here has an extdata/ folder keeps it in the upload (Checkpoint's save backups have none, and an
 app taking this save replaces both folders).
@@ -146,6 +150,29 @@ def builds():
     return out
 
 
+def upload_one(c, tid, game, build, backup, saved, device, device_id, upload, fmt):
+    """The backup as <title id>/<device id>.3dssave (game: the name in data/ with that title id, if any)"""
+    t = bytearray()
+    add_tree(t, backup, 'savedata')
+    ext = os.path.join(SAVE_ROOT, tid, 'extdata')
+    if game and os.path.isdir(ext):
+        add_tree(t, ext, 'extdata')
+    t += b'\0' * (2 * TAR_BLOCK)
+    tar = bytes(t)
+    sha = hashlib.sha256(tar).hexdigest()
+    key = (c['prefix'] + '/' if c['prefix'] else '') + f'{tid}/{device_id}.3dssave'
+    print(f'  as {tid}, {len(tar) // 1024} KB'
+          + (f', for {game}' + (' (+ the extdata here)' if os.path.isdir(ext) else '') if game else ''))
+    for k, dev, when, b in slots(c, tid):
+        same = ' same game files' if build and b == build else ''
+        print(f'    in the bucket: {dev} {fmt(when)}{same}' + (' (this one)' if k == key else ''))
+    if upload:
+        meta = {'x-amz-meta-nx-device': urllib.parse.quote(device), 'x-amz-meta-nx-saved': str(saved),
+                'x-amz-meta-nx-build': build, 'x-amz-meta-nx-hash': sha}
+        st, _, body = request(c, 'PUT', key, body=tar, headers=meta)
+        print(f'    uploaded {key}' if st == 200 else f'    UPLOAD FAILED: HTTP {st} {body[:300]!r}')
+
+
 def main():
     args = sys.argv[1:]
     upload = '--upload' in args
@@ -153,6 +180,12 @@ def main():
     if '--device' in args:
         device = args[args.index('--device') + 1]
         del args[args.index('--device'):args.index('--device') + 2]
+    aliases = {}  # title id -> the name in data/ whose save it also is
+    while '--as' in args:
+        i = args.index('--as')
+        uid, _, name = args[i + 1].partition('=')
+        aliases['00040000' + f'{int(uid, 16):06x}' + '00'] = name
+        del args[i:i + 2]
     args = [a for a in args if a != '--upload']
     if len(args) != 2:
         sys.exit(__doc__)
@@ -172,26 +205,15 @@ def main():
             continue
         newest = backups[-1]
         saved = int(datetime.datetime.strptime(newest, '%Y%m%d-%H%M%S').timestamp())
-        game, build = known.get(tid, (None, ''))
-        t = bytearray()
-        add_tree(t, os.path.join(src, newest), 'savedata')
-        ext = os.path.join(SAVE_ROOT, tid, 'extdata')
-        if game and os.path.isdir(ext):
-            add_tree(t, ext, 'extdata')
-        t += b'\0' * (2 * TAR_BLOCK)
-        tar = bytes(t)
-        sha = hashlib.sha256(tar).hexdigest()
-        key = (c['prefix'] + '/' if c['prefix'] else '') + f'{tid}/{device_id}.3dssave'
-        print(f'{tid} {" ".join(title.split())}: backup {newest}, {len(tar) // 1024} KB'
-              + (f', for {game}' + (' (+ the extdata here)' if os.path.isdir(ext) else '') if game else ''))
-        for k, dev, when, b in slots(c, tid):
-            same = ' same game files' if build and b == build else ''
-            print(f'    in the bucket: {dev} {fmt(when)}{same}' + (' (this one)' if k == key else ''))
-        if upload:
-            meta = {'x-amz-meta-nx-device': urllib.parse.quote(device), 'x-amz-meta-nx-saved': str(saved),
-                    'x-amz-meta-nx-build': build, 'x-amz-meta-nx-hash': sha}
-            st, _, body = request(c, 'PUT', key, body=tar, headers=meta)
-            print(f'    uploaded {key}' if st == 200 else f'    UPLOAD FAILED: HTTP {st} {body[:300]!r}')
+        dests = [(tid, *known.get(tid, (None, '')))]  # (title id, game, its build)
+        if tid in aliases:
+            other = [t for t, (g, _) in known.items() if g == aliases[tid]]
+            if not other:
+                sys.exit(f'--as: no data/{aliases[tid]}')
+            dests.append((other[0], *known[other[0]]))
+        print(f'{tid} {" ".join(title.split())}: backup {newest}')
+        for dtid, game, build in dests:
+            upload_one(c, dtid, game, build, os.path.join(src, newest), saved, device, device_id, upload, fmt)
 
 
 if __name__ == '__main__':
