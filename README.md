@@ -40,6 +40,13 @@ and online play are not supported: the services report nothing there. The Europe
 0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
 American one has (its own addresses, and its keyboard's keys).
 
+**Hey! Pikmin** (EUR, `CTR-P-BRCP`, title 00040000001AF800) runs: the first-boot dialogs, the title screen, file
+select, a new game's opening (the crash on PNF-404, with its streamed music) and the first scenes with Olimar, and,
+from a real console's save, the area map and the levels: walking with the circle pad, the touch screen (the mouse)
+for everything else, the pause menu, at full speed with music and sound (built with `-DGAME=pikmin` from
+`data/pikmin`). Its CIA uses seed crypto: extract it with its seed (`--seed` or `--seeddb`, see step 1 below).
+amiibo is not supported.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
