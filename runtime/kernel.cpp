@@ -2,7 +2,6 @@
 #include "kernel.h"
 
 #include <dlfcn.h>
-#include <mach/mach.h>
 #include <pthread.h>
 #include <unistd.h>
 
@@ -11,6 +10,7 @@
 #include <set>
 
 #include "loader.h"
+#include "platform.h"
 #include "service.h"
 
 namespace kernel {
@@ -363,7 +363,7 @@ std::shared_ptr<Thread> create_thread(u32 entry, u32 arg, u32 stack_top, s32 pri
     pthread_attr_setstacksize(&attr, 64 << 20);
     pthread_t pt;
     if (pthread_create(&pt, &attr, thread_main, t.get())) FATAL("pthread_create failed\n");
-    t->mach = pthread_mach_thread_np(pt);
+    t->host_id = platform::thread_handle(pt);
     pthread_detach(pt);
     if (start) make_ready(t.get());
     return t;
@@ -1020,25 +1020,9 @@ void svc_dispatch(CPU *c, u32 imm) {
 // The guest functions (f_<address>) on a thread's host stack, innermost first: a thread that spins without SVCs
 // shows only a stale pc otherwise, and a waiting one shows where it waits from.
 static std::string guest_backtrace(Thread *t) {
-    if (!t->mach || pthread_mach_thread_np(pthread_self()) == t->mach) return "";
-    u64 pcs[64];
-    int n = 0;
-    if (thread_suspend(t->mach) != KERN_SUCCESS) return "";
-    arm_thread_state64_t st;
-    mach_msg_type_number_t cnt = ARM_THREAD_STATE64_COUNT;
-    if (thread_get_state(t->mach, ARM_THREAD_STATE64, (thread_state_t)&st, &cnt) == KERN_SUCCESS) {
-        pcs[n++] = arm_thread_state64_get_pc(st);
-        pcs[n++] = arm_thread_state64_get_lr(st);
-        u64 fp = arm_thread_state64_get_fp(st);
-        // frame records are {previous fp, return address}; stop at anything that does not look like one
-        for (int i = 0; i < 60 && fp && !(fp & 7) && n < 64; i++) {
-            u64 *rec = (u64 *)fp;
-            pcs[n++] = rec[1];
-            if (rec[0] <= fp) break;
-            fp = rec[0];
-        }
-    }
-    thread_resume(t->mach);
+    if (!t->host_id || platform::is_current_thread(t->host_id)) return "";
+    uint64_t pcs[64];
+    const int n = platform::sample_thread_pcs(t->host_id, pcs, 64);
     std::string out;
     const void *last = nullptr;
     for (int i = 0; i < n; i++) {

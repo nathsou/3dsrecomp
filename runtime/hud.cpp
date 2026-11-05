@@ -1,8 +1,6 @@
 // The game profile's HUD: icons decoded from the game's own files (BCLIM textures, in SARC archives that may be
-// or DARC, Yaz0-compressed or not; or glyph sheets of BCFNT fonts; MTXT/CTPK .bctex) and numbers drawn with Core Text, placed in top-screen pixels and scaled with the screen.
+// or DARC, Yaz0-compressed or not; or glyph sheets of BCFNT fonts; MTXT/CTPK .bctex) and numbers drawn in the system font (text.h), placed in top-screen pixels and scaled with the screen.
 #include "hud.h"
-
-#import <CoreText/CoreText.h>
 
 #include <algorithm>
 #include <cmath>
@@ -13,6 +11,7 @@
 #include <vector>
 
 #include "profile.h"
+#include "text.h"
 
 namespace kernel {
 std::vector<u8> romfs_file(const std::string &path);  // (kernel.h clashes with MacTypes.h)
@@ -288,51 +287,12 @@ const Tex &text(SDL_Renderer *r, const std::string &s, float size, float px) {
         text_cache.clear();
     }
     const float pt = size * px;
-    CTFontRef font = CTFontCreateUIFontForLanguage(kCTFontUIFontEmphasizedSystem, pt, nullptr);
-    CFStringRef str = CFStringCreateWithCString(nullptr, s.c_str(), kCFStringEncodingUTF8);
-    auto make_line = [&](CGColorRef col, float stroke) {
-        CFNumberRef sw = CFNumberCreate(nullptr, kCFNumberFloatType, &stroke);
-        const void *keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName, kCTStrokeColorAttributeName,
-                              kCTStrokeWidthAttributeName};
-        const void *vals[] = {font, col, col, sw};
-        CFDictionaryRef attrs = CFDictionaryCreate(nullptr, keys, vals, 4, &kCFTypeDictionaryKeyCallBacks,
-                                                   &kCFTypeDictionaryValueCallBacks);
-        CFAttributedStringRef as = CFAttributedStringCreate(nullptr, str ? str : CFSTR("?"), attrs);
-        CTLineRef line = CTLineCreateWithAttributedString(as);
-        CFRelease(as);
-        CFRelease(attrs);
-        CFRelease(sw);
-        return line;
-    };
-    CGColorRef white = CGColorCreateSRGB(1, 1, 1, 1), dark = CGColorCreateSRGB(0.08, 0.08, 0.1, 1);
-    CTLineRef outline = make_line(dark, 22.0f), fill = make_line(white, 0.0f);
-    CGFloat ascent, descent, leading;
-    const double width = CTLineGetTypographicBounds(outline, &ascent, &descent, &leading);
     const int pad = (int)std::ceil(pt * 0.12f) + 1;
-    const int w = std::max(1, (int)std::ceil(width) + 2 * pad), h = std::max(1, (int)std::ceil(ascent + descent) + 2 * pad);
-    std::vector<uint32_t> buf((size_t)w * h, 0);
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef ctx = CGBitmapContextCreate(buf.data(), w, h, 8, w * 4, cs,
-                                             (uint32_t)kCGImageAlphaPremultipliedLast | (uint32_t)kCGBitmapByteOrder32Big);
-    CGContextSetTextPosition(ctx, pad, std::ceil(descent) + pad);
-    CTLineDraw(outline, ctx);
-    CGContextSetTextPosition(ctx, pad, std::ceil(descent) + pad);
-    CTLineDraw(fill, ctx);
-    CGContextFlush(ctx);
+    const text::Texture tt = text::render_outlined(r, s, pt, pad);
     Tex t;
-    t.t = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
-    SDL_UpdateTexture(t.t, nullptr, buf.data(), w * 4);
-    SDL_SetTextureBlendMode(t.t, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-    t.w = w / px;
-    t.h = h / px;
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(cs);
-    CFRelease(outline);
-    CFRelease(fill);
-    CGColorRelease(white);
-    CGColorRelease(dark);
-    if (str) CFRelease(str);
-    CFRelease(font);
+    t.t = tt.tex;
+    t.w = tt.w / px;
+    t.h = tt.h / px;
     return text_cache[s + key] = t;
 }
 

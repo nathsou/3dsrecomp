@@ -4,6 +4,7 @@
 usage: .venv/bin/python -m tools.test_cpu [count] [seed] [class,...]
 """
 import os
+import platform
 import random
 import struct
 import subprocess
@@ -15,6 +16,11 @@ from unicorn import arm_const as A
 
 from tools.recomp import arm, thumb
 from tools.recomp.ins import OP, COND_C
+
+# The recompiled VFP code leaves NaN results to the host: x86's invalid operations (sqrt of a negative number, ...)
+# give a NaN with the sign bit set where ARM's default NaN has it clear. Nothing else about it differs, and games do
+# not look at a NaN's sign, so on x86 hosts NaNs that differ only in their sign count as equal.
+X86 = platform.machine().lower() in ('x86_64', 'amd64', 'i386', 'i686')
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CODE = 0x100000
@@ -448,7 +454,7 @@ int main(int argc, char **argv) {
     with open(cpath, 'w') as f:
         f.write('\n'.join(src))
     exe = os.path.join(tmp, 't')
-    subprocess.check_call(['clang', '-O1', '-w', '-ffp-contract=off', '-I', os.path.join(ROOT, 'runtime'), cpath, '-o', exe])
+    subprocess.check_call(['clang', '-O1', '-w', '-ffp-contract=off', '-I', os.path.join(ROOT, 'runtime'), cpath, '-o', exe, '-lm'])
     inp = os.path.join(tmp, 'in.bin')
     outp = os.path.join(tmp, 'out.bin')
     with open(inp, 'wb') as f:
@@ -486,6 +492,8 @@ int main(int argc, char **argv) {
         for x in range(32):
             if c_v[x] != u_v[x]:
                 a, b = c_v[x], u_v[x]
+                if X86 and a ^ b == 0x80000000 and a & 0x7F800000 == 0x7F800000 and a & 0x7FFFFF:
+                    continue  # (a NaN's sign, or a double NaN's high word: see X86)
                 diffs.append('s%d c=%08x uc=%08x' % (x, a, b))
         if (c_fps & 0xF0000000) != (u_fps & 0xF0000000):
             diffs.append('fpscr c=%08x uc=%08x' % (c_fps, u_fps))

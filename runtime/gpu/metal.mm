@@ -29,6 +29,24 @@ extern std::string g_save_base;
 
 namespace gpu {
 
+// the backend's hooks (pica.h's HwBackend; the table is at the end of this file)
+bool metal_init();
+void metal_flush(const RTConfig &rt, const MBatch &b);
+const void *metal_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s);
+void metal_guest_read(u32 paddr, u32 size);
+void metal_guest_written(u32 paddr, u32 size, bool definite = true);
+void metal_guest_prewrite(u32 paddr, u32 size);
+void metal_writeback_all();
+void metal_poll();
+bool metal_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width, u32 out_gap);
+bool metal_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+bool metal_surface_for(u32 addr, u32 w, u32 h, u32 fmt);
+void metal_end_list();
+bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size);
+void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+bool metal_gpu_made(u32 paddr, u32 size);
+void metal_note_gpu_output(u32 paddr, u32 size);
+
 namespace {
 
 // shaders compiled at run time without fast math, as the precompiled ones (MTLMathModeSafe; before macOS 15 and
@@ -2702,7 +2720,7 @@ bool metal_init() {
     dump_shaders = getenv("GPU_DUMP_SHADERS") != nullptr;
     eager_writeback = getenv("GPU_METAL_EAGER") != nullptr;
     log_timing = getenv("RECOMP_STATS") != nullptr;
-    if (const char *tf = getenv("GPU_TEX_FILTER")) set_texture_filter(atoi(tf));
+    if (const char *tf = getenv("GPU_TEX_FILTER")) metal_set_texture_filter(atoi(tf));
     active = true;
     LOG("gpu: Metal backend on %s, internal scale %s%u, MSAA %ux, anisotropic filtering %ux\n", dev.name.UTF8String,
         scale_fixed ? "" : "auto, now ", S, MS, aniso);
@@ -2717,7 +2735,7 @@ bool metal_active() { return active; }
 // <outdir> <pipeline lists...>: one .metal file per fragment shader (fs_<hash of its source>) plus vs.metal,
 // for building shaders.metallib ahead of time. Unchanged files are left alone and stale ones removed, so
 // only new shaders get recompiled.
-int emit_shaders(int argc, char **argv) {
+int metal_emit_shaders(int argc, char **argv) {
     if (argc < 1) {
         fprintf(stderr, "usage: --emit-shaders <outdir> <pipelines.bin...>\n");
         return 1;
@@ -2797,14 +2815,14 @@ void apply_scale(u32 ns) {
 }
 }  // namespace
 
-void set_scale(int s) { want_scale = (u32)std::clamp(s, 1, 4); }
-int scale() { return active ? (int)(want_scale.load() ? want_scale.load() : S) : 0; }
-bool scale_is_auto() { return active && !scale_fixed; }
-float busy() { return active ? busy_frac.load() : 0; }
+void metal_set_scale(int s) { want_scale = (u32)std::clamp(s, 1, 4); }
+int metal_scale() { return active ? (int)(want_scale.load() ? want_scale.load() : S) : 0; }
+bool metal_scale_is_auto() { return active && !scale_fixed; }
+float metal_busy() { return active ? busy_frac.load() : 0; }
 
-void set_texture_filter(int mode) { want_filter = std::clamp(mode, 0, (int)kTexFilterCount - 1); }
-int texture_filter_count() { return kTexFilterCount; }
-const char *texture_filter_name(int mode) {
+void metal_set_texture_filter(int mode) { want_filter = std::clamp(mode, 0, (int)kTexFilterCount - 1); }
+int metal_texture_filter_count() { return kTexFilterCount; }
+const char *metal_texture_filter_name(int mode) {
     static const char *const names[kTexFilterCount] = {"Off", "Sharp", "Smooth"};
     return mode >= 0 && mode < kTexFilterCount ? names[mode] : "?";
 }
@@ -2824,7 +2842,7 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
     flushes++;
     if (const u32 ws = want_scale.load(); ws && ws != S) apply_scale(ws);
     if (const int wf = want_filter.load(); wf != tf_mode) {
-        LOG("gpu metal: texture filter %s -> %s\n", texture_filter_name(tf_mode), texture_filter_name(wf));
+        LOG("gpu metal: texture filter %s -> %s\n", metal_texture_filter_name(tf_mode), metal_texture_filter_name(wf));
         tf_mode = wf;
         tf_drop_all();
         gpu_outs.clear();
@@ -3250,7 +3268,7 @@ void metal_poll() {
                 }
                 LOG("[gpu] textures: %u decoded in %.2f ms, %u uploaded in %.2f ms; filter %s: %u upscaled + %u updated "
                     "(%u tiles) in %.2f ms (GPU %.2f ms), %zu MiB\n",
-                    g_tex_decodes, g_tex_decode_ms, st_uploads, st_upload_ms, texture_filter_name(tf_mode), st_upscaled,
+                    g_tex_decodes, g_tex_decode_ms, st_uploads, st_upload_ms, metal_texture_filter_name(tf_mode), st_upscaled,
                     st_partial, st_tiles, st_upscale_ms, ug * 1000, tf_bytes >> 20);
                 g_tex_decodes = st_uploads = st_upscaled = st_partial = st_tiles = 0;
                 g_tex_decode_ms = st_upload_ms = st_upscale_ms = 0;
@@ -3618,11 +3636,11 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
 // target is cleared to transparent after each display transfer (before the next draw into it, so a picture
 // transferred again unchanged stays), so the bottom screen's picture keeps only what its pass draws (and its
 // alpha says where that is). The top screen's pass draws all of its picture anyway.
-void set_clear_after_top_transfer(bool on) { clear_after_top = on; }
+void metal_set_clear_after_top_transfer(bool on) { clear_after_top = on; }
 // One-screen play shows the bottom screen over the top one: black there is made transparent as the display image is
 // made (a screen left black shows nothing; a dialog's choices on it float), and what the game drew translucent, to
 // blend with a background now hidden, more opaque.
-void set_key_black_bottom(bool on) { key_black_bottom = on; }
+void metal_set_key_black_bottom(bool on) { key_black_bottom = on; }
 
 namespace {
 // The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes
@@ -3682,7 +3700,7 @@ void with_view(const DisplayView &v, const std::function<void(const u32 *, int, 
 }
 }  // namespace
 
-bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h) {
+bool metal_get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h) {
     thread_local std::vector<u32> out;
     if (!wait_for_view(fb_paddr, stride, lines)) return false;
     std::lock_guard<std::mutex> lk(disp_mtx);
@@ -3697,7 +3715,7 @@ bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba
     return true;
 }
 
-u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
+u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
                       const std::function<void(const u32 *, int, int)> &fn) {
     if (!wait_for_view(fb_paddr, stride, lines)) return 0;
     // fn (an upload to the UI's texture: slow for a large image) runs without disp_mtx held, the buffer kept from
@@ -3734,14 +3752,50 @@ u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
     return v.key;
 }
 
-bool get_display_image(int screen, const u32 **rgba, int *w, int *h) {
+bool metal_get_display_image(int screen, const u32 **rgba, int *w, int *h) {
     u32 addr;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
         if (screen < 0 || screen > 1 || !last_screen_addr[screen]) return false;
         addr = last_screen_addr[screen];
     }
-    return get_display_image_for(addr, 0, screen ? 320 : 400, rgba, w, h);
+    return metal_get_display_image_for(addr, 0, screen ? 320 : 400, rgba, w, h);
+}
+
+const HwBackend *metal_backend() {
+    static const HwBackend b = {
+        .name = "metal",
+        .init = metal_init,
+        .flush = metal_flush,
+        .vs_kernel = metal_vs_kernel,
+        .guest_read = metal_guest_read,
+        .guest_written = metal_guest_written,
+        .guest_prewrite = metal_guest_prewrite,
+        .writeback_all = metal_writeback_all,
+        .poll = metal_poll,
+        .texture_copy = metal_texture_copy,
+        .gpu_transfer = metal_gpu_transfer,
+        .surface_for = metal_surface_for,
+        .end_list = metal_end_list,
+        .defer_transfer = metal_defer_transfer,
+        .display_transfer = metal_display_transfer,
+        .gpu_made = metal_gpu_made,
+        .note_gpu_output = metal_note_gpu_output,
+        .get_display_image_for = metal_get_display_image_for,
+        .use_display_image = metal_use_display_image,
+        .get_display_image = metal_get_display_image,
+        .set_scale = metal_set_scale,
+        .scale = metal_scale,
+        .scale_is_auto = metal_scale_is_auto,
+        .busy = metal_busy,
+        .set_texture_filter = metal_set_texture_filter,
+        .texture_filter_count = metal_texture_filter_count,
+        .texture_filter_name = metal_texture_filter_name,
+        .set_clear_after_top_transfer = metal_set_clear_after_top_transfer,
+        .set_key_black_bottom = metal_set_key_black_bottom,
+        .emit_shaders = metal_emit_shaders,
+    };
+    return &b;
 }
 
 }  // namespace gpu

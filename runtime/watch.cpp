@@ -11,6 +11,7 @@
 #include <mutex>
 #include <thread>
 
+#include "platform.h"
 #include "rt.h"
 
 static u8 *watch_page;
@@ -20,8 +21,7 @@ static std::map<u64, u64> hits;
 static void handler(int sig, siginfo_t *si, void *ctx) {
     u8 *a = (u8 *)si->si_addr;
     if (watch_page && a >= watch_page && a < watch_page + 0x4000) {
-        auto *uc = (ucontext_t *)ctx;
-        u64 pc = uc->uc_mcontext->__ss.__pc;
+        u64 pc = platform::fault_pc(ctx);
         hits[pc]++;  // (racy but fine for a debug histogram)
         mprotect(watch_page, 0x4000, PROT_READ | PROT_WRITE);
         return;

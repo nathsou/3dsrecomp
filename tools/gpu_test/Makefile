@@ -2,12 +2,21 @@
 #   make            -> build/gpu_test, build/gpu_replay
 #   make test       -> run unit tests
 ROOT := ../..
-CXX ?= clang++
+ifeq ($(origin CXX),default)
+CXX := clang++
+endif
 CXXFLAGS ?= -std=c++20 -O2 -g -Wall -Wno-unused-function -Wno-unused-variable -I$(ROOT)/runtime -I. -DRECOMP_SOURCE_DIR=\"$(abspath $(ROOT))\"
-LDFLAGS ?= -lpthread -framework Metal -framework Foundation
-
 GPU_SRC := $(wildcard $(ROOT)/runtime/gpu/*.cpp)
+ifeq ($(shell uname),Darwin)
+LDFLAGS ?= -lpthread -framework Metal -framework Foundation
 GPU_MM := $(wildcard $(ROOT)/runtime/gpu/*.mm)
+GPU_SRC := $(filter-out $(wildcard $(ROOT)/runtime/gpu/vulkan*.cpp $(ROOT)/runtime/gpu/vk_*.cpp),$(GPU_SRC))
+else
+# the Vulkan backend (runtime/gpu/vulkan.cpp) with shaderc
+LDFLAGS ?= -lpthread -ldl $(shell pkg-config --libs vulkan shaderc 2>/dev/null)
+CXXFLAGS += -I$(ROOT)/third_party
+GPU_MM :=
+endif
 GPU_OBJ := $(patsubst $(ROOT)/runtime/gpu/%.cpp,build/gpu_%.o,$(GPU_SRC)) $(patsubst $(ROOT)/runtime/gpu/%.mm,build/gpumm_%.o,$(GPU_MM))
 COMMON_OBJ := build/stub.o build/png.o
 HDR := $(wildcard $(ROOT)/runtime/gpu/*.h) $(ROOT)/runtime/rt.h $(ROOT)/runtime/cpu.h $(wildcard *.h)

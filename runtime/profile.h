@@ -42,7 +42,7 @@ struct Button {
     int cond = -1;
 };
 
-// one-screen controls (runtime/onescreen.mm): host inputs bound to 3DS buttons or overlays, the hub's entries,
+// one-screen controls (runtime/onescreen.cpp): host inputs bound to 3DS buttons or overlays, the hub's entries,
 // the map's part of the bottom screen, the tool ring's sources
 struct Bind {
     std::string host;    // a gamepad input by position: a b x y l r zl zr start back ls rs dup ddown dleft dright
@@ -84,7 +84,7 @@ struct Tools {
                                    // dispatches to hold_on; else the pockets are worked through out of sight
 };
 
-// ACNH-style stacks in the pockets (runtime/stacks.mm): items of these categories stack up to max in one pocket
+// ACNH-style stacks in the pockets (runtime/stacks.cpp): items of these categories stack up to max in one pocket
 struct StackKind {
     u32 kind;
     int max;

@@ -1,7 +1,7 @@
 // On-screen controls for touch screens (iPhone, iPad; RECOMP_TOUCH=1 tries them on a Mac, the mouse being a
 // finger): a circle pad, A B X Y, L R, Start, Select, a menu button and, when one screen shows at a time, a button
 // that swaps the screens. They go in the room the screens leave; fingers elsewhere touch the bottom screen.
-// Drawn with SDL's renderer in window pixels, labels with Core Text (runtime/touch.mm).
+// Drawn with SDL's renderer in window pixels, labels with the system font (runtime/text.h) (runtime/touch.cpp).
 #pragma once
 #include <SDL3/SDL.h>
 

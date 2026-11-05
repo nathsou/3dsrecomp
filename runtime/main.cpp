@@ -10,10 +10,10 @@
 #include "settings.h"
 
 #include <SDL3/SDL.h>
-#include <TargetConditionals.h>
 #include <dlfcn.h>
-#include <mach-o/dyld.h>
 #include <sys/stat.h>
+
+#include "platform.h"
 #if TARGET_OS_IOS
 #include <SDL3/SDL_main.h>  // UIKit owns the process: SDL starts the app and calls main() from it
 #endif
@@ -29,7 +29,7 @@ char **g_argv;  // for restarting the game from the menu
 std::string g_start_game;  // (multi-game app) the game playing, which a restart goes straight back to
 
 #ifdef RECOMP_MODULES
-// A multi-game app: games/<name>/ holds each game's files and <name>.dylib its code. The player picks one from the
+// A multi-game app: games/<name>/ holds each game's files and <name>.dylib (.so) its code. The player picks one from the
 // list, the last one played selected (RECOMP_START_GAME=<name> skips the list: restarts, tests).
 static std::string choose_game(const std::filesystem::path &games_dir, const std::filesystem::path &code_dir) {
     std::vector<LauncherGame> games;
@@ -54,7 +54,7 @@ static std::string choose_game(const std::filesystem::path &games_dir, const std
     const int i = start && found >= 0 ? found : games.size() == 1 ? 0 : launcher_choose(games, std::max(found, 0));
     std::filesystem::create_directories(g_save_base, ec);
     std::ofstream(last_file) << games[i].id << "\n";
-    const std::string lib = (code_dir / (games[i].id + ".dylib")).string();
+    const std::string lib = (code_dir / (games[i].id + platform::module_suffix())).string();
     void *h = dlopen(lib.c_str(), RTLD_NOW);
     if (!h) FATAL("cannot load %s: %s\n", lib.c_str(), dlerror());
     const auto entries = (const GuestEntry *)dlsym(h, "guest_entries");
@@ -83,21 +83,20 @@ int main(int argc, char **argv) {
     if (argc > 1 && std::string(argv[1]) == "--emit-shaders") return gpu::emit_shaders(argc - 2, argv + 2);
     std::string dir = "data/" RECOMP_GAME;
     bool bundle = false;
-    // inside an app bundle: game files in Contents/Resources/game (macOS) or game/ next to the executable (iOS)
-    // (games/<name>/ for a multi-game app, with the code in Frameworks/), saves in Application Support (the app's
-    // own container on iOS)
-    char exe[4096];
-    uint32_t len = sizeof exe;
-    if (_NSGetExecutablePath(exe, &len) == 0) {
+    // inside an app bundle: game files in Contents/Resources/game (macOS), game/ next to the executable (iOS) or
+    // resources/game next to it (tools/bundle_linux.sh) (games/<name>/ for a multi-game app, with the code in
+    // Frameworks/, or lib/ on Linux), saves in platform::app_data_dir() (the app's own container on iOS)
+    if (const std::string exe = platform::exe_path(); !exe.empty()) {
         const auto exe_dir = std::filesystem::path(exe).parent_path();
-        const auto res = TARGET_OS_IOS ? exe_dir : exe_dir.parent_path() / "Resources";
-        const char *home = getenv("HOME");
-        const std::string app_support = std::string(home ? home : ".") + "/Library/Application Support/3dsrecomp";
+        const auto res = TARGET_OS_IOS ? exe_dir : TARGET_OS_OSX ? exe_dir.parent_path() / "Resources" : exe_dir / "resources";
+        const std::string app_support = platform::app_data_dir();
 #ifdef RECOMP_MODULES
         if (std::filesystem::exists(res / "games")) {
             bundle = true;
             g_save_base = app_support;
-            dir = choose_game(res / "games", TARGET_OS_IOS ? exe_dir / "Frameworks" : exe_dir.parent_path() / "Frameworks");
+            dir = choose_game(res / "games", TARGET_OS_IOS    ? exe_dir / "Frameworks"
+                                             : TARGET_OS_OSX ? exe_dir.parent_path() / "Frameworks"
+                                                             : exe_dir / "lib");
         } else {
             dir = choose_game(exe_dir / "games", exe_dir);  // a build folder (games/<name>: links to data/<name>)
         }
@@ -122,7 +121,7 @@ int main(int argc, char **argv) {
     rt_log_open(kernel::save_root() + "/log.txt");
     if (bundle) g_fatal_hook = fatal_dialog;
     settings_load();
-    cloud_boot();  // (a newer save from another device: runtime/cloud.mm)
+    cloud_boot();  // (a newer save from another device: runtime/cloud.cpp)
     save_auto_backup();
     kernel::init_services();
     frontend_init();

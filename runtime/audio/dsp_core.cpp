@@ -1,4 +1,5 @@
 // DSP firmware HLE: pipes, power state changes and the per-frame processing (audio:: interface).
+#include <algorithm>
 #include <mutex>
 
 #include "../audio_iface.h"

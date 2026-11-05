@@ -12,9 +12,10 @@ No keys are in this repository. They come from files you dump from your own cons
                         "Build support files" writes it (gm9/out/seeddb.bin) from the seeds of the titles installed
                         on the console; Azahar's sysdata/seeddb.bin has the same format
   --seed <32 hex digits> one title's seed instead
-AES comes from macOS's CommonCrypto.
+AES comes from the system: macOS's CommonCrypto, elsewhere OpenSSL's libcrypto.
 """
 import ctypes
+import ctypes.util
 import hashlib
 import struct
 import sys
@@ -22,27 +23,57 @@ import sys
 M128 = (1 << 128) - 1
 SCRAMBLER = 0x1FF9E9AAC5FE0408024591DC5D52768A
 
-_cc = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
-_cc.CCCryptorCreateWithMode.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
-                                        ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p,
-                                        ctypes.c_size_t, ctypes.c_int, ctypes.c_uint32, ctypes.POINTER(ctypes.c_void_p)]
-_cc.CCCryptorUpdate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
-                                ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
-_cc.CCCryptorRelease.argtypes = [ctypes.c_void_p]
-DECRYPT, MODE_CBC, MODE_CTR, AES, CTR_BE = 1, 2, 4, 0, 2
+MODE_CBC, MODE_CTR = 2, 4
+if sys.platform == 'darwin':
+    _cc = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+    _cc.CCCryptorCreateWithMode.argtypes = [ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32, ctypes.c_uint32,
+                                            ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_void_p,
+                                            ctypes.c_size_t, ctypes.c_int, ctypes.c_uint32,
+                                            ctypes.POINTER(ctypes.c_void_p)]
+    _cc.CCCryptorUpdate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
+                                    ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    _cc.CCCryptorRelease.argtypes = [ctypes.c_void_p]
+    DECRYPT, AES, CTR_BE = 1, 0, 2
 
+    def _aes(mode, key, iv, data):
+        ref = ctypes.c_void_p()
+        st = _cc.CCCryptorCreateWithMode(DECRYPT, mode, AES, 0, iv, key, 16, None, 0, 0,
+                                         CTR_BE if mode == MODE_CTR else 0, ctypes.byref(ref))
+        assert st == 0, 'CCCryptorCreateWithMode: %d' % st
+        out = ctypes.create_string_buffer(len(data))
+        moved = ctypes.c_size_t()
+        st = _cc.CCCryptorUpdate(ref, data, len(data), out, len(data), ctypes.byref(moved))
+        _cc.CCCryptorRelease(ref)
+        assert st == 0 and moved.value == len(data), 'CCCryptorUpdate: %d' % st
+        return out.raw
+else:
+    _lib = ctypes.util.find_library('crypto')
+    assert _lib, 'AES needs OpenSSL (libcrypto)'
+    _ssl = ctypes.CDLL(_lib)
+    _ssl.EVP_CIPHER_CTX_new.restype = ctypes.c_void_p
+    _ssl.EVP_CIPHER_CTX_free.argtypes = [ctypes.c_void_p]
+    _ssl.EVP_aes_128_cbc.restype = ctypes.c_void_p
+    _ssl.EVP_aes_128_ctr.restype = ctypes.c_void_p
+    _ssl.EVP_DecryptInit_ex.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p,
+                                        ctypes.c_char_p]
+    _ssl.EVP_CIPHER_CTX_set_padding.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    _ssl.EVP_DecryptUpdate.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.POINTER(ctypes.c_int),
+                                       ctypes.c_char_p, ctypes.c_int]
 
-def _aes(mode, key, iv, data):
-    ref = ctypes.c_void_p()
-    st = _cc.CCCryptorCreateWithMode(DECRYPT, mode, AES, 0, iv, key, 16, None, 0, 0,
-                                     CTR_BE if mode == MODE_CTR else 0, ctypes.byref(ref))
-    assert st == 0, 'CCCryptorCreateWithMode: %d' % st
-    out = ctypes.create_string_buffer(len(data))
-    moved = ctypes.c_size_t()
-    st = _cc.CCCryptorUpdate(ref, data, len(data), out, len(data), ctypes.byref(moved))
-    _cc.CCCryptorRelease(ref)
-    assert st == 0 and moved.value == len(data), 'CCCryptorUpdate: %d' % st
-    return out.raw
+    def _aes(mode, key, iv, data):
+        ctx = _ssl.EVP_CIPHER_CTX_new()
+        assert ctx, 'EVP_CIPHER_CTX_new'
+        try:
+            cipher = _ssl.EVP_aes_128_cbc() if mode == MODE_CBC else _ssl.EVP_aes_128_ctr()  # (CTR: big-endian)
+            assert _ssl.EVP_DecryptInit_ex(ctx, cipher, None, key, iv) == 1, 'EVP_DecryptInit_ex'
+            _ssl.EVP_CIPHER_CTX_set_padding(ctx, 0)
+            out = ctypes.create_string_buffer(len(data))
+            moved = ctypes.c_int()
+            assert _ssl.EVP_DecryptUpdate(ctx, out, ctypes.byref(moved), data, len(data)) == 1, 'EVP_DecryptUpdate'
+            assert moved.value == len(data), 'EVP_DecryptUpdate: %d of %d bytes' % (moved.value, len(data))
+            return out.raw
+        finally:
+            _ssl.EVP_CIPHER_CTX_free(ctx)
 
 
 def cbc_decrypt(key, iv, data): return _aes(MODE_CBC, key, iv, data)

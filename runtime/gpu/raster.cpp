@@ -101,12 +101,12 @@ void raster_append(const TriSink &s) {
     }
 }
 
-static bool use_metal = false;
+static bool use_hw = false;
 
 MBatch &raster_mbatch() { return batch.mb; }
 
 void raster_init() {
-    use_metal = metal_init();
+    use_hw = hw_init();
     stats_on = getenv("GPU_STATS") != nullptr;
     tilebufs.clear();
     for (u32 i = 0; i < pool_threads(); i++) tilebufs.push_back(std::make_unique<TileBuf>());
@@ -283,15 +283,15 @@ static void setup_texunit(DrawState &ds, u32 i) {
     for (u32 l = 0; l < levels; l++) total += texture_level_bytes(tu.w >> l, tu.h >> l, fmt);
     for (u32 f = 0; f < nfaces; f++)
         if (overlaps_rt(faddr[f], total)) raster_flush();
-    if (use_metal)
+    if (use_hw)
         for (u32 f = 0; f < nfaces; f++) batch.tex.emplace_back(faddr[f], total);
-    if (use_metal && nfaces == 1 && levels == 1 && (tu.type == 0 || tu.type == 3) && metal_surface_for(addr, tu.w, tu.h, fmt)) {
+    if (use_hw && nfaces == 1 && levels == 1 && (tu.type == 0 || tu.type == 3) && hw_surface_for(addr, tu.w, tu.h, fmt)) {
         tu.surf = true;  // render-to-texture: sampled where the GPU holds it
         tu.surf_addr = addr;
         tu.surf_fmt = (u8)fmt;
     } else {
         for (u32 f = 0; f < nfaces; f++) {
-            metal_guest_read(faddr[f], total);  // render-to-texture: GPU-only data to guest first
+            hw_guest_read(faddr[f], total);  // render-to-texture: GPU-only data to guest first
             tu.face[f] = texcache_get(faddr[f], tu.w, tu.h, fmt, levels);
         }
     }
@@ -605,7 +605,7 @@ DrawState *draw_state() {
     RTConfig rt;
     rt_from_regs(rt);
     if (batch.has_rt && !(rt == batch.rt)) {
-        if (use_metal)
+        if (use_hw)
             switch_target(rt);
         else if (batch_nonempty())
             raster_flush();
@@ -696,7 +696,7 @@ void raster_triangle_sv(const DrawState *ds, const SV &a, const SV &b, const SV 
 void raster_triangle(const DrawState *ds, const OutVertex &a, const OutVertex &b,
                      const OutVertex &c) {
     if (!tl_sink) vtx_finish_jobs();  // keep primitive order with deferred draws
-    if (use_metal) {
+    if (use_hw) {
         // clipping, culling and snapping happen on the GPU
         MBatch &mb = batch.mb;
         const u32 first = (u32)mb.idx.size(), v = (u32)mb.cverts.size();
@@ -1559,7 +1559,7 @@ void process_tile(u32 item, u32 tid) {
 void raster_flush() {
     vtx_finish_jobs();
     for (Parked &p : parked) {
-        metal_flush(p.rt, p.mb);
+        hw_flush(p.rt, p.mb);
         if (p.rt.color_addr) texcache_invalidate(p.rt.color_addr, color_bytes_of(p.rt));
         if (p.rt.depth_addr) texcache_invalidate(p.rt.depth_addr, depth_bytes_of(p.rt));
     }
@@ -1567,7 +1567,7 @@ void raster_flush() {
     batch.tex.clear();
     if (!batch.mb.empty()) {
         const double tf = g_stats ? now_ms() : 0;
-        metal_flush(batch.rt, batch.mb);
+        hw_flush(batch.rt, batch.mb);
         batch.mb.clear();
         const RTConfig &rt = batch.rt;
         if (rt.color_addr) texcache_invalidate(rt.color_addr, rt.w * rt.h * color_bytes(rt.color_fmt & 7));

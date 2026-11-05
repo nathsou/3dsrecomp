@@ -548,14 +548,14 @@ void ensure_init() {
 
 void process_command_list(u32 paddr, u32 size_bytes) {
     ensure_init();
-    metal_poll();
+    hw_poll();
     texcache_new_epoch();
     g.ds_version = 0;
     static const double hitch_ms = getenv("GPU_HITCH_MS") ? atof(getenv("GPU_HITCH_MS")) : 0;
     const double t0 = g_stats || hitch_ms ? now_ms() : 0;
     cmd_run(paddr, size_bytes);
     raster_flush();
-    metal_end_list();
+    hw_end_list();
     if (hitch_ms) {
         // command lists that took long enough to delay a frame (GPU_HITCH_MS=<threshold>)
         static double worst = 0;
@@ -618,7 +618,7 @@ void state_fields(F &&f) {
 bool save_state(const char *path) {
     ensure_init();
     raster_flush();
-    metal_writeback_all();
+    hw_writeback_all();
     FILE *fp = fopen(path, "wb");
     if (!fp) return false;
     const u32 hdr[2] = {STATE_MAGIC, STATE_VERSION};
@@ -651,7 +651,7 @@ bool load_state(const char *path) {
 void flush() {
     ensure_init();
     raster_flush();
-    metal_writeback_all();
+    hw_writeback_all();
 }
 
 }  // namespace gpu

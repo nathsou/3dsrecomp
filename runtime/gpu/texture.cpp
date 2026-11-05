@@ -134,9 +134,9 @@ void set_trust_invalidations(bool trust) { trust_invalidations = trust; }
 void invalidate_memory(u32 paddr, u32 size) {
     ensure_init();
     raster_flush();
-    metal_poll();
+    hw_poll();
     texcache_invalidate(paddr, size);
-    metal_guest_written(paddr, size, false);  // CPU cache maintenance: maybe written
+    hw_guest_written(paddr, size, false);  // CPU cache maintenance: maybe written
 }
 
 void texcache_new_epoch() {

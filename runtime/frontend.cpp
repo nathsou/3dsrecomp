@@ -5,8 +5,7 @@
 #include "cloud.h"
 
 #include <SDL3/SDL.h>
-#include <TargetConditionals.h>
-#include <pthread/qos.h>
+#include "platform.h"
 #include <unistd.h>
 
 #include <algorithm>
@@ -33,8 +32,6 @@
 #include "stacks.h"
 #include "touch.h"
 #include "uiview.h"
-
-#include <mach-o/dyld.h>
 
 using namespace std::chrono;
 
@@ -281,9 +278,7 @@ extern std::string g_start_game;  // main.cpp: (multi-game app) the game playing
 #endif
     LOG("frontend: restarting\n");
     unsetenv("RECOMP_INPUT");  // a test script runs once
-    char exe[4096];
-    uint32_t len = sizeof exe;
-    if (_NSGetExecutablePath(exe, &len) == 0) execv(exe, g_argv);
+    if (const std::string exe = platform::exe_path(); !exe.empty()) execv(exe.c_str(), g_argv);
     FATAL("cannot restart: %s\n", strerror(errno));
 }
 void frontend_restart() {
@@ -1324,7 +1319,7 @@ static void swap_screens() {
 // GX commands run on their own thread so a slow frame never delays VBlank or presentation
 
 static void gpu_thread() {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    platform::set_thread_interactive();
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(gpu_m);
@@ -1342,7 +1337,7 @@ static std::mutex input_m;
 static InputSnapshot input_now{};
 
 static void hid_thread() {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    platform::set_thread_interactive();
     const auto period = nanoseconds(1000000000ll / 234);
     auto next = steady_clock::now();
     for (;;) {
@@ -1358,7 +1353,7 @@ static void hid_thread() {
 }
 
 static void audio_thread() {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    platform::set_thread_interactive();
     auto next = steady_clock::now();
     for (;;) {
         next += nanoseconds(1000000000ll * 160 / 32728 * 100 / g_settings.speed);

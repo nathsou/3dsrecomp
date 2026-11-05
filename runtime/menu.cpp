@@ -1,16 +1,8 @@
 // The in-game menu. Pages are lists of rows rebuilt every frame from the current state (an immediate-mode
-// layout), drawn with SDL's renderer in window pixels; text is rasterised with Core Text (the system font)
-// into cached textures. Keyboard, gamepad, mouse and fingers drive it: a finger drags the page to scroll it and
+// layout), drawn with SDL's renderer in window pixels; text is rasterised in the system font (text.h) into cached
+// textures. Keyboard, gamepad, mouse and fingers drive it: a finger drags the page to scroll it and
 // a tap acts when the finger lifts.
 #include "menu.h"
-
-#include <TargetConditionals.h>
-#if TARGET_OS_IOS
-#import <UIKit/UIKit.h>
-#else
-#import <AppKit/AppKit.h>
-#endif
-#import <CoreText/CoreText.h>
 
 #include <algorithm>
 #include <cmath>
@@ -24,6 +16,7 @@
 #include "cloud.h"
 #include "gpu_iface.h"
 #include "loader.h"
+#include "platform.h"
 #include "profile.h"
 #include "settings.h"
 #include "swkbd.h"
@@ -40,7 +33,7 @@ namespace {
 SDL_Window *win;
 SDL_Renderer *ren;
 bool open_ = false;
-constexpr const char *kDevice = TARGET_OS_IOS ? "device" : "Mac";  // whose clock the 3DS clock follows
+constexpr const char *kDevice = TARGET_OS_IOS ? "device" : TARGET_OS_OSX ? "Mac" : "computer";  // whose clock the 3DS clock follows
 float fps = 0;
 
 // ---- text
@@ -59,37 +52,8 @@ const Text &text(const std::string &s, float px, SDL_Color c, bool bold = false)
         for (auto &[k, t] : text_cache) SDL_DestroyTexture(t.tex);
         text_cache.clear();
     }
-    CTFontRef font = CTFontCreateUIFontForLanguage(bold ? kCTFontUIFontEmphasizedSystem : kCTFontUIFontSystem, px, nullptr);
-    CGColorRef col = CGColorCreateSRGB(c.r / 255.0, c.g / 255.0, c.b / 255.0, c.a / 255.0);
-    CFStringRef str = CFStringCreateWithCString(nullptr, s.c_str(), kCFStringEncodingUTF8);
-    const void *keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
-    const void *vals[] = {font, col};
-    CFDictionaryRef attrs = CFDictionaryCreate(nullptr, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
-                                               &kCFTypeDictionaryValueCallBacks);
-    CFAttributedStringRef as = CFAttributedStringCreate(nullptr, str ? str : CFSTR("?"), attrs);
-    CTLineRef line = CTLineCreateWithAttributedString(as);
-    CGFloat ascent, descent, leading;
-    double width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
-    int w = std::max(1, (int)std::ceil(width) + 2), h = std::max(1, (int)std::ceil(ascent + descent) + 2);
-    std::vector<uint32_t> px_(w * h, 0);
-    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
-    CGContextRef ctx = CGBitmapContextCreate(px_.data(), w, h, 8, w * 4, cs,
-                                             (uint32_t)kCGImageAlphaPremultipliedLast | (uint32_t)kCGBitmapByteOrder32Big);
-    CGContextSetTextPosition(ctx, 1, std::ceil(descent) + 1);
-    CTLineDraw(line, ctx);
-    CGContextFlush(ctx);
-    SDL_Texture *t = SDL_CreateTexture(ren, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STATIC, w, h);
-    SDL_UpdateTexture(t, nullptr, px_.data(), w * 4);
-    SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND_PREMULTIPLIED);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(cs);
-    CFRelease(line);
-    CFRelease(as);
-    CFRelease(attrs);
-    if (str) CFRelease(str);
-    CGColorRelease(col);
-    CFRelease(font);
-    return text_cache[s + key] = {t, w, h};
+    const text::Texture t = text::render(ren, s, px, c, bold);
+    return text_cache[s + key] = {t.tex, t.w, t.h};
 }
 
 // ---- pages
@@ -142,7 +106,7 @@ std::string when(time_t t) {
 }
 bool cloud_restart;  // a save picked from the cloud: restored (and the game restarted) once it's downloaded
 
-// Cloud saves (runtime/cloud.mm): the bucket, each device's save of this game
+// Cloud saves (runtime/cloud.cpp): the bucket, each device's save of this game
 void cloud_rows(std::vector<Row> &r) {
     CloudView v = cloud_view();
     if (cloud_restart && !v.fetched.empty()) {  // (restored as any backup is, then the game restarts)
@@ -157,14 +121,11 @@ void cloud_rows(std::vector<Row> &r) {
         r.push_back({"Connect…", "", "Copy your bucket's line first - s3://<key ID>:<application key>@<endpoint>/<bucket> - "
                                     "then select this. Every game on this " + std::string(kDevice) + " uses it.",
                      nullptr, [] {
-#if TARGET_OS_IOS
-                         NSString *str = UIPasteboard.generalPasteboard.string;
-#else
-                         NSString *str = [NSPasteboard.generalPasteboard stringForType:NSPasteboardTypeString];
-#endif
+                         char *str = SDL_GetClipboardText();
                          std::string why;
-                         if (cloud_connect(str ? str.UTF8String : "", &why)) say("Connected");
+                         if (cloud_connect(str ? str : "", &why)) say("Connected");
                          else say("Can't connect: " + why);
+                         SDL_free(str);
                      }});
         return;
     }
@@ -260,10 +221,8 @@ std::vector<Row> rows(Page p) {
                          "scolding you (Resetti). Applies at the next launch.",
                          [&s](int) { s.forgive_unsaved = !s.forgive_unsaved; }});
 #if !TARGET_OS_IOS
-        r.push_back({"Show in Finder", "", "", nullptr, [] {
-                         NSString *p = [NSString stringWithUTF8String:kernel::save_root().c_str()];
-                         [[NSWorkspace sharedWorkspace] openURL:[NSURL fileURLWithPath:p]];
-                     }});
+        r.push_back({TARGET_OS_OSX ? "Show in Finder" : "Show the folder", "", "", nullptr,
+                     [] { platform::open_folder(kernel::save_root()); }});
 #endif
         cloud_rows(r);
         if (save_exists())

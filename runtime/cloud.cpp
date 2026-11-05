@@ -17,16 +17,12 @@
 // name and slot; RECOMP_CLOUD_EVERY=<s>: uploads that often at most.
 #include "cloud.h"
 
+#include "cloud_http.h"
 #include "loader.h"
+#include "platform.h"
 #include "rt.h"
 #include "s3.h"
 
-#include <TargetConditionals.h>
-#import <Foundation/Foundation.h>
-#if TARGET_OS_IPHONE
-#import <Security/Security.h>
-#import <UIKit/UIKit.h>
-#endif
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -150,27 +146,9 @@ static bool parse_conn(std::string s, Conn *c, std::string *why) {
 
 // The application key's secret: the Keychain on iOS (this app's own, not synced to iCloud), else an owner-only file
 #if TARGET_OS_IPHONE
-static NSMutableDictionary *kc_query(const std::string &kid) {
-    return [@{(id)kSecClass: (id)kSecClassGenericPassword, (id)kSecAttrService: @"3dsrecomp cloud saves",
-              (id)kSecAttrAccount: @(kid.c_str())} mutableCopy];
-}
-static std::string secret_get(const std::string &kid) {
-    NSMutableDictionary *q = kc_query(kid);
-    q[(id)kSecReturnData] = @YES;
-    q[(id)kSecMatchLimit] = (id)kSecMatchLimitOne;
-    CFTypeRef r = NULL;
-    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &r) != errSecSuccess || !r) return "";
-    NSData *d = CFBridgingRelease(r);
-    return std::string((const char *)d.bytes, d.length);
-}
-static void secret_clear(const std::string &kid) { SecItemDelete((__bridge CFDictionaryRef)kc_query(kid)); }
-static bool secret_set(const std::string &kid, const std::string &secret) {
-    secret_clear(kid);
-    NSMutableDictionary *q = kc_query(kid);
-    q[(id)kSecValueData] = [NSData dataWithBytes:secret.data() length:secret.size()];
-    q[(id)kSecAttrAccessible] = (id)kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly;
-    return SecItemAdd((__bridge CFDictionaryRef)q, NULL) == errSecSuccess;
-}
+static std::string secret_get(const std::string &kid) { return cloud_keychain_get(kid); }
+static void secret_clear(const std::string &kid) { cloud_keychain_clear(kid); }
+static bool secret_set(const std::string &kid, const std::string &secret) { return cloud_keychain_set(kid, secret); }
 #else
 static std::string secret_get(const std::string &kid) {  // "<key ID> <secret>"
     std::ifstream f(secret_path());
@@ -211,76 +189,13 @@ static bool conn(Conn *c) {
     return !c->secret.empty();
 }
 
-// ------------------------------------------------------------------ HTTPS (NSURLSession)
-struct Resp { int status = 0; std::string body, error; std::map<std::string, std::string> headers; /* (lower-case names) */ };
-using Progress = std::function<void(double)>;
+// ------------------------------------------------------------------ HTTPS (cloud_http.h)
+using Resp = CloudResp;
+using Progress = CloudProgress;
 
 static Resp http_send(const std::string &method, const std::string &url, const s3::Headers &headers, const std::string &body,
                       double timeout, const Progress &progress) {
-    Resp out;
-    @autoreleasepool {
-        static NSURLSession *sessions[2];  // ([1]: mobile data allowed)
-        static std::mutex m;
-        NSURLSession *session;
-        {
-            std::lock_guard<std::mutex> l(m);
-            int k = cfg().cellular ? 1 : 0;
-            if (!sessions[k]) {
-                NSURLSessionConfiguration *c = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-                c.allowsCellularAccess = k;
-                c.timeoutIntervalForResource = 600;
-                c.URLCache = nil;
-                sessions[k] = [NSURLSession sessionWithConfiguration:c];
-            }
-            session = sessions[k];
-        }
-        NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@(url.c_str())]];
-        r.HTTPMethod = @(method.c_str());
-        r.timeoutInterval = timeout;  // (with nothing received for that long)
-        for (auto &h : headers)
-            if (s3::lower(h.first) != "host") [r setValue:@(h.second.c_str()) forHTTPHeaderField:@(h.first.c_str())];
-        dispatch_semaphore_t done = dispatch_semaphore_create(0);
-        Resp *o = &out;
-        void (^handler)(NSData *, NSURLResponse *, NSError *) = ^(NSData *data, NSURLResponse *resp, NSError *e) {
-            if (e) o->error = e.localizedDescription.UTF8String ?: "network error";
-            else {
-                NSHTTPURLResponse *h = (NSHTTPURLResponse *)resp;
-                o->status = (int)h.statusCode;
-                if (data) o->body.assign((const char *)data.bytes, data.length);
-                [h.allHeaderFields enumerateKeysAndObjectsUsingBlock:^(id key, id val, BOOL *stop) {
-                    (void)stop;
-                    o->headers[s3::lower([key description].UTF8String)] = [val description].UTF8String;
-                }];
-            }
-            dispatch_semaphore_signal(done);
-        };
-        bool up = method == "PUT";
-        NSURLSessionTask *t = up ? [session uploadTaskWithRequest:r fromData:[NSData dataWithBytesNoCopy:(void *)body.data()
-                                                                                                      length:body.size() freeWhenDone:NO]
-                                                completionHandler:handler]
-                                 : [session dataTaskWithRequest:r completionHandler:handler];
-#if TARGET_OS_IPHONE
-        // (an upload carries on for a while when the app goes to the background)
-        __block UIBackgroundTaskIdentifier bg = UIBackgroundTaskInvalid;
-        UIApplication *app = UIApplication.sharedApplication;
-        bg = [app beginBackgroundTaskWithName:@"cloud save" expirationHandler:^{
-            [t cancel];
-            [app endBackgroundTask:bg];
-            bg = UIBackgroundTaskInvalid;
-        }];
-#endif
-        [t resume];
-        while (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, 100 * NSEC_PER_MSEC)))
-            if (progress) {
-                int64_t n = up ? t.countOfBytesSent : t.countOfBytesReceived;
-                int64_t of = up ? t.countOfBytesExpectedToSend : t.countOfBytesExpectedToReceive;
-                if (of > 0) progress((double)n / of);
-            }
-#if TARGET_OS_IPHONE
-        if (bg != UIBackgroundTaskInvalid) [app endBackgroundTask:bg];
-#endif
-    }
-    return out;
+    return cloud_http_send(method, url, headers, body, timeout, cfg().cellular, progress);
 }
 
 // A request to the bucket (key: an object in it, "" the bucket itself), signed. Its error: the network's, or S3's.
@@ -664,12 +579,7 @@ static void enqueue(std::function<void()> job) {
 // ------------------------------------------------------------------ the runtime's calls
 static void ensure_device() {
     if (!cfg().device_id.empty()) return;
-    std::string name;
-#if TARGET_OS_IPHONE
-    name = UIDevice.currentDevice.model.UTF8String;  // ("iPhone", "iPad": iOS doesn't tell apps the device's own name)
-#else
-    name = NSHost.currentHost.localizedName.UTF8String ?: "Mac";
-#endif
+    std::string name = platform::device_name();
     if (name.empty()) name = "device";
     std::string id;
     for (char ch : name)

@@ -1,4 +1,6 @@
 // GX transfer engine: MemoryFill, DisplayTransfer and TextureCopy.
+#include <algorithm>
+
 #include "gpu/pica.h"
 
 namespace gpu {
@@ -20,18 +22,18 @@ void memory_fill(u32 start, u32 end, u32 value, u32 control) {
     if (!(control & 1)) return;
     ensure_init();
     raster_flush();
-    metal_poll();
+    hw_poll();
     u8 *s = pptr(start), *e = pptr(end - 1);
     if (!s || !e || end <= start) {
         LOG("gpu: bad memory fill %08x-%08x\n", start, end);
         return;
     }
     const u32 len = end - start;
-    metal_guest_prewrite(start, len);
+    hw_guest_prewrite(start, len);
     const u8 pattern[4] = {(u8)value, (u8)(value >> 8), (u8)(value >> 16), (u8)(value >> 24)};  // little-endian
     fill_pattern(s, len, pattern, control & 0x100 ? 3 : control & 0x200 ? 4 : 2);  // 24, 32 or 16-bit
     texcache_invalidate(start, len);
-    metal_guest_written(start, len);
+    hw_guest_written(start, len);
 }
 
 void transfer_convert(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 flags) {
@@ -82,7 +84,7 @@ void transfer_convert(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 fla
 void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
     ensure_init();
     raster_flush();
-    metal_poll();
+    hw_poll();
     if (flags & 8) {
         LOG("gpu: display_transfer called with texture-copy flag, ignored\n");
         return;
@@ -105,19 +107,19 @@ void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u3
         LOG("gpu: bad display transfer %08x -> %08x\n", in_paddr, out_paddr);
         return;
     }
-    if (metal_gpu_transfer(in_paddr, out_paddr, in_dims, out_dims, flags)) return;
+    if (hw_gpu_transfer(in_paddr, out_paddr, in_dims, out_dims, flags)) return;
     const u32 hs = scaling != 0 ? 1 : 0, vs = scaling == 2 ? 1 : 0;
     const u32 out_w = out_w0 >> hs, out_h = out_h0 >> vs;
     // from a render target the GPU is still drawing: finished asynchronously
-    if (metal_defer_transfer(in_paddr, out_paddr, in_dims, out_dims, flags, out_w * out_h * obpp)) return;
-    metal_guest_read(in_paddr, in_w * in_h * ibpp);
-    const bool from_gpu = metal_gpu_made(in_paddr, in_w * in_h * ibpp);
-    metal_guest_prewrite(out_paddr, out_w * out_h * obpp);
+    if (hw_defer_transfer(in_paddr, out_paddr, in_dims, out_dims, flags, out_w * out_h * obpp)) return;
+    hw_guest_read(in_paddr, in_w * in_h * ibpp);
+    const bool from_gpu = hw_gpu_made(in_paddr, in_w * in_h * ibpp);
+    hw_guest_prewrite(out_paddr, out_w * out_h * obpp);
     transfer_convert(src, dst, in_dims, out_dims, flags);
     texcache_invalidate(out_paddr, out_w * out_h * obpp);
-    metal_guest_written(out_paddr, out_w * out_h * obpp);
-    if (from_gpu) metal_note_gpu_output(out_paddr, out_w * out_h * obpp);
-    metal_display_transfer(in_paddr, out_paddr, in_dims, out_dims, flags);
+    hw_guest_written(out_paddr, out_w * out_h * obpp);
+    if (from_gpu) hw_note_gpu_output(out_paddr, out_w * out_h * obpp);
+    hw_display_transfer(in_paddr, out_paddr, in_dims, out_dims, flags);
 }
 
 void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 out_width_gap,
@@ -125,7 +127,7 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     (void)flags;
     ensure_init();
     raster_flush();
-    metal_poll();
+    hw_poll();
     const u8 *src = pptr(in_paddr);
     u8 *dst = pptr(out_paddr);
     if (!src || !dst) {
@@ -139,10 +141,10 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     const u32 out_width = out_gap == 0 ? remaining : (out_width_gap & 0xffff) * 16;
     if (!in_width || !out_width) return;
     const u32 out_total = size / out_width * (out_width + out_gap) + out_width;
-    if (metal_texture_copy(in_paddr, out_paddr, remaining, in_width, in_gap, out_width, out_gap)) return;
-    metal_guest_read(in_paddr, size / in_width * (in_width + in_gap) + in_width);
-    const bool from_gpu = metal_gpu_made(in_paddr, size / in_width * (in_width + in_gap) + in_width);
-    metal_guest_prewrite(out_paddr, out_total);
+    if (hw_texture_copy(in_paddr, out_paddr, remaining, in_width, in_gap, out_width, out_gap)) return;
+    hw_guest_read(in_paddr, size / in_width * (in_width + in_gap) + in_width);
+    const bool from_gpu = hw_gpu_made(in_paddr, size / in_width * (in_width + in_gap) + in_width);
+    hw_guest_prewrite(out_paddr, out_total);
     u32 ri = in_width, ro = out_width;
     while (remaining) {
         u32 n = std::min({ri, ro, remaining});
@@ -162,8 +164,8 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
         }
     }
     texcache_invalidate(out_paddr, out_total);
-    metal_guest_written(out_paddr, out_total);
-    if (from_gpu) metal_note_gpu_output(out_paddr, out_total);
+    hw_guest_written(out_paddr, out_total);
+    if (from_gpu) hw_note_gpu_output(out_paddr, out_total);
 }
 
 }  // namespace gpu

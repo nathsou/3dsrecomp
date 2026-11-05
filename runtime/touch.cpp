@@ -3,7 +3,7 @@
 // fingertip wide), so they stay the same physical size on a phone and on a tablet.
 #include "touch.h"
 
-#include <TargetConditionals.h>
+#include "platform.h"
 
 #include <algorithm>
 #include <cmath>

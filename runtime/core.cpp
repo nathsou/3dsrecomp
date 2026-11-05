@@ -3,7 +3,7 @@
 #include <unistd.h>
 
 #include <dlfcn.h>
-#include <TargetConditionals.h>
+#include "platform.h"
 
 #include <algorithm>
 #include <atomic>
@@ -190,11 +190,12 @@ static bool lazy_compile(u32 addr) {
     snprintf(hexaddr, sizeof hexaddr, "%x", addr);
     std::string cmd = "mkdir -p '" + root + "/build/lazy' && cd '" + root + "' && $( [ -x .venv/bin/python ] && echo .venv/bin/python || echo python3 ) -m tools.recomp.gen '" +
                       gamedir + "' generated/" + game + " --lazy " + hexaddr + " --lazy-out " + base +
-                      ".c > /dev/null && clang -O1 -w -ffp-contract=off -fno-strict-aliasing -shared -fPIC "
-                      "-undefined dynamic_lookup -Iruntime -Igenerated/" + game + " " + base + ".c -o " + base + ".dylib";
+                      ".c > /dev/null && clang -O1 -w -ffp-contract=off -fno-strict-aliasing -shared -fPIC " +
+                      (TARGET_OS_OSX ? "-undefined dynamic_lookup " : "") + "-Iruntime -Igenerated/" + game + " " + base +
+                      ".c -o " + base + platform::module_suffix();
     LOG("[lazy] recompiling missing code at %08x\n", addr);
     if (system(cmd.c_str()) != 0) return false;
-    void *h = dlopen((std::string(base) + ".dylib").c_str(), RTLD_NOW);
+    void *h = dlopen((std::string(base) + platform::module_suffix()).c_str(), RTLD_NOW);
     if (!h) {
         LOG("[lazy] dlopen: %s\n", dlerror());
         return false;

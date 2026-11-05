@@ -5,7 +5,8 @@ D=$1; N=$2
 TID=$(python3 -c "import json;print(json.load(open('$D/info.json'))['program_id'])")
 # fold in code that a run found missing (runs from a build or from the app bundle)
 mkdir -p games/$TID; touch games/$TID/functions.txt
-for M in save/missing_functions.txt "$HOME/Library/Application Support/3dsrecomp/missing_functions.txt"; do
+for M in save/missing_functions.txt "$HOME/Library/Application Support/3dsrecomp/missing_functions.txt" \
+         "${XDG_DATA_HOME:-$HOME/.local/share}/3dsrecomp/missing_functions.txt"; do
   [ -f "$M" ] && sort -u "$M" >> games/$TID/functions.txt && rm "$M"
 done
 sort -u -o games/$TID/functions.txt games/$TID/functions.txt
