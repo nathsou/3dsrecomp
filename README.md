@@ -54,6 +54,14 @@ full speed with music and sound (built with `-DGAME=oot3d` from `data/oot3d`). A
 (an adult Link inside Ganon's Castle, Master Quest offered on the title screen). It needed no change to the
 recompiler or the runtime.
 
+**Pullblox** (EUR, eShop, `CTR-N-JCAP` v0.2.0, title 0004000000068F00) runs: save creation, the opening, the
+title screen, Papa Blox's lessons in Pullblox Park with blocks grabbed, pulled out and climbed (Lesson 1 cleared,
+Lesson 2 reached), with music and sound at full speed (built with `-DGAME=pullblox` from `data/pullblox`,
+extracted from the CIA with `--boot9`/`--keys`). It needs the shared font system archive
+(`tools/import_system_archives.py`). It needed no runtime changes. QR codes (sharing Pullblox) and StreetPass are
+not supported. In the first lesson, the way on is to walk into the Pullblox itself (Papa Blox only reacts once
+Mallo touches the block), not up to Papa Blox.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
