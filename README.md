@@ -40,6 +40,20 @@ and online play are not supported: the services report nothing there. The Europe
 0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
 American one has (its own addresses, and its keyboard's keys).
 
+**The Legend of Zelda: Majora's Mask 3D** (EUR, `CTR-P-AJRP`, title 0004000000125600, an eShop CIA) runs: the
+title screen and its attract scenes, the file select, naming Link on the software keyboard, the opening in the Lost
+Woods with Skull Kid, then Link on foot with the bottom-screen HUD (items, masks, map), at full speed with music
+and sound (built with `-DGAME=mm3d` from `data/mm3d`). It supports the Circle Pad Pro, which the runtime presents
+(see [Controls](#controls)): at start, ZR (2, or the right trigger) takes it, and the right stick then turns the
+camera; "Don't Use" plays without it. Beyond the first steps in the Lost Woods it was not tested by scripts.
+
+**The Legend of Zelda: Ocarina of Time 3D** (EUR, `CTR-P-AQEP`, title 0004000000033600, a CIA) runs: the title
+screen and its attract scenes, file select, naming a file on the game's own keyboard, the opening (the Deku Tree,
+the nightmare, Navi's flight through Kokiri Forest) and Link's house with the touch-screen item and map panel, at
+full speed with music and sound (built with `-DGAME=oot3d` from `data/oot3d`). A real console's save loads
+(an adult Link inside Ganon's Castle, Master Quest offered on the title screen). It needed no change to the
+recompiler or the runtime.
+
 **Pullblox** (EUR, eShop, `CTR-N-JCAP` v0.2.0, title 0004000000068F00) runs: save creation, the opening, the
 title screen, Papa Blox's lessons in Pullblox Park with blocks grabbed, pulled out and climbed (Lesson 1 cleared,
 Lesson 2 reached), with music and sound at full speed (built with `-DGAME=pullblox` from `data/pullblox`,
@@ -161,6 +175,13 @@ The same bucket and lines can serve nx (its Switch games' saves are under their 
 Tests: `RECOMP_CLOUD=<line>` uses that bucket without storing anything (`s3+http://` for a local server such as
 `moto_server`), and `RECOMP_CLOUD_DEVICE=<name>` acts as another device.
 
+**Saves from a 3DS:** `python3 tools/checkpoint_cloud.py <Checkpoint's saves folder> <file with the line> --upload`
+uploads each game's newest [Checkpoint](https://github.com/BernardoGiordano/Checkpoint) backup (copied from the
+SD card's `3ds/Checkpoint/saves`) as the saves of one more device, "3DS". A game made from the same game files as
+`data/<name>` takes it as any other device's save; the others are only kept in the bucket. `--as 0x01BFB=metroid`
+also makes that game's save (here Europe's Samus Returns) data/metroid's (America's), for a backup from another
+region's version. Without `--upload` it lists what the bucket has.
+
 ### Homebrew (.3dsx)
 
 ```sh
@@ -236,8 +257,13 @@ On a Mac, `RECOMP_TOUCH=1` shows the touch controls and layout in the window, th
 | A / B / X / Y | X / Z / S / A | East / South / North / West |
 | L / R | Q / W | Shoulders |
 | ZL / ZR | 1 / 2 | Triggers |
+| Circle Pad Pro's circle pad (C-stick) | | Right stick |
 | Start / Select | Enter / Backspace | Start / Back |
 | Touch screen | Mouse on the bottom screen | |
+
+The runtime presents an old 3DS with a Circle Pad Pro attached (as a New 3DS does for older games): games that
+support it (Majora's Mask 3D, ...) get ZL, ZR and the second circle pad through `ir:USER`. A
+game that asks for it at start ("press ZR on your Circle Pad Pro") takes it once ZR is pressed.
 
 F11 toggles fullscreen, F2 cycles the screen layout (stacked, top screen only, side by side, large top with a small bottom, bottom screen
 only, stacked with the bottom screen first; the window takes the layout's shape and the mouse touches the bottom
