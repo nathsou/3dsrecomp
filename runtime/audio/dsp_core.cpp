@@ -133,17 +133,24 @@ StereoFrame generate_frame(Dsp &d) {
 namespace audio {
 using namespace hle;
 
-void pipe_write(u32 pipe, const u8 *data, u32 size) {
+bool pipe_write(u32 pipe, const u8 *data, u32 size) {
     Dsp &d = dsp();
     std::lock_guard lk(d.lock);
-    if (pipe != 2) {
-        // pipe 3 is the AAC decoder (binary pipe): unsupported
+    if (pipe == kBinaryPipe) {
+        std::vector<u8> answer;
+        if (!aac_request(data, size, answer)) {
+            return false;
+        }
+        d.pipes[kBinaryPipe].insert(d.pipes[kBinaryPipe].end(), answer.begin(), answer.end());
+        return true;
+    }
+    if (pipe != kAudioPipe) {
         LOG("dsp: write of %u bytes to unsupported pipe %u ignored\n", size, pipe);
-        return;
+        return false;
     }
     if (size != 4) {
         LOG("dsp: unexpected audio pipe write of %u bytes\n", size);
-        return;
+        return false;
     }
     switch (data[0]) {
     case 0:  // initialize
@@ -173,6 +180,7 @@ void pipe_write(u32 pipe, const u8 *data, u32 size) {
         d.power = Power::Off;
         break;
     }
+    return true;
 }
 
 std::vector<u8> pipe_read(u32 pipe, u32 size) {

@@ -40,13 +40,13 @@ and online play are not supported: the services report nothing there. The Europe
 0004000000198F00, an eShop CIA) runs too, with a town from a real console's save, and its profile has everything the
 American one has (its own addresses, and its keyboard's keys).
 
-**Picross 3D: Round 2** (EUR, `CTR-P-BBPP`, title 0004000000187E00, an eShop CIA) boots (built with `-DGAME=picross`
+**Picross 3D: Round 2** (EUR, `CTR-P-BBPP`, title 0004000000187E00, an eShop CIA) runs (built with `-DGAME=picross`
 from `data/picross`; it uses seed crypto, so it is extracted with its seed: `--seed` or `--seeddb`): title screen,
 membership cards (a new one, named on the system keyboard, or a real console's save), the café menu, settings, the
-library and a book's puzzle pages with their 3D previews, with sound effects. Not working yet: starting a puzzle
-(tapping a puzzle's card selects it but never opens it, and the buttons are ignored on these screens, so the
-puzzles themselves were not reached) and the music, which is AAC (`sound/stream/*.aac`) decoded by the DSP's AAC
-decoder (its binary pipe), not emulated.
+library, a book's puzzle pages and the puzzles themselves (rotating the block with the mouse, removing and painting
+cubes with the mouse while holding the buttons the game's Controls settings name), with music and sound. Its
+music is AAC (`sound/stream/*.aac`), decoded by the DSP's AAC decoder, which the runtime implements with the
+system's AudioToolbox (`runtime/audio/aac.cpp`). The menus are played with the touch screen only, as on a 3DS.
 
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).

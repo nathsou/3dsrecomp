@@ -22,6 +22,7 @@ constexpr int kSampleRate = 32728;     // native output rate (Hz)
 constexpr int kFrameSamples = 160;     // samples per audio frame
 constexpr int kNumSources = 24;
 constexpr int kNumPipes = 8;
+constexpr u32 kAudioPipe = 2, kBinaryPipe = 3;  // the binary pipe is the AAC decoder's
 constexpr u32 kRegion0 = 0x50000;      // byte offsets inside DSP RAM
 constexpr u32 kRegion1 = 0x70000;
 constexpr u32 kDspRamSize = 0x80000;
