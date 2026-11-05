@@ -772,18 +772,38 @@ class Emitter:
                         fr.add(t)
                         changed = True
         self.flag_returning = fr
-        # entries that read flags first are mid-function code split off as a function: jumps into them keep flags
-        fre = set()
-        for k in an.funcs:
-            seq, a = [], k & ~1
-            for _ in range(4):
-                n = an.decode(a, k & 1)
-                seq.append(n)
-                if n is None:
-                    break
-                a += n.size
-            if flags.reads_flags_first(seq):
-                fre.add(k)
+        # entries that read flags before setting them are mid-function code split off as a function: jumps and
+        # fall-throughs into them keep those flags. Which flags an entry reads comes from its own liveness, which
+        # depends on the entries it goes on to: iterated until nothing changes (a few instructions' look-ahead
+        # missed a compare whose branch came later, e.g. after a run of VFP instructions)
+        fre = {}
+        into = defaultdict(set)  # entry -> functions that jump or fall through into it
+        work = []
+        for k in keys:
+            th = k & 1
+            insts, _ = an.explore(k)
+            for a, i in insts.items():
+                if i.kind == B and (i.target | th) in an.funcs and i.target != (k & ~1):
+                    into[i.target | th].add(k)
+                if i.falls_through and (a + i.size) not in insts:
+                    into[(a + i.size) | th].add(k)
+            work.append(k)
+        queued = set(work)
+        while work:
+            k = work.pop()
+            queued.discard(k)
+            insts, _ = an.explore(k)
+            first = insts.get(k & ~1)
+            if first is None:
+                continue
+            lo = flags.liveness(insts, k & 1, k & ~1, an.funcs, k in fr, fre)
+            li = frozenset(flags.live_in(first, lo[k & ~1])) | fre.get(k, frozenset())
+            if li and li != fre.get(k):
+                fre[k] = li
+                for p in into.get(k, ()):
+                    if p not in queued:
+                        queued.add(p)
+                        work.append(p)
         self.flag_reading_entries = fre
         print('flag-returning functions: %d, entries reading flags: %d' % (len(fr), len(fre)))
 

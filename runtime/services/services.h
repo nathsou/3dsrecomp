@@ -33,7 +33,10 @@ bool gsp_gx_pending();
 struct GxStats { u64 cmdlists, gpu_ns, transfers; };
 extern GxStats gx_stats;
 // hid
-void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty);  // (host thread, lock not held)
+// (host thread, lock not held) sx, sy: the second circle pad (the host's right stick), -0x7FF..0x7FF, up positive
+void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty, s16 sx, s16 sy);
+// ir (lock held): the Circle Pad Pro's state, sent to the game at the polling period it asked for
+void ir_poll(u32 buttons, s16 sx, s16 sy);
 // dsp
 void dsp_tick();  // (host thread, lock not held) one audio frame
 }
