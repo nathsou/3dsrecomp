@@ -518,6 +518,48 @@ static void create_gamecoin(const std::string &dir) {
     LOG("[fs] created shared extdata F000000B with gamecoin.dat (10 Play Coins)\n");
 }
 
+// Mii Maker's database, CFL_DB.dat, is in F000000B too once a Mii was made on the console. Some games need a Mii
+// from it (Mario Kart 7 stops at "There are currently no Mii characters in Mii Maker"): it gets one, the standard
+// Mii of the Mii selector, in its first slot.
+static void create_mii_database(const std::string &dir) {
+    constexpr size_t kMiis = 100;        // Mii Maker's slots ("CFOG" section)
+    constexpr size_t kHidden = 3000;     // entries of the "CFHE" section (Miis met, a linked list)
+    constexpr size_t kHiddenEntry = 14;  // its entries: Mii id and links
+    constexpr u16 kNoLink = 0x7FFF;      // a link to no entry
+    constexpr size_t kCfhe = 8 + kMiis * MII_DATA_SIZE;
+    constexpr size_t kCfra = kCfhe + 8 + kHidden * kHiddenEntry + 16;  // 14 bytes of padding, then the CRC
+    constexpr size_t kCfraSize = 0x1CA0;  // a section of its own (empty here), with its own CRC
+    constexpr size_t kSize = 0x4BD20;     // what follows stays zero
+    std::vector<u8> db(kSize, 0);
+    auto le16 = [&](size_t o, u16 v) { db[o] = (u8)v; db[o + 1] = v >> 8; };
+    // each section ends with the CRC-16/XMODEM of the rest of it, big-endian
+    auto seal = [&](size_t start, size_t size) {
+        const u16 crc = crc16_xmodem(&db[start], size - 2);
+        db[start + size - 2] = crc >> 8;
+        db[start + size - 1] = (u8)crc;
+    };
+    memcpy(&db[0], "CFOG", 4);
+    le16(4, 0x100);  // version
+    const std::vector<u8> mii = standard_mii();
+    memcpy(&db[8], mii.data(), mii.size());
+    memcpy(&db[kCfhe], "CFHE", 4);
+    le16(kCfhe + 4, 0xFFFF);  // first and last entry in use: none
+    le16(kCfhe + 6, 0xFFFF);
+    for (size_t i = 0; i < kHidden; i++) {
+        const size_t e = kCfhe + 8 + i * kHiddenEntry;
+        le16(e + 10, kNoLink);
+        le16(e + 12, kNoLink);
+    }
+    seal(0, kCfra);
+    memcpy(&db[kCfra], "CFRA", 4);
+    seal(kCfra, kCfraSize);
+    if (FILE *f = fopen((dir + "/CFL_DB.dat").c_str(), "wb")) {
+        fwrite(db.data(), 1, db.size(), f);
+        fclose(f);
+    }
+    LOG("[fs] created Mii Maker's database in shared extdata F000000B (one Mii)\n");
+}
+
 // ---- fs:USER
 struct FsUser : Service {
     using Service::Service;
@@ -540,7 +582,14 @@ struct FsUser : Service {
                 return ERR_NOT_FOUND;
             }
             if (id == 9) fsys::create_directories(a.host);
-            if (id == 7 && p.word(1) == 0xF000000B && !fsys::exists(a.host)) create_gamecoin(a.host);
+            if (id == 7 && p.word(1) == 0xF000000B) {
+                if (!fsys::exists(a.host)) {
+                    create_gamecoin(a.host);
+                }
+                if (!fsys::exists(a.host + "/CFL_DB.dat")) {
+                    create_mii_database(a.host);
+                }
+            }
             if (!fsys::exists(a.host)) {
                 VLOG("[fs] archive %x (%s) not formatted\n", id, a.host.c_str());
                 return id == 4 ? ERR_NOT_FORMATTED : ERR_NOT_FOUND;

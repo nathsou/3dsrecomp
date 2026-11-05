@@ -450,38 +450,6 @@ struct Ir : Service {
     }
 };
 
-struct Y2r : Service {
-    using Service::Service;
-    std::shared_ptr<Event> done = make_event(ONESHOT, "y2r");
-    void handle(IPC &ipc) override {
-        switch (ipc.cmd()) {
-        case 0x000F:  // GetTransferEndEvent
-            ipc.ok(1, 2);
-            ipc.handles(2, {done});
-            break;
-        case 0x0026:  // StartConversion: we don't convert
-            done->signal();
-            ipc.ok();
-            break;
-        case 0x0027:  // IsBusyConversion
-        case 0x0014:  // IsFinishedSendingYuv
-        case 0x0015:
-        case 0x0016:
-        case 0x0017:
-        case 0x0018:
-            ipc.ok(2);
-            ipc.set(2, ipc.cmd() == 0x0027 ? 0 : 1);
-            break;
-        case 0x0028:  // PingProcess
-            ipc.ok(2);
-            ipc.set(2, 0);
-            break;
-        default:
-            ipc.ok();
-        }
-    }
-};
-
 struct Generic : Service {
     using Service::Service;
     void handle(IPC &ipc) override { unimplemented(ipc); }
@@ -500,7 +468,7 @@ void register_misc() {
     register_service(std::make_shared<Mic>("mic:u"));
     register_service(std::make_shared<Ir>("ir:USER"));
     register_service(std::make_shared<Ir>("ir:u"));
-    register_service(std::make_shared<Y2r>("y2r:u"));
+    register_y2r();
     for (const char *n : {"news:u", "cam:u", "soc:U", "ssl:C", "http:C", "nwm::UDS", "dlp:FKCL", "dlp:SRVR",
                           "pxi:dev", "act:u", "am:app", "nim:aoc", "qtm:u", "csnd:SND"})
         register_service(std::make_shared<Generic>(n));

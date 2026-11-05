@@ -77,6 +77,16 @@ cubes with the mouse while holding the buttons the game's Controls settings name
 music is AAC (`sound/stream/*.aac`), decoded by the DSP's AAC decoder, which the runtime implements with the
 system's AudioToolbox (`runtime/audio/aac.cpp`). The menus are played with the touch screen only, as on a 3DS.
 
+**Mario Kart 7** (EUR, `CTR-P-AMKP`, title 0004000000030700, extracted from its CIA with your console's keys, see
+below) runs: the title screen, the menus with their Mobiclip previews (converted by the `y2r` service), Grand Prix,
+Time Trials and battles with every course and arena, at full speed with music and sound (built with `-DGAME=mk7` from
+`data/mk7`; on an M4 Pro races keep the 4x resolution). It needs a Mii in Mii Maker before it starts: the runtime
+gives the console one, the Mii selector's standard Mii, in Mii Maker's database (`CFL_DB.dat` in shared extdata
+F000000B, made when it is missing), so the game's own Mii character is that Mii; its face needs the Mii data system
+archive, as in Tomodachi Life. A save from a real console (`system0.dat`, `system1.dat` and `replay/`, copied into
+the save folder) keeps its unlocked cups, characters and parts. Online play, StreetPass, SpotPass, local multiplayer
+and the Mario Kart Channel's communities are not supported.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 

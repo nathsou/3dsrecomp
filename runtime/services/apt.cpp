@@ -58,49 +58,66 @@ static void system_applet_receive(u32 id, u32 signal) {
     send_parameter({id, 0x300, 10, nullptr, {}});  // WakeupByExit: back to the application
 }
 
-// The Mii selector returns a standard Mii: a plain male Mii named "Mario" (made-up console/Mii IDs and a
-// placeholder MAC; games mostly check the flags and the checksum)
+// The standard Mii: a plain male Mii named "Mario" (made-up console/Mii IDs and a placeholder MAC; games mostly
+// check the flags and the checksum). The Mii selector returns it, and it is the one Mii of Mii Maker's database.
+std::vector<u8> standard_mii() {
+    std::vector<u8> m(MII_DATA_SIZE, 0);
+    auto be32 = [&](size_t o, u32 v) { m[o] = v >> 24; m[o + 1] = v >> 16; m[o + 2] = v >> 8; m[o + 3] = v; };
+    auto be16 = [&](size_t o, u16 v) { m[o] = v >> 8; m[o + 1] = (u8)v; };
+    m[0] = 0x03;
+    m[1] = 0x01;  // copying allowed (games that make look-alikes, e.g. Tomodachi Life, refuse it otherwise)
+    m[2] = 0x10;
+    m[3] = 0x30;
+    u64 sys = 0x3D5000000000C0DEull;  // console id of the "author"
+    for (int i = 0; i < 8; i++) m[4 + i] = (u8)(sys >> (56 - 8 * i));
+    be32(0x0C, 0x98000001);  // Mii id: normal Mii flags, creation time 1
+    const u8 mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};  // locally administered placeholder
+    memcpy(&m[0x10], mac, 6);
+    be16(0x18, 0xA600);
+    const char *name = "Mario";
+    for (int i = 0; name[i]; i++) m[0x1A + 2 * i] = (u8)name[i];
+    m[0x2E] = 0x40;
+    m[0x2F] = 0x40;
+    m[0x32] = 0x21;
+    m[0x33] = 0x01;
+    be32(0x34, 0x02684418);
+    be32(0x38, 0x26344614);
+    be16(0x3C, 0x8112);
+    be16(0x3E, 0x1768);
+    be16(0x40, 0x0D00);
+    be16(0x42, 0x0029);
+    be16(0x44, 0x0052);
+    be16(0x46, 0x4850);
+    const char *author = "Player";
+    for (int i = 0; author[i]; i++) m[0x48 + 2 * i] = (u8)author[i];
+    return m;
+}
+
+u16 crc16_xmodem(const u8 *p, size_t n) {
+    u16 crc = 0;
+    for (size_t i = 0; i < n; i++) {
+        crc ^= (u16)p[i] << 8;
+        for (int b = 0; b < 8; b++) {
+            crc = (crc & 0x8000) ? (u16)((crc << 1) ^ 0x1021) : (u16)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+// The Mii selector's result: the standard Mii, as if the player picked it
 static std::vector<u8> mii_selector_result() {
     std::vector<u8> r(0x84, 0);
     auto be32 = [&](size_t o, u32 v) { r[o] = v >> 24; r[o + 1] = v >> 16; r[o + 2] = v >> 8; r[o + 3] = v; };
-    auto be16 = [&](size_t o, u16 v) { r[o] = v >> 8; r[o + 1] = (u8)v; };
     be32(0, 0);           // return code: a Mii was selected
     be32(4, 0);           // not a guest Mii
     be32(8, 0xFFFFFFFF);  // guest index
-    size_t m = 0x0C;
-    r[m + 0] = 0x03;
-    r[m + 1] = 0x01;  // copying allowed (games that make look-alikes, e.g. Tomodachi Life, refuse it otherwise)
-    r[m + 2] = 0x10;
-    r[m + 3] = 0x30;
-    u64 sys = 0x3D5000000000C0DEull;  // console id of the "author"
-    for (int i = 0; i < 8; i++) r[m + 4 + i] = (u8)(sys >> (56 - 8 * i));
-    be32(m + 0x0C, 0x98000001);  // Mii id: normal Mii flags, creation time 1
-    const u8 mac[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};  // locally administered placeholder
-    memcpy(&r[m + 0x10], mac, 6);
-    be16(m + 0x18, 0xA600);
-    const char *name = "Mario";
-    for (int i = 0; name[i]; i++) r[m + 0x1A + 2 * i] = (u8)name[i];
-    r[m + 0x2E] = 0x40;
-    r[m + 0x2F] = 0x40;
-    r[m + 0x32] = 0x21;
-    r[m + 0x33] = 0x01;
-    be32(m + 0x34, 0x02684418);
-    be32(m + 0x38, 0x26344614);
-    be16(m + 0x3C, 0x8112);
-    be16(m + 0x3E, 0x1768);
-    be16(m + 0x40, 0x0D00);
-    be16(m + 0x42, 0x0029);
-    be16(m + 0x44, 0x0052);
-    be16(m + 0x46, 0x4850);
-    const char *author = "Player";
-    for (int i = 0; author[i]; i++) r[m + 0x48 + 2 * i] = (u8)author[i];
+    const size_t m = 0x0C;
+    const std::vector<u8> mii = standard_mii();
+    memcpy(&r[m], mii.data(), mii.size());
     // CRC-16/XMODEM over the Mii data and padding
-    u16 crc = 0;
-    for (size_t i = 0; i < 0x5E; i++) {
-        crc ^= (u16)r[m + i] << 8;
-        for (int b = 0; b < 8; b++) crc = (crc & 0x8000) ? (u16)((crc << 1) ^ 0x1021) : (u16)(crc << 1);
-    }
-    be16(m + 0x5E, crc);
+    const u16 crc = crc16_xmodem(&r[m], 0x5E);
+    r[m + 0x5E] = crc >> 8;
+    r[m + 0x5F] = (u8)crc;
     return r;
 }
 
