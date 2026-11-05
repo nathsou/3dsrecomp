@@ -120,10 +120,13 @@ vertex VOutV vs_main(uint vid [[vertex_id]], device const float *gv [[buffer(0)]
     }
     o.pos.z = z * D.rt.z + D.rt.w * w;  // depth z/w * scale + offset, clamped by the depth clip mode
     o.pos.w = w;
-    o.clip[0] = -z;
-    o.clip[1] = z + w;
-    o.clip[2] = w - 0.00001;
-    o.clip[3] = D.flags.x != 0u ? x * D.clip.x + y * D.clip.y + z * D.clip.z + w * D.clip.w : 1.0;
+    // inside up to raster.cpp's EPS_Z, as in the software renderer: values below the PICA's f24 range are 0
+    // there (Picross 3D: Round 2 draws its 2D menus at z = 1e-37, which a strict near plane would clip)
+    const float eps = 0.00000001;
+    o.clip[0] = eps - z;
+    o.clip[1] = z + w + eps;
+    o.clip[2] = w - 0.00001 + eps;
+    o.clip[3] = D.flags.x != 0u ? x * D.clip.x + y * D.clip.y + z * D.clip.z + w * D.clip.w + eps : 1.0;
     float4 q = float4(v[4], v[5], v[6], v[7]);
     const uint first = vid - vid % 3u;
     if (vid != first) {

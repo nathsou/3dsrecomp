@@ -27,6 +27,15 @@ static u64 boot_ns;
 static std::shared_ptr<Process> self_process = std::make_shared<Process>();
 static std::shared_ptr<ResLimit> self_reslimit = std::make_shared<ResLimit>();
 u32 heap_size, linear_used;
+
+// The application memory a process uses (its resource limit's commit): the program's pages and main stack, then
+// what it allocated. Games size their heap from what is left of the 64 MiB (Picross 3D: Round 2 takes all of it,
+// and needs every page the program does not use).
+static u32 pages(u32 size) { return (size + 0xFFF) & ~0xFFFu; }
+static u32 memory_used() {
+    return pages(g_game.text_size) + pages(g_game.ro_size) + pages(g_game.data_size + g_game.bss_size) +
+           pages(g_game.stack_size) + heap_size + linear_used;
+}
 static thread_local Thread *tls_thread;
 static void flush_deferred();
 
@@ -901,7 +910,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     case 0x2B: {  // GetProcessInfo(handle=r1, type=r2)
         u32 type = c->r[2];
         u64 v = 0;
-        if (type == 0 || type == 2) v = heap_size + linear_used + 0x00400000;
+        if (type == 0 || type == 2) v = memory_used();
         else if (type == 20) v = mem::FCRAM_PADDR - mem::LINEAR_BASE;  // linear address offset
         c->r[1] = (u32)v;
         c->r[2] = (u32)(v >> 32);
@@ -957,7 +966,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             bool limit = imm == 0x39;
             switch (name) {
             case 0: v = limit ? 0x18 : 0x18; break;                                   // priority
-            case 1: v = limit ? 0x04000000 : heap_size + linear_used + 0x00400000; break;  // commit
+            case 1: v = limit ? 0x04000000 : memory_used(); break;  // commit
             case 2: v = limit ? 32 : threads.size(); break;
             case 3: v = limit ? 32 : 8; break;
             case 4: v = limit ? 32 : 8; break;

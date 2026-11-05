@@ -189,9 +189,10 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
 }
 }  // namespace
 
-void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty) {
+void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty, s16 sx, s16 sy) {
     live_input(buttons, cx, cy, touch, tx, ty);
     Lock lk(kmutex);
+    ir_poll(buttons, sx, sy);
     if (!hid.shm) return;
     u32 b = hid.shm->backing;
     u64 now = system_tick();

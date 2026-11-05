@@ -22,6 +22,8 @@ struct Dsp {
     std::array<Source, kNumSources> backup_sources;
     Mixer backup_mixer;
     u64 frames = 0;
+    bool have_counter = false;  // a frame was processed since the DSP started: last_counter is its frame counter
+    u16 last_counter = 0;
 };
 
 Dsp &dsp() {
@@ -84,6 +86,7 @@ void initialize(Dsp &d) {
     d.mixer.reset();
     for (auto &s : d.sources) s.reset();
     reset_pipes(d);
+    d.have_counter = false;
 }
 
 void sleep(Dsp &d) {
@@ -100,18 +103,25 @@ void wakeup(Dsp &d) {
     for (auto &s : d.backup_sources) s.reset();
     d.backup_mixer.reset();
     reset_pipes(d);
+    d.have_counter = false;
 }
 
 StereoFrame generate_frame(Dsp &d) {
     const int ri = read_region_index();
     SharedMemory &rd = region(ri);
     SharedMemory &wr = region(ri ^ 1);
+    // No new frame since the last one: the application, late, has not handled the last interrupt, nor read
+    // the status written then (this frame's replaces it)
+    const u16 counter = frame_counter(ri);
+    const bool status_unread = d.have_counter && counter == d.last_counter;
+    d.have_counter = true;
+    d.last_counter = counter;
 
     std::array<QuadFrame, 3> mixes{};
     for (int i = 0; i < kNumSources; i++) {
         s16 coeffs[16];
         memcpy(coeffs, rd.adpcm_coeffs[i], sizeof(coeffs));
-        SourceStatus s = d.sources[i].tick(rd.source_config[i], coeffs);
+        SourceStatus s = d.sources[i].tick(rd.source_config[i], coeffs, status_unread);
         memcpy(&wr.source_status[i], &s, sizeof(s));
         for (int m = 0; m < 3; m++) d.sources[i].mix_into(mixes[m], m);
     }
@@ -133,17 +143,24 @@ StereoFrame generate_frame(Dsp &d) {
 namespace audio {
 using namespace hle;
 
-void pipe_write(u32 pipe, const u8 *data, u32 size) {
+bool pipe_write(u32 pipe, const u8 *data, u32 size) {
     Dsp &d = dsp();
     std::lock_guard lk(d.lock);
-    if (pipe != 2) {
-        // pipe 3 is the AAC decoder (binary pipe): unsupported
+    if (pipe == kBinaryPipe) {
+        std::vector<u8> answer;
+        if (!aac_request(data, size, answer)) {
+            return false;
+        }
+        d.pipes[kBinaryPipe].insert(d.pipes[kBinaryPipe].end(), answer.begin(), answer.end());
+        return true;
+    }
+    if (pipe != kAudioPipe) {
         LOG("dsp: write of %u bytes to unsupported pipe %u ignored\n", size, pipe);
-        return;
+        return false;
     }
     if (size != 4) {
         LOG("dsp: unexpected audio pipe write of %u bytes\n", size);
-        return;
+        return false;
     }
     switch (data[0]) {
     case 0:  // initialize
@@ -173,6 +190,7 @@ void pipe_write(u32 pipe, const u8 *data, u32 size) {
         d.power = Power::Off;
         break;
     }
+    return true;
 }
 
 std::vector<u8> pipe_read(u32 pipe, u32 size) {

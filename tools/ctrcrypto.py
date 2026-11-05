@@ -8,9 +8,14 @@ No keys are in this repository. They come from files you dump from your own cons
   --keys aes_keys.txt   the Citra/Azahar key file: common0..common5 (KeyY 0x3D of the ticket's common key),
                         slot0x25KeyX / slot0x18KeyX / slot0x1BKeyX (NCCH made for firmware 7.x and the New 3DS,
                         set by NATIVE_FIRM, not in boot9), and slot0x2CKeyX / slot0x3DKeyX in place of boot9.
+  --seeddb seeddb.bin   per-title seeds, for titles that use seed crypto (from firmware 9.6 on): GodMode9's
+                        "Build support files" writes it (gm9/out/seeddb.bin) from the seeds of the titles installed
+                        on the console; Azahar's sysdata/seeddb.bin has the same format
+  --seed <32 hex digits> one title's seed instead
 AES comes from macOS's CommonCrypto.
 """
 import ctypes
+import hashlib
 import struct
 import sys
 
@@ -51,9 +56,24 @@ def normal_key(key_x, key_y):
     return rol((rol(x, 2) ^ y) + SCRAMBLER & M128, 87).to_bytes(16, 'big')
 
 
+SEEDDB_HEADER, SEEDDB_ENTRY = 0x10, 0x20  # u32 count + padding; u64 title id, 16-byte seed, padding
+
+
 class Keys:
-    def __init__(self, boot9=None, keyfile=None):
-        self.x, self.common = {}, {}
+    def __init__(self, boot9=None, keyfile=None, seeddb=None, seed=None):
+        self.x, self.common, self.seeds = {}, {}, {}
+        self.seed = bytes.fromhex(seed) if seed else None
+        if self.seed is not None and len(self.seed) != 16:
+            sys.exit('--seed: expected 16 bytes (32 hex digits)')
+        if seeddb:
+            with open(seeddb, 'rb') as f:
+                db = f.read()
+            count = struct.unpack_from('<I', db, 0)[0]
+            if len(db) < SEEDDB_HEADER + count * SEEDDB_ENTRY:
+                sys.exit('%s: not a seeddb.bin (%d entries announced, file too short)' % (seeddb, count))
+            for i in range(count):
+                o = SEEDDB_HEADER + i * SEEDDB_ENTRY
+                self.seeds[struct.unpack_from('<Q', db, o)[0]] = db[o + 8:o + 24]
         if boot9:
             with open(boot9, 'rb') as f:
                 b9 = f.read()
@@ -78,6 +98,16 @@ class Keys:
             src = '--boot9 boot9.bin' if slot in (0x2C, 0x3D) else '--keys aes_keys.txt (slot0x%02XKeyX)' % slot
             sys.exit('%s needs KeyX 0x%02X: pass %s' % (what, slot, src))
         return self.x[slot]
+
+    def title_seed(self, program_id, check):
+        """The seed of a title, checked against the NCCH header's hash of it (SHA-256 of seed + program id)."""
+        seed = self.seed if self.seed is not None else self.seeds.get(program_id)
+        if seed is None:
+            sys.exit('NCCH %016X uses seed crypto: pass --seeddb seeddb.bin (or --seed) with its seed'
+                     % program_id)
+        if hashlib.sha256(seed + struct.pack('<Q', program_id)).digest()[:4] != check:
+            sys.exit('the seed given for %016X does not match the one its NCCH was made with' % program_id)
+        return seed
 
 
 class Reader:
@@ -162,8 +192,6 @@ class NcchContent(Reader):
         self.src = src
         nh = bytearray(src.pread(0, 0x200))
         flags = nh[0x188:0x190]
-        if flags[7] & 0x20:
-            sys.exit('NCCH uses seed crypto (titles from 9.6 on): not supported')
         if flags[7] & 1:
             key0 = key1 = bytes(16)  # fixed key: zero for applications
         else:
@@ -172,6 +200,9 @@ class NcchContent(Reader):
             slot = {0x00: 0x2C, 0x01: 0x25, 0x0A: 0x18, 0x0B: 0x1B}.get(flags[3])
             if slot is None:
                 sys.exit('NCCH crypto method 0x%02X is unknown' % flags[3])
+            if flags[7] & 0x20:  # seed crypto: the secondary key's KeyY also hashes in the title's seed
+                seed = keys.title_seed(struct.unpack_from('<Q', nh, 0x118)[0], bytes(nh[0x114:0x118]))
+                key_y = hashlib.sha256(key_y + seed).digest()[:16]
             key1 = normal_key(keys.key_x(slot, 'NCCH crypto method 0x%02X' % flags[3]), key_y)
         version = struct.unpack_from('<H', nh, 0x112)[0]
         exefs_off, exefs_size = struct.unpack_from('<II', nh, 0x1A0)

@@ -57,16 +57,18 @@ def reads_flags_first(insts_seq):
     return False
 
 
-def liveness(insts, th, start, funcs, live_at_exit, entry_reads=frozenset()):
-    """Returns {addr: live-out flag set} for every instruction of a function. entry_reads: functions that read
-    flags before setting them (mid-function code taken for an entry): flags are live at a jump into one."""
+def liveness(insts, th, start, funcs, live_at_exit, entry_reads=None):
+    """Returns {addr: live-out flag set} for every instruction of a function. entry_reads: {entry: flags} of the
+    functions that read flags before setting them (mid-function code taken for an entry): those flags are live at
+    a jump or fall-through into one."""
+    entry_reads = entry_reads or {}
     succ = {}
     for a, i in insts.items():
         s = []
-        exit_ = False
+        exit_ = False  # False, True (leaves the function) or the flags the code it goes to reads
         if i.kind == B:
             if (i.target | th) in funcs and i.target != start:
-                exit_ = 'all' if (i.target | th) in entry_reads else True
+                exit_ = entry_reads.get(i.target | th, True)
             else:
                 s.append(i.target)
         elif i.kind == JMP:
@@ -80,7 +82,7 @@ def liveness(insts, th, start, funcs, live_at_exit, entry_reads=frozenset()):
             if n in insts:
                 s.append(n)
             elif (n | th) in entry_reads:
-                exit_ = 'all'
+                exit_ = entry_reads[n | th] | (exit_ if isinstance(exit_, frozenset) else frozenset())
             elif not exit_:
                 exit_ = True
         succ[a] = (s, exit_)
@@ -94,7 +96,7 @@ def liveness(insts, th, start, funcs, live_at_exit, entry_reads=frozenset()):
         for a in order:
             i = insts[a]
             s, exit_ = succ[a]
-            out = set(ALL) if exit_ == 'all' else set(exit_live) if exit_ else set()
+            out = set(exit_) | set(exit_live) if isinstance(exit_, frozenset) else set(exit_live) if exit_ else set()
             for b in s:
                 out |= live_in[b]
             r, w = rw(i)
@@ -111,6 +113,14 @@ def liveness(insts, th, start, funcs, live_at_exit, entry_reads=frozenset()):
                 live_in[a] = inn
                 changed = True
     return live_out
+
+
+def live_in(i, live_out):
+    """The flags live into an instruction, given its live-out set."""
+    r, w = rw(i)
+    if i.kind in (CALL, ICALL):
+        return set(COND_READS[i.cond]) | (set(live_out) if i.cond != 14 else set())
+    return (set(live_out) - (w if i.cond == 14 else set())) | r
 
 
 def strip_dead(i, live_out):
