@@ -177,7 +177,8 @@ class Analyzer:
         v = i.addr + 8 + sign * imm(i.word)
         rx = (i.word >> 12) & 15
         n = self.img.read32(i.addr + 4)
-        if n is not None and n >> 28 == 14 and (n & 0x0FDFF000) == (0x02400000 | rx << 16 | rx << 12):
+        if n is not None and n >> 28 == 14 and (n & 0x0FFFF000) in (0x02800000 | rx << 16 | rx << 12,
+                                                                 0x02400000 | rx << 16 | rx << 12):
             v += (1 if (n >> 21) & 15 == 4 else -1) * imm(n)
         return v & 0xFFFFFFFF
 
@@ -550,7 +551,7 @@ class Analyzer:
                         v = img.read32(i.reads_pc_lit)
                         if v is not None and img.in_text(v & ~1):
                             lit_candidates.add(v)
-                    if i.kind == OP and not i.thumb and (i.word & 0x0FDF0000) == 0x024F0000:  # ADR (add/sub rX, pc, #imm)
+                    if i.kind == OP and not i.thumb and (i.word & 0x0FFF0000) in (0x028F0000, 0x024F0000):  # ADR (add/sub rX, pc, #imm)
                         v = self.adr_target(i)
                         if img.in_text(v & ~1):
                             lit_candidates.add(v)
