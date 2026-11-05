@@ -61,8 +61,9 @@ class Source {
 public:
     void reset() { st = {}; frame = {}; }
     // Parses the configuration (clearing its dirty flags), generates this frame and returns the
-    // status to report.
-    SourceStatus tick(SourceConfig &cfg, const s16 coeffs[16]);
+    // status to report. status_unread: the application has not taken the previous frame's status yet
+    // (it submitted no frame since), so a buffer change reported there is reported again.
+    SourceStatus tick(SourceConfig &cfg, const s16 coeffs[16], bool status_unread);
     void mix_into(QuadFrame &dst, int mix);
     const StereoFrame &output() const { return frame; }
 
@@ -96,6 +97,7 @@ private:
         std::vector<Sample> decoded;  // ADPCM samples decoded so far (decoded on demand)
         u32 adpcm_decoded = 0;        // a multiple of 14 or cur_length; PCM is read live
         bool buffer_update = false;
+        bool reported_update = false;  // the last status reported had current_buffer_id_dirty
         u16 last_buffer_id = 0, current_buffer_id = 0;
         std::array<s16, 16> adpcm_coeffs{};
         AdpcmState adpcm{};
