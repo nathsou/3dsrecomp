@@ -8,7 +8,7 @@ namespace kernel {
 namespace {
 struct DspState {
     std::shared_ptr<Event> semaphore = make_event(ONESHOT, "DSP semaphore");
-    std::shared_ptr<Event> pipe_irq[3];   // per pipe channel (interrupt type 2)
+    std::shared_ptr<Event> pipe_irq[4];   // per pipe channel (interrupt type 2): debug, DMA, audio, binary
     std::shared_ptr<Event> other_irq[2];  // interrupt types 0/1
 };
 DspState dsp;
@@ -50,10 +50,10 @@ struct Dsp : Service {
             break;
         case 0x000D: {  // WriteProcessPipe(channel, size, static buffer)
             u32 ch = ipc[1], size = ipc[2], src = ipc[4];
-            audio::pipe_write(ch, gptr(src), size);
+            const bool answered = audio::pipe_write(ch, gptr(src), size);
             ipc.ok();
-            // a state change answers on the audio pipe
-            if (ch == 2 && dsp.pipe_irq[2]) dsp.pipe_irq[2]->signal();
+            // a state change answers on the audio pipe, an AAC decoder request on the binary pipe
+            if (answered && ch < 4 && dsp.pipe_irq[ch]) dsp.pipe_irq[ch]->signal();
             break;
         }
         case 0x000E:    // ReadPipe(channel, peer, size)
@@ -89,7 +89,7 @@ struct Dsp : Service {
             u32 irq = ipc[1], ch = ipc[2];
             auto ev = get<Event>(ipc[4]);
             VLOG("[dsp] RegisterInterruptEvents irq=%u ch=%u ev=%p\n", irq, ch, (void *)ev.get());
-            if (irq == 2 && ch < 3) dsp.pipe_irq[ch] = ev;
+            if (irq == 2 && ch < 4) dsp.pipe_irq[ch] = ev;
             else if (irq < 2) dsp.other_irq[irq] = ev;
             ipc.ok();
             break;

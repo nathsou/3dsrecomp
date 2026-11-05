@@ -7,7 +7,7 @@
 
 namespace audio {
 void init();                                        // host audio output
-void pipe_write(u32 pipe, const u8 *data, u32 size);  // WriteProcessPipe
+bool pipe_write(u32 pipe, const u8 *data, u32 size);  // WriteProcessPipe: true if it answers on the pipe
 std::vector<u8> pipe_read(u32 pipe, u32 size);       // ReadPipe / ReadPipeIfPossible (consumes)
 u32 pipe_readable(u32 pipe);                         // GetPipeReadableSize
 u16 recv_data(u32 reg);                              // RecvData: 0 when on, 1 when off/asleep

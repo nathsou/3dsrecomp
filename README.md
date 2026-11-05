@@ -69,6 +69,14 @@ for everything else, the pause menu, at full speed with music and sound (built w
 `data/pikmin`). Its CIA uses seed crypto: extract it with its seed (`--seed` or `--seeddb`, see step 1 below).
 amiibo is not supported.
 
+**Picross 3D: Round 2** (EUR, `CTR-P-BBPP`, title 0004000000187E00, an eShop CIA) runs (built with `-DGAME=picross`
+from `data/picross`; it uses seed crypto, so it is extracted with its seed: `--seed` or `--seeddb`): title screen,
+membership cards (a new one, named on the system keyboard, or a real console's save), the café menu, settings, the
+library, a book's puzzle pages and the puzzles themselves (rotating the block with the mouse, removing and painting
+cubes with the mouse while holding the buttons the game's Controls settings name), with music and sound. Its
+music is AAC (`sound/stream/*.aac`), decoded by the DSP's AAC decoder, which the runtime implements with the
+system's AudioToolbox (`runtime/audio/aac.cpp`). The menus are played with the touch screen only, as on a 3DS.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 

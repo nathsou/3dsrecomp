@@ -11,12 +11,12 @@ static bool on;
 
 __attribute__((weak)) void init() {}
 
-__attribute__((weak)) void pipe_write(u32 pipe, const u8 *data, u32 size) {
-    if (pipe != 2 || size < 1) return;
+__attribute__((weak)) bool pipe_write(u32 pipe, const u8 *data, u32 size) {
+    if (pipe != 2 || size < 1) return false;
     std::lock_guard<std::mutex> lk(m);
     u8 state = data[0];
     on = state == 0 || state == 2;
-    if (state == 1) return;
+    if (state == 1) return true;
     static const u16 addrs[15] = {0xBFFF, 0x9E92, 0x8680, 0xA792, 0x9430, 0x8400, 0x8540, 0x9492,
                                   0x8710, 0x8410, 0xA912, 0xAA12, 0xAAD2, 0xAC52, 0xAC5C};
     auto put = [&](u16 v) {
@@ -25,6 +25,7 @@ __attribute__((weak)) void pipe_write(u32 pipe, const u8 *data, u32 size) {
     };
     put(15);
     for (u16 a : addrs) put(a);
+    return true;
 }
 
 __attribute__((weak)) std::vector<u8> pipe_read(u32 pipe, u32 size) {

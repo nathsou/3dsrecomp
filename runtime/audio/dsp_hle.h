@@ -23,6 +23,10 @@ void decode_pcm16(unsigned channels, const u8 *data, size_t count, Sample *out);
 // not entirely inside one mapped region (FCRAM, VRAM, DSP RAM).
 const u8 *phys_range(u32 paddr, u64 bytes);
 
+// ---- AAC decoder (aac.cpp)
+// A request written to the binary pipe; false if it gets no answer, else the answer to queue on the pipe.
+bool aac_request(const u8 *data, u32 size, std::vector<u8> &answer);
+
 // ---- resampling (interp.cpp)
 // Fixed point position with 24 fractional bits. Output sample k is interpolated between the
 // virtual input samples floor(pos) and floor(pos)+1 of [x[-2], x[-1], in...], i.e. there is a
