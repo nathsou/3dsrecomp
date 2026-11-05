@@ -47,6 +47,13 @@ and sound (built with `-DGAME=mm3d` from `data/mm3d`). It supports the Circle Pa
 (see [Controls](#controls)): at start, ZR (2, or the right trigger) takes it, and the right stick then turns the
 camera; "Don't Use" plays without it. Beyond the first steps in the Lost Woods it was not tested by scripts.
 
+**The Legend of Zelda: Ocarina of Time 3D** (EUR, `CTR-P-AQEP`, title 0004000000033600, a CIA) runs: the title
+screen and its attract scenes, file select, naming a file on the game's own keyboard, the opening (the Deku Tree,
+the nightmare, Navi's flight through Kokiri Forest) and Link's house with the touch-screen item and map panel, at
+full speed with music and sound (built with `-DGAME=oot3d` from `data/oot3d`). A real console's save loads
+(an adult Link inside Ganon's Castle, Master Quest offered on the title screen). It needed no change to the
+recompiler or the runtime.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
