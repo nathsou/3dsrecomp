@@ -40,6 +40,7 @@
 #include "gpu/fsgen.h"
 #include "gpu/pica.h"
 #include "gpu/vk_shaders.h"
+#include "gpu/vsblob.h"
 #include "loader.h"
 
 extern std::string g_save_base;
@@ -486,6 +487,12 @@ void dispatch(VkCommandBuffer cb, Kern k, std::initializer_list<KBind> binds, co
     vkCmdPushConstants(cb, k_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (w + 15) / 16, (h + 15) / 16, 1);
 }
+
+// vertex program kernels: storage buffers 0-4 (vertex arrays, ids, parameter blocks, output, each thread's draw), the
+// number of threads as a push constant
+VkDescriptorSetLayout v_dsl;
+VkPipelineLayout v_layout;
+BufP gbuf_dev;  // vertices the kernels shaded (device-local; reused flush after flush, the barriers order the uses)
 
 // graphics pipelines (fragment shaders from fsgen.h): bindings as gen_fs() documents, 15-17 the vertex shader's
 VkDescriptorSetLayout g_dsl;
@@ -1025,6 +1032,98 @@ void verify_key(const std::string &key, const DrawState &ds) {
     else if (gen_fs(d, fo) != gen_fs(ds, fo)) LOG("gpu vulkan: KEY MISMATCH: decoded state generates another shader\n");
 }
 
+// ---------------------------------------------------------------- vertex program kernels
+// As metal.mm's: programs (and their specializations for the uniforms their flow control reads) recorded in
+// <saves>/shadercache/<title id>.vs.bin, the shipped and recorded ones compiled at startup, new ones in the background
+// while the CPU shades their draws.
+struct VsKern {
+    VkPipeline ps = VK_NULL_HANDLE;
+    bool done = false;
+};
+std::recursive_mutex &vk_mtx = *new std::recursive_mutex;
+std::unordered_map<u64, std::unique_ptr<VsKern>> &vk_cache = *new std::unordered_map<u64, std::unique_ptr<VsKern>>;
+FILE *vk_log;
+struct {
+    u32 built = 0, fail = 0, cpu_draws = 0;
+    double ms = 0;
+} vkstats;
+
+VkPipeline build_vs_pipeline(const VsBlob &v);
+void build_vs_kernel(VsKern *k, const std::string &blob) {
+    const double t0 = now_ms();
+    VsBlob v;
+    VkPipeline ps = parse_vs_blob(blob, v) ? build_vs_pipeline(v) : VK_NULL_HANDLE;
+    std::lock_guard<std::recursive_mutex> lk(vk_mtx);
+    k->ps = ps;
+    k->done = true;
+    if (!ps) vkstats.fail++;
+    else vkstats.built++;
+    vkstats.ms += now_ms() - t0;
+}
+
+// (the pipeline workers build these too)
+std::mutex &vs_queue_mtx = *new std::mutex;
+std::condition_variable &vs_queue_cv = *new std::condition_variable;
+std::deque<std::pair<VsKern *, std::string>> &vs_queue = *new std::deque<std::pair<VsKern *, std::string>>;
+void vs_worker() {
+    std::unique_lock<std::mutex> lk(vs_queue_mtx);
+    for (;;) {
+        vs_queue_cv.wait(lk, [] { return !vs_queue.empty(); });
+        auto job = std::move(vs_queue.front());
+        vs_queue.pop_front();
+        lk.unlock();
+        build_vs_kernel(job.first, job.second);
+        lk.lock();
+    }
+}
+void vs_compile_async(VsKern *k, std::string blob) {
+    if (sync_shaders) {
+        build_vs_kernel(k, blob);
+        return;
+    }
+    std::lock_guard<std::mutex> lk(vs_queue_mtx);
+    static bool started = false;
+    if (!started) {
+        started = true;
+        for (int i = 0; i < 2; i++) std::thread(vs_worker).detach();
+    }
+    vs_queue.emplace_back(k, std::move(blob));
+    vs_queue_cv.notify_one();
+}
+VsKern *vs_add(const std::string &blob) {  // (vk_mtx held)
+    VsBlob v;
+    if (!parse_vs_blob(blob, v)) return nullptr;
+    const u64 key = vk_key(vk_hash(v.code.data(), v.code_size, v.swz.data(), v.swz_size), v.entry);
+    auto &k = vk_cache[v.spec ? spec_key(key, v.sp) : key];
+    if (k) return nullptr;
+    k = std::make_unique<VsKern>();
+    vs_compile_async(k.get(), blob);
+    return k.get();
+}
+void vs_kernels_init(const std::string &tid) {
+    std::vector<std::string> blobs;
+    for (const auto &p : {g_game.dir + "/vsprograms.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/vsprograms.bin"}) {
+        if (!std::filesystem::exists(p)) continue;
+        blobs = read_blobs(p, kVsMagic, kVsVersion);
+        break;
+    }
+    const size_t shipped = blobs.size();
+    const std::string user = g_save_base + "/shadercache/" + tid + ".vs.bin";
+    std::vector<std::string> mine = read_blobs(user, kVsMagic, kVsVersion);
+    blobs.insert(blobs.end(), mine.begin(), mine.end());
+    if (mine.empty()) {
+        vk_log = fopen(user.c_str(), "wb");
+        const u32 hdr[2] = {kVsMagic, kVsVersion};
+        if (vk_log) fwrite(hdr, 4, 2, vk_log);
+    } else {
+        vk_log = fopen(user.c_str(), "ab");
+    }
+    std::lock_guard<std::recursive_mutex> lk(vk_mtx);
+    for (const auto &b : blobs) vs_add(b);
+    LOG("gpu vulkan: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(),
+        shipped, mine.size(), user.c_str());
+}
+
 void pipelines_init() {
     sync_shaders = getenv("GPU_SYNC_SHADERS") != nullptr;
     verify_keys = getenv("GPU_VERIFY_KEYS") != nullptr;
@@ -1034,6 +1133,7 @@ void pipelines_init() {
     const std::string dir = g_save_base + "/shadercache";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
+    vs_kernels_init(tid);
     // the driver's compiled pipelines from earlier runs
     {
         pcache_path = dir + "/" + tid + ".vkpc";
@@ -1630,6 +1730,22 @@ bool init_device() {
         VK_CHECK(vkCreatePipelineLayout(dev, &li, nullptr, &k_layout));
     }
     {
+        VkDescriptorSetLayoutBinding b[5];
+        for (u32 i = 0; i < 5; i++) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        ci.bindingCount = 5;
+        ci.pBindings = b;
+        VK_CHECK(vkCreateDescriptorSetLayout(dev, &ci, nullptr, &v_dsl));
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, 16};
+        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        li.setLayoutCount = 1;
+        li.pSetLayouts = &v_dsl;
+        li.pushConstantRangeCount = 1;
+        li.pPushConstantRanges = &pr;
+        VK_CHECK(vkCreatePipelineLayout(dev, &li, nullptr, &v_layout));
+    }
+    {
         VkDescriptorSetLayoutBinding b[18];
         for (u32 i = 0; i < 18; i++) {
             VkDescriptorType t = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -1779,7 +1895,69 @@ const char *vk_texture_filter_name(int mode) { return mode == 0 ? "Off" : "?"; }
 bool vk_gpu_made(u32, u32) { return false; }
 void vk_note_gpu_output(u32, u32) {}
 
-const void *vk_vs_kernel(const ShaderProgram *, u32, const ShaderSetup &) { return nullptr; }
+namespace {
+// the kernel of a vertex program blob: specialized for its uniforms when the program allows, else generic
+VkPipeline build_vs_pipeline(const VsBlob &v) {
+    ShaderProgram *p = shader_decode(v.code.data(), v.code_size, v.swz.data());
+    std::string src = v.spec ? shader_glsl_spec(p, v.entry, v.sp.b, v.sp.iu) : std::string();
+    if (src.empty()) src = shader_glsl(p, v.entry);
+    shader_free(p);
+    if (src.empty()) return VK_NULL_HANDLE;  // (not translatable: the CPU shades it)
+    if (dump_shaders) LOG("gpu vulkan: vertex kernel:\n%s\n", src.c_str());
+    VkShaderModule m = make_module(compile_glsl(std::string(kVkVsCommonGLSL) + src, shaderc_compute_shader, "vertex kernel"));
+    if (!m) return VK_NULL_HANDLE;
+    VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    ci.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    ci.stage.module = m;
+    ci.stage.pName = "main";
+    ci.layout = v_layout;
+    VkPipeline ps = VK_NULL_HANDLE;
+    if (vkCreateComputePipelines(dev, pcache, 1, &ci, nullptr, &ps) != VK_SUCCESS) ps = VK_NULL_HANDLE;
+    vkDestroyShaderModule(dev, m, nullptr);
+    return ps;
+}
+}  // namespace
+
+const void *vk_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s) {
+    if (!active) return nullptr;
+    std::lock_guard<std::recursive_mutex> lk(vk_mtx);
+    // the uniforms the program's flow control reads (masks cached per program)
+    static std::unordered_map<u64, std::pair<u32, u32>> masks;
+    const u64 ph = shader_program_hash(p);
+    auto mi = masks.find(ph);
+    if (mi == masks.end()) {
+        u32 lm;
+        const u32 bm = shader_static_uniforms(p, &lm);
+        mi = masks.emplace(ph, std::make_pair(bm, lm)).first;
+    }
+    VsSpec sp;
+    for (u32 i = 0; i < 16; i++)
+        if (((mi->second.first >> i) & 1) && s.b[i]) sp.b |= 1u << i;
+    for (u32 i = 0; i < 4; i++)
+        if ((mi->second.second >> i) & 1) memcpy(sp.iu[i], s.i[i], 3);
+    const u64 key = vk_key(ph, entry);
+    auto it = vk_cache.find(spec_key(key, sp));
+    if (it == vk_cache.end()) {
+        const std::string blob = vs_blob(s, entry, &sp);
+        VsKern *k = vs_add(blob);
+        if (k && vk_log) {
+            const u32 n = (u32)blob.size();
+            fwrite(&n, 4, 1, vk_log);
+            fwrite(blob.data(), 1, n, vk_log);
+            fflush(vk_log);
+        }
+        LOG("gpu vulkan: new vertex program %016llx entry %u%s\n", (unsigned long long)ph, entry,
+            sync_shaders ? "" : ", compiling in the background");
+        if (k && k->done && k->ps) return k;
+    } else if (it->second->done && it->second->ps) {
+        return it->second.get();
+    }
+    auto g = vk_cache.find(key);
+    if (g != vk_cache.end() && g->second->done && g->second->ps) return g->second.get();
+    vkstats.cpu_draws++;
+    return nullptr;
+}
 
 void vk_flush(const RTConfig &rt, const MBatch &mb) {
     if (!active || mb.empty() || !rt.color_addr || !pptr(rt.color_addr)) return;
@@ -1841,6 +2019,59 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
     const Slice cbuf = upload(mb.cverts.data(), mb.cverts.size() * sizeof(OutVertex));
     const Slice ibuf = upload(mb.idx.data(), mb.idx.size() * 4);
     const size_t cbytes = std::max<size_t>(16, mb.cverts.size() * sizeof(OutVertex)), ibytes = std::max<size_t>(16, mb.idx.size() * 4);
+    const size_t gbytes = (size_t)mb.gpu_verts * sizeof(OutVertex);
+    if (!mb.jobs.empty() && gbytes) {
+        // one dispatch per kernel: its draws' vertices one after the other, with their parameter blocks in a buffer
+        // and each thread's draw in tj (draws are often only a few vertices). The draws write disjoint ranges of gbuf.
+        ensure_buffer(gbuf_dev, gbytes, Mem::Device);
+        const Slice dbuf = upload(mb.vdata.data(), mb.vdata.size());
+        struct Group {
+            VkPipeline ps;
+            std::vector<VsParamsG> params;
+            std::vector<u32> vids, tj;
+        };
+        std::vector<Group> groups;
+        for (const GpuVsJob &j : mb.jobs) {
+            VkPipeline ps = ((const VsKern *)j.kernel)->ps;
+            Group *g = nullptr;
+            for (Group &x : groups)
+                if (x.ps == ps) g = &x;
+            if (!g) {
+                groups.push_back({ps, {}, {}, {}});
+                g = &groups.back();
+            }
+            VsParamsG &P = g->params.emplace_back(j.p);
+            P.first = (u32)g->vids.size();
+            g->vids.insert(g->vids.end(), mb.vids.begin() + j.vids_off, mb.vids.begin() + j.vids_off + j.p.nverts);
+            g->tj.insert(g->tj.end(), j.p.nverts, (u32)g->params.size() - 1);
+        }
+        VkCommandBuffer vcb = rec();
+        barrier(vcb);
+        for (const Group &g : groups) {
+            if (g.vids.empty()) continue;
+            const Slice vb = upload(g.vids.data(), g.vids.size() * 4);
+            const Slice pb = upload(g.params.data(), g.params.size() * sizeof(VsParamsG));
+            const Slice tb = upload(g.tj.data(), g.tj.size() * 4);
+            vkCmdBindPipeline(vcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.ps);
+            VkDescriptorBufferInfo bi[5] = {{dbuf.buf->b, dbuf.off, std::max<size_t>(16, mb.vdata.size())},
+                                            {vb.buf->b, vb.off, g.vids.size() * 4},
+                                            {pb.buf->b, pb.off, g.params.size() * sizeof(VsParamsG)},
+                                            {gbuf_dev->b, 0, gbytes},
+                                            {tb.buf->b, tb.off, g.tj.size() * 4}};
+            VkWriteDescriptorSet w[5];
+            for (u32 i = 0; i < 5; i++) {
+                w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+                w[i].dstBinding = i;
+                w[i].descriptorCount = 1;
+                w[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                w[i].pBufferInfo = &bi[i];
+            }
+            vkPushDescriptors(vcb, VK_PIPELINE_BIND_POINT_COMPUTE, v_layout, 0, 5, w);
+            const u32 nt[4] = {(u32)g.vids.size(), 0, 0, 0};
+            vkCmdPushConstants(vcb, v_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, nt);
+            vkCmdDispatch(vcb, ((u32)g.vids.size() + 63) / 64, 1, 1);
+        }
+    }
 
     std::unordered_map<u64, const Img *> surf_tex;
     for (const MSeg &seg : mb.segs)
@@ -2211,7 +2442,8 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         for (int k = 0; k < 3; k++) put_img(6 + k, VK_DESCRIPTOR_TYPE_SAMPLER, VK_NULL_HANDLE, pr.sm[k]);
         for (int f = 0; f < 5; f++) put_img(9 + f, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, pr.fv[f], VK_NULL_HANDLE);
         if (pr.fetch) put_img(14, VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT, msaa ? col.ms->view : col.tex->view, VK_NULL_HANDLE);
-        put_buf(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dummy_buf->b, 0, VK_WHOLE_SIZE);  // (kernel-shaded vertices)
+        if (gbytes) put_buf(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, gbuf_dev->b, 0, gbytes);  // (kernel-shaded vertices)
+        else put_buf(15, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, dummy_buf->b, 0, VK_WHOLE_SIZE);
         put_buf(16, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, cbuf.buf->b, cbuf.off, cbytes);
         put_buf(17, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, ibuf.buf->b, ibuf.off, ibytes);
         vkPushDescriptors(cb, VK_PIPELINE_BIND_POINT_GRAPHICS, g_layout, 0, nw, w);

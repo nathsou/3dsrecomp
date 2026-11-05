@@ -78,6 +78,146 @@ void main() {
 }
 )";
 
+// What vertex program kernels (shader.cpp's shader_glsl / shader_glsl_spec) start with (kVsCommonMSL): one thread per
+// vertex of all the draws a kernel shades in a batch; vertex arrays as bytes (0), vertex ids (1), the draws' parameter
+// blocks (2, VsParamsG in pica.h), the output vertices (3, OutVertex layout), each thread's draw (4); NT threads (a push
+// constant). P is the thread's parameter block; the helpers take the MSL ones' arguments. Multiplications are
+// precise: the CPU interpreter and Metal never fuse them into the additions that follow.
+static const char *const kVkVsCommonGLSL = R"(#version 450
+#extension GL_EXT_shader_8bit_storage : require
+layout(local_size_x = 64) in;
+#define float2 vec2
+#define float3 vec3
+#define float4 vec4
+#define int2 ivec2
+#define int3 ivec3
+#define int4 ivec4
+#define uint2 uvec2
+#define uint3 uvec3
+#define uint4 uvec4
+struct VsAttr { int offset; uint stride, fmt, elems; };
+struct VsParams {
+    vec4 f[96];
+    vec4 defaults[16];
+    VsAttr attr[16];
+    int reg_attr[16];
+    int slot_src[24];
+    uvec4 iu[4];
+    uint b, nverts, out_base, first;
+};
+layout(std430, set = 0, binding = 0) readonly buffer VD { uint8_t vd[]; };
+layout(std430, set = 0, binding = 1) readonly buffer VI { uint vids[]; };
+layout(std430, set = 0, binding = 2) readonly buffer PSB { VsParams PS[]; };
+layout(std430, set = 0, binding = 3) writeonly buffer OV { float outv[]; };
+layout(std430, set = 0, binding = 4) readonly buffer TJ { uint tj[]; };
+layout(push_constant) uniform PC { uint NT; };
+uint pidx;
+#define P PS[pidx]
+struct VsFlow {
+    uint ie[8], iend[8], nif;
+    uint ce[4], cr[4], ncall;
+    uint le[4], lend[4], lc[4], li[4], lp[4], nloop;
+    int aL;
+};
+float vs_rdf(int a) {
+    return uintBitsToFloat(uint(vd[a]) | (uint(vd[a + 1]) << 8) | (uint(vd[a + 2]) << 16) | (uint(vd[a + 3]) << 24));
+}
+vec4 vs_input_(uint r, uint vid) {
+    const int a = P.reg_attr[r];
+    if (a < 0) return vec4(0.0);
+    const VsAttr A = P.attr[a];
+    if (A.elems == 5u) return P.defaults[a];
+    vec4 v = vec4(0.0, 0.0, 0.0, 1.0);
+    if (A.elems == 0u) return v;
+    const int base = A.offset + int(A.stride * vid);
+    for (uint c = 0u; c < A.elems; c++) {
+        switch (A.fmt) {
+        case 0u: v[c] = float((int(uint(vd[base + int(c)])) << 24) >> 24); break;
+        case 1u: v[c] = float(uint(vd[base + int(c)])); break;
+        case 2u: v[c] = float((int(uint(vd[base + int(2u * c)]) | (uint(vd[base + int(2u * c) + 1]) << 8)) << 16) >> 16); break;
+        default: v[c] = vs_rdf(base + int(4u * c)); break;
+        }
+    }
+    return v;
+}
+#define vs_input(D_, P_, r, vid) vs_input_(r, vid)
+// PICA multiplication: 0 * inf = 0
+vec4 vs_mul(vec4 a, vec4 b) {
+    precise const vec4 r = a * b;
+    bvec4 z;
+    for (int i = 0; i < 4; i++) z[i] = isnan(r[i]) && !isnan(a[i]) && !isnan(b[i]);
+    return mix(r, vec4(0.0), z);
+}
+vec4 vs_dp3(vec4 a, vec4 b) { const vec4 p = vs_mul(a, b); precise float d = 0.0; d += p.x; d += p.y; d += p.z; return vec4(d); }
+vec4 vs_dp4(vec4 a, vec4 b) { const vec4 p = vs_mul(a, b); precise float d = 0.0; d += p.x; d += p.y; d += p.z; d += p.w; return vec4(d); }
+vec4 vs_dph(vec4 a, vec4 b) { a.w = 1.0; return vs_dp4(a, b); }
+vec4 vs_dst(vec4 a, vec4 b) { return vec4(1.0, vs_mul(a, b).y, a.z, b.w); }
+vec4 vs_max(vec4 a, vec4 b) { return mix(b, a, greaterThan(a, b)); }
+vec4 vs_min(vec4 a, vec4 b) { return mix(b, a, lessThan(a, b)); }
+int vs_s32(float f) {
+    if (isnan(f)) return 0;
+    if (f >= 2147483647.0) return 0x7fffffff;
+    if (f <= -2147483648.0) return int(0x80000000u);
+    return int(f);
+}
+vec4 vs_rel_(int base, int off) {
+    if (off < -128 || off > 127) off = 0;
+    const uint u = uint(base + off) & 0x7fu;
+    return u >= 96u ? vec4(1.0) : P.f[u];
+}
+#define vs_rel(P_, base, off) vs_rel_(base, off)
+void vs_push_if(inout VsFlow S, uint e, uint end) {
+    if (S.nif == 8u) { for (int i = 0; i < 7; i++) { S.ie[i] = S.ie[i + 1]; S.iend[i] = S.iend[i + 1]; } S.nif = 7u; }
+    S.ie[S.nif] = e; S.iend[S.nif] = end; S.nif++;
+}
+void vs_push_call(inout VsFlow S, uint end, uint ret) {
+    if (S.ncall == 4u) { for (int i = 0; i < 3; i++) { S.ce[i] = S.ce[i + 1]; S.cr[i] = S.cr[i + 1]; } S.ncall = 3u; }
+    S.ce[S.ncall] = end; S.cr[S.ncall] = ret; S.ncall++;
+}
+void vs_push_loop(inout VsFlow S, uint entry, uint end, uint cnt, uint inc, uint prev) {
+    if (S.nloop == 4u) {
+        for (int i = 0; i < 3; i++) { S.le[i] = S.le[i + 1]; S.lend[i] = S.lend[i + 1]; S.lc[i] = S.lc[i + 1]; S.li[i] = S.li[i + 1]; S.lp[i] = S.lp[i + 1]; }
+        S.nloop = 3u;
+    }
+    S.le[S.nloop] = entry; S.lend[S.nloop] = end; S.lc[S.nloop] = cnt & 255u; S.li[S.nloop] = inc & 255u; S.lp[S.nloop] = prev & 255u;
+    S.nloop++;
+}
+uint vs_flow(inout VsFlow S, uint old, uint pc, bool brk) {
+    if ((S.ncall | S.nif | S.nloop) == 0u) return pc;
+    uint next = old + 1u;
+    for (uint i = 0u; i < 4u; i++) {
+        if (S.ncall == 0u || S.ce[S.ncall - 1u] != next) break;
+        if (i < 3u) { pc = S.cr[S.ncall - 1u]; next = pc; }
+        S.ncall--;
+    }
+    if (S.nif != 0u && S.ie[S.nif - 1u] == old + 1u) { pc = S.iend[S.nif - 1u]; S.nif--; }
+    if (S.nloop != 0u && (S.lend[S.nloop - 1u] == old + 1u || brk)) {
+        const uint k = S.nloop - 1u;
+        S.aL += int(S.li[k]);
+        const uint c = S.lc[k];
+        S.lc[k] = (c - 1u) & 255u;
+        if (!brk && c != 0u) {
+            pc = S.le[k];
+        } else {
+            pc = S.lend[k];
+            if (S.nloop > 1u) S.aL = int(S.lp[k]);
+            S.nloop--;
+        }
+    }
+    return pc;
+}
+void vs_output_(vec4 o[16], uint tid) {
+    const uint d = (P.out_base + tid) * 24u;
+    for (int i = 0; i < 24; i++) {
+        const int s = P.slot_src[i];
+        float v = s >= 0 ? o[s >> 2][s & 3] : 1.0;
+        if (i >= 8 && i < 12) v = min(abs(v), 1.0);
+        outv[d + uint(i)] = v;
+    }
+}
+#define vs_output(P_, O_, OV_, LI_) vs_output_(O_, LI_)
+)";
+
 // MSAA: a full-screen triangle filling a multisampled target from its resolved copy, every sample alike
 static const char *const kVkFullGLSL = R"(#version 450
 void main() {

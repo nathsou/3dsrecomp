@@ -122,6 +122,9 @@ u64 shader_program_hash(const ShaderProgram *p);  // of the code and swizzle wor
 std::string shader_msl(const ShaderProgram *p, u32 entry, const char *name);
 // the same for one set of bool/int uniforms (flow resolved statically), or "" if it cannot be done exactly
 std::string shader_msl_spec(const ShaderProgram *p, u32 entry, const char *name, u32 b, const u8 (*iu)[4]);
+// the same as Vulkan GLSL compute shaders (after vk_shaders.h's kVkVsCommonGLSL)
+std::string shader_glsl(const ShaderProgram *p, u32 entry);
+std::string shader_glsl_spec(const ShaderProgram *p, u32 entry, u32 b, const u8 (*iu)[4]);
 // the bool uniforms (bit mask) and int uniforms (*loops, bit mask) the program's flow control reads
 u32 shader_static_uniforms(const ShaderProgram *p, u32 *loops);
 bool shader_run4(const ShaderProgram *p, ShaderUnit4 &u, const V4 *uniforms, const bool *b,

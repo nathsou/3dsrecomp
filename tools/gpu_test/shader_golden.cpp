@@ -1,4 +1,5 @@
 // shader_golden [--glsl [--samples <n>]] [-o <dir>] <pipeline list>...
+// shader_golden --vs [--glsl] [-o <dir>] <vertex program list (.vs.bin)>...
 //
 // Generates the fragment shader of every key in the pipeline lists (games/*/pipelines.bin) and prints how many
 // and one hash of them all, so a change to the generator can be checked against an older build's output (the
@@ -13,6 +14,8 @@
 #include <vector>
 
 #include "gpu/fsgen.h"
+#include "gpu/vsblob.h"
+#include "gpu/vk_shaders.h"
 #include "rt.h"
 
 #ifdef SHADER_GOLDEN_SHADERC
@@ -20,12 +23,13 @@
 #endif
 
 int main(int argc, char **argv) {
-    bool glsl = false;
+    bool glsl = false, vs = false;
     unsigned samples = 1;
     const char *outdir = nullptr;
     std::vector<std::string> lists;
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--glsl")) glsl = true;
+        else if (!strcmp(argv[i], "--vs")) vs = true;
         else if (!strcmp(argv[i], "-o") && i + 1 < argc) outdir = argv[++i];
         else if (!strcmp(argv[i], "--samples") && i + 1 < argc) samples = (unsigned)atoi(argv[++i]);
         else lists.push_back(argv[i]);
@@ -36,6 +40,50 @@ int main(int argc, char **argv) {
     if (opt) shaderc_compile_options_set_target_env(opt, shaderc_target_env_vulkan, shaderc_env_version_vulkan_1_3);
 #endif
     std::set<std::string> seen;
+    if (vs) {
+        // vertex kernels: each program's generic kernel, and its specialized one when the blob has a specialization
+        u64 hash = 0xcbf29ce484222325ull;
+        int n = 0, spec = 0, bad = 0;
+        for (const std::string &path : lists)
+            for (const std::string &b : gpu::read_blobs(path, gpu::kVsMagic, gpu::kVsVersion)) {
+                if (!seen.insert(b).second) continue;
+                gpu::VsBlob v;
+                if (!gpu::parse_vs_blob(b, v)) continue;
+                gpu::ShaderProgram *p = gpu::shader_decode(v.code.data(), v.code_size, v.swz.data());
+                std::vector<std::string> srcs = {glsl ? gpu::shader_glsl(p, v.entry) : gpu::shader_msl(p, v.entry, "vk_main")};
+                if (v.spec)
+                    srcs.push_back(glsl ? gpu::shader_glsl_spec(p, v.entry, v.sp.b, v.sp.iu)
+                                        : gpu::shader_msl_spec(p, v.entry, "vk_main", v.sp.b, v.sp.iu));
+                gpu::shader_free(p);
+                for (const std::string &src : srcs) {
+                    for (unsigned char c : src) hash = (hash ^ c) * 0x100000001b3ull;
+                    hash = (hash ^ 0xff) * 0x100000001b3ull;
+                    if (!src.empty()) n++;
+#ifdef SHADER_GOLDEN_SHADERC
+                    if (glsl && !src.empty()) {
+                        const std::string full = std::string(gpu::kVkVsCommonGLSL) + src;
+                        shaderc_compilation_result_t r = shaderc_compile_into_spv(sc, full.data(), full.size(),
+                                                                                  shaderc_compute_shader, "vs", "main", opt);
+                        if (shaderc_result_get_compilation_status(r) != shaderc_compilation_status_success && bad++ < 3)
+                            fprintf(stderr, "vertex kernel %d does not compile:\n%s\n", n, shaderc_result_get_error_message(r));
+                        shaderc_result_release(r);
+                    }
+#endif
+                    if (outdir && !src.empty()) {
+                        char name[512];
+                        snprintf(name, sizeof name, "%s/vs%05d.%s", outdir, n, glsl ? "comp" : "metal");
+                        if (FILE *f = fopen(name, "wb")) {
+                            fwrite(src.data(), 1, src.size(), f);
+                            fclose(f);
+                        }
+                    }
+                }
+                spec += v.spec;
+            }
+        printf("%d vertex kernels (%s, %d programs specialized), hash %016llx, %d not compiling\n", n,
+               glsl ? "GLSL" : "MSL", spec, (unsigned long long)hash, bad);
+        return bad ? 1 : 0;
+    }
     u64 hash = 0xcbf29ce484222325ull;
     int n = 0, bad_keys = 0, bad_compiles = 0;
     for (const std::string &path : lists) {

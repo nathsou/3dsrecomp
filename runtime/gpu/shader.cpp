@@ -772,13 +772,15 @@ bool shader_run4(const ShaderProgram *P, ShaderUnit4 &u, const V4 *uni, const bo
     return false;
 }
 
-// ---------------------------------------------------------------- Metal translation
+// ---------------------------------------------------------------- Metal (and Vulkan GLSL) translation
 namespace {
 // Metal source for the vertex program's registers, sources and arithmetic, shared by the two kernel
-// generators below.
+// generators below. glsl: Vulkan's GLSL instead (vk_shaders.h's kVkVsCommonGLSL has the parameter block,
+// the MSL type names as macros, and helpers taking the same arguments as the MSL ones).
 struct MslWriter {
     const ShaderProgram *P;
     std::string o;
+    bool glsl = false;
     const char *al = "0";  // the loop counter register's expression
     char b[512];
     template <class... A> void f(const char *fmt, A... a) {
@@ -841,15 +843,21 @@ struct MslWriter {
         case OP_DP4: write(I, "vs_dp4(" + src(I, 0) + ", " + src(I, 1) + ")"); break;
         case OP_DPH: write(I, "vs_dph(" + src(I, 0) + ", " + src(I, 1) + ")"); break;
         case OP_DST: write(I, "vs_dst(" + src(I, 0) + ", " + src(I, 1) + ")"); break;
-        case OP_EX2: write(I, "float4(precise::exp2(" + src(I, 0) + ".x))"); break;
-        case OP_LG2: write(I, "float4(precise::log2(" + src(I, 0) + ".x))"); break;
+        case OP_EX2: write(I, std::string(glsl ? "float4(exp2(" : "float4(precise::exp2(") + src(I, 0) + ".x))"); break;
+        case OP_LG2: write(I, std::string(glsl ? "float4(log2(" : "float4(precise::log2(") + src(I, 0) + ".x))"); break;
         case OP_RCP: write(I, "float4(1.0 / " + src(I, 0) + ".x)"); break;
-        case OP_RSQ: write(I, "float4(1.0 / precise::sqrt(" + src(I, 0) + ".x))"); break;
+        case OP_RSQ: write(I, std::string(glsl ? "float4(1.0 / sqrt(" : "float4(1.0 / precise::sqrt(") + src(I, 0) + ".x))"); break;
         case OP_FLR: write(I, "floor(" + src(I, 0) + ")"); break;
         case OP_MAX: write(I, "vs_max(" + src(I, 0) + ", " + src(I, 1) + ")"); break;
         case OP_MIN: write(I, "vs_min(" + src(I, 0) + ", " + src(I, 1) + ")"); break;
-        case OP_SGE: write(I, "select(float4(0.0), float4(1.0), " + src(I, 0) + " >= " + src(I, 1) + ")"); break;
-        case OP_SLT: write(I, "select(float4(0.0), float4(1.0), " + src(I, 0) + " < " + src(I, 1) + ")"); break;
+        case OP_SGE:
+            write(I, glsl ? "mix(float4(0.0), float4(1.0), greaterThanEqual(" + src(I, 0) + ", " + src(I, 1) + "))"
+                          : "select(float4(0.0), float4(1.0), " + src(I, 0) + " >= " + src(I, 1) + ")");
+            break;
+        case OP_SLT:
+            write(I, glsl ? "mix(float4(0.0), float4(1.0), lessThan(" + src(I, 0) + ", " + src(I, 1) + "))"
+                          : "select(float4(0.0), float4(1.0), " + src(I, 0) + " < " + src(I, 1) + ")");
+            break;
         case OP_LITP:
             o += "    { const float4 a_ = " + src(I, 0) + "; c0 = a_.x > 0.0; c1 = a_.w > 0.0;\n";
             o += "      const float4 l_ = float4(max(a_.x, 0.0), max(a_.y, 0.0), a_.z, clamp(a_.w, -127.9961, 127.9961));\n";
@@ -886,6 +894,19 @@ struct MslWriter {
         }
         // one thread per vertex of all the draws using this kernel in a batch: tj gives the draw (its
         // parameters), whose first thread is P.first
+        if (glsl) {  // (P: a macro for PS[pidx]; NT: the number of threads)
+            o += "void main() {\n  const uint tid = gl_GlobalInvocationID.x;\n  if (tid >= NT) return;\n"
+                 "  pidx = tj[tid];\n  const uint vid = vids[tid], li = tid - P.first;\n";
+            for (u32 r = 0; r < 16; r++)
+                if (in_used & (1u << r)) f("  const float4 v%u = vs_input(vd, P, %u, vid);\n", r, r);
+            o += "  float4 t0 = float4(0.0), t1 = float4(0.0), t2 = float4(0.0), t3 = float4(0.0), t4 = float4(0.0), "
+                 "t5 = float4(0.0), t6 = float4(0.0), t7 = float4(0.0), t8 = float4(0.0), t9 = float4(0.0), "
+                 "t10 = float4(0.0), t11 = float4(0.0), t12 = float4(0.0), t13 = float4(0.0), t14 = float4(0.0), "
+                 "t15 = float4(0.0);\n"
+                 "  float4 o[16]; for (int i = 0; i < 16; i++) o[i] = float4(0.0);\n"
+                 "  int a0 = 0, a1 = 0; bool c0 = false, c1 = false;\n";
+            return;
+        }
         f("kernel void %s(device const uchar *vd [[buffer(0)]], device const uint *vids [[buffer(1)]],\n"
           "    constant VsParams *PS [[buffer(2)]], device float *outv [[buffer(3)]], device const uint *tj [[buffer(4)]],\n"
           "    uint tid [[thread_position_in_grid]]) {\n"
@@ -905,7 +926,8 @@ struct MslWriter {
 // metal.mm for the parameter block and helpers). Flow control reproduces shader_run() exactly: a
 // program-counter loop over a switch whose cases are the possible flow targets, with straight-line
 // code falling through between them, and the same if/call/loop stacks and end-address checks.
-std::string shader_msl(const ShaderProgram *P, u32 entry, const char *name) {
+namespace {
+std::string kernel_flow(const ShaderProgram *P, u32 entry, const char *name, bool glsl) {
     const u32 n = (u32)P->ins.size();
     if (entry >= n) return "";
     bool flow = false;
@@ -937,16 +959,18 @@ std::string shader_msl(const ShaderProgram *P, u32 entry, const char *name) {
     }
     label[entry] = true;
     MslWriter w{P};
+    w.glsl = glsl;
     std::string &o = w.o;
     w.prologue(name);
     if (flow) o += "  VsFlow S; S.nif = 0; S.ncall = 0; S.nloop = 0; S.aL = 0;\n";
     w.al = flow ? "S.aL" : "0";
     auto ub = [&](u32 bid) { return "((P.b >> " + std::to_string(bid) + "u) & 1u) != 0u"; };
     if (flow) o += "  uint pc = " + std::to_string(entry) + ";\n  for (uint guard_ = 0; guard_ < 262144u; guard_++) {\n  switch (pc) {\n";
+    if (flow && glsl) o += "  case 0xfffffffeu:\n";  // (GLSL: no statement before the first label; those are dead code)
     const u32 start = flow ? 0 : entry;
     for (u32 i = start; i < n; i++) {
         const DInst &I = P->ins[i];
-        if (flow && label[i]) w.f("  case %u:\n", i);
+        if (flow && label[i]) w.f(glsl ? "  case %uu:\n" : "  case %u:\n", i);
         // next pc / break flag for flow instructions ("" = not a flow instruction)
         std::string npc, brk = "false";
         const std::string next = std::to_string(i + 1), dst = std::to_string(I.fdst);
@@ -994,6 +1018,10 @@ std::string shader_msl(const ShaderProgram *P, u32 entry, const char *name) {
     o += "  vs_output(P, o, outv, li);\n}\n";
     return o;
 }
+}  // namespace
+
+std::string shader_msl(const ShaderProgram *P, u32 entry, const char *name) { return kernel_flow(P, entry, name, false); }
+std::string shader_glsl(const ShaderProgram *P, u32 entry) { return kernel_flow(P, entry, "main", true); }
 
 u32 shader_static_uniforms(const ShaderProgram *P, u32 *loops) {
     u32 bmask = 0, lmask = 0;
@@ -1186,10 +1214,12 @@ struct SpecGen {
 };
 }  // namespace
 
-std::string shader_msl_spec(const ShaderProgram *P, u32 entry, const char *name, u32 b, const u8 (*iu)[4]) {
+namespace {
+std::string kernel_spec(const ShaderProgram *P, u32 entry, const char *name, u32 b, const u8 (*iu)[4], bool glsl) {
     const u32 n = (u32)P->ins.size();
     if (entry >= n) return "";
     MslWriter w{P};
+    w.glsl = glsl;
     w.prologue(name);
     w.al = "aL";
     w.o += "  int aL = 0;\n";
@@ -1198,6 +1228,14 @@ std::string shader_msl_spec(const ShaderProgram *P, u32 entry, const char *name,
     if (g.fail) return "";
     w.o += "}\n";
     return w.o;
+}
+}  // namespace
+
+std::string shader_msl_spec(const ShaderProgram *P, u32 entry, const char *name, u32 b, const u8 (*iu)[4]) {
+    return kernel_spec(P, entry, name, b, iu, false);
+}
+std::string shader_glsl_spec(const ShaderProgram *P, u32 entry, u32 b, const u8 (*iu)[4]) {
+    return kernel_spec(P, entry, "main", b, iu, true);
 }
 
 }  // namespace gpu
