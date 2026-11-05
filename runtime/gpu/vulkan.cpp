@@ -40,6 +40,7 @@
 #include "gpu/fsgen.h"
 #include "gpu/pica.h"
 #include "gpu/vk_shaders.h"
+#include "gpu/vk_texfilter.h"
 #include "gpu/vsblob.h"
 #include "loader.h"
 
@@ -138,11 +139,13 @@ struct Img {
     VkImageView vdepth = VK_NULL_HANDLE, vstencil = VK_NULL_HANDLE;  // depth images: one aspect each (sampling)
     u32 w = 0, h = 0, levels = 1;
     VkFormat fmt = VK_FORMAT_UNDEFINED;
+    std::vector<VkImageView> lviews;  // one mip level each (storage images: texture filters), made when needed
     ~Img() {
         if (!img) return;
         VkImage i = img;
         VmaAllocation aa = a;
-        VkImageView v[3] = {view, vdepth, vstencil};
+        std::vector<VkImageView> v = {view, vdepth, vstencil};
+        v.insert(v.end(), lviews.begin(), lviews.end());
         retire([i, aa, v] {
             for (VkImageView x : v)
                 if (x) vkDestroyImageView(dev, x, nullptr);
@@ -357,6 +360,19 @@ VkImageView make_view(VkImage img, VkFormat fmt, VkImageAspectFlags aspect, u32 
     VK_CHECK(vkCreateImageView(dev, &vi, nullptr, &v));
     return v;
 }
+// a view of one mip level of a colour image
+VkImageView level_view(Img &im, u32 l) {
+    if (im.lviews.size() < im.levels) im.lviews.resize(im.levels, VK_NULL_HANDLE);
+    if (!im.lviews[l]) {
+        VkImageViewCreateInfo vi{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        vi.image = im.img;
+        vi.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        vi.format = im.fmt;
+        vi.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, l, 1, 0, 1};
+        VK_CHECK(vkCreateImageView(dev, &vi, nullptr, &im.lviews[l]));
+    }
+    return im.lviews[l];
+}
 bool is_depth(VkFormat f) { return f == VK_FORMAT_D32_SFLOAT_S8_UINT || f == VK_FORMAT_D24_UNORM_S8_UINT; }
 
 // a new image, in the GENERAL layout (from the command buffer being recorded on)
@@ -407,6 +423,8 @@ constexpr VkImageUsageFlags kColorUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | 
                                           VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT;
 constexpr VkImageUsageFlags kDepthUsage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT |
                                           VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+constexpr VkImageUsageFlags kUpscaledUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT |
+                                             VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 constexpr VkImageUsageFlags kTexUsage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
                                         VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
 
@@ -486,6 +504,103 @@ void dispatch(VkCommandBuffer cb, Kern k, std::initializer_list<KBind> binds, co
     if (q) memcpy(pc + 4, q, 16);
     vkCmdPushConstants(cb, k_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof pc, pc);
     vkCmdDispatch(cb, (w + 15) / 16, (h + 15) / 16, 1);
+}
+
+// ---------------------------------------------------------------- texture filters (vk_texfilter.cpp)
+// texfilter.mm's encoding on Vulkan: input texture at binding 0, output storage image at 1 (one mip level), the
+// rectangles at 2 (grid z), TFP as push constants
+VkDescriptorSetLayout tf_dsl;
+VkPipelineLayout tf_layout;
+VkPipeline tf_pipe[kVkTfKernCount];
+bool tf_ok = false;  // the kernels were built
+struct TfRect {
+    u32 x, y, w, h;
+};
+struct TFP {
+    u32 sw, sh, dw, dh, wrap_s, wrap_t, factor, pad;
+};
+
+// one dispatch over the rectangles rc (source rectangles scaled by num / den, in output texels)
+void tf_dispatch(VkCommandBuffer cb, VkTfKernel k, VkImageView in, VkImageView out, const TFP &p, const TfRect *rc,
+                 u32 n, u32 num, u32 den) {
+    const Slice rs = arena((size_t)n * 16);
+    u32 *v = (u32 *)rs.p;
+    u32 mw = 1, mh = 1;
+    for (u32 i = 0; i < n; i++) {
+        v[i * 4] = rc[i].x * num / den;
+        v[i * 4 + 1] = rc[i].y * num / den;
+        v[i * 4 + 2] = std::max(1u, rc[i].w * num / den);
+        v[i * 4 + 3] = std::max(1u, rc[i].h * num / den);
+        mw = std::max(mw, v[i * 4 + 2]);
+        mh = std::max(mh, v[i * 4 + 3]);
+    }
+    vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, tf_pipe[k]);
+    VkDescriptorImageInfo ii[2] = {{VK_NULL_HANDLE, in, VK_IMAGE_LAYOUT_GENERAL}, {VK_NULL_HANDLE, out, VK_IMAGE_LAYOUT_GENERAL}};
+    VkDescriptorBufferInfo bi = {rs.buf->b, rs.off, (VkDeviceSize)n * 16};
+    VkWriteDescriptorSet w[3];
+    for (u32 i = 0; i < 3; i++) {
+        w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
+        w[i].dstBinding = i;
+        w[i].descriptorCount = 1;
+    }
+    w[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    w[0].pImageInfo = &ii[0];
+    w[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
+    w[1].pImageInfo = &ii[1];
+    w[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+    w[2].pBufferInfo = &bi;
+    vkPushDescriptors(cb, VK_PIPELINE_BIND_POINT_COMPUTE, tf_layout, 0, 3, w);
+    vkCmdPushConstants(cb, tf_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof p, &p);
+    vkCmdDispatch(cb, (mw + 15) / 16, (mh + 15) / 16, n);
+}
+
+// the upscaling of src (level 0, w x h) by factor (2 or 4) into level 0 of dst, then dst's levels 1..log2(factor)-1
+// by alpha-aware 2x2 reduction; as texfilter_encode (rects: source texels, all if none; mid: the sharp filter's 2x
+// image at 4x, a partial update needing the previous one's). False without the kernels.
+bool tf_encode(int mode, Img &src, Img &dst, Img *mid, u32 factor, u32 wrap_s, u32 wrap_t, const TfRect *rects = nullptr,
+               u32 nrects = 0) {
+    if (!tf_ok || (factor != 2 && factor != 4)) return false;
+    const u32 w = src.w, h = src.h;
+    const TfRect all = {0, 0, w, h};
+    if (!rects || !nrects) {
+        rects = &all;
+        nrects = 1;
+    }
+    VkCommandBuffer cb = rec();
+    barrier(cb);
+    VkImageView top = level_view(dst, 0);
+    ImgP tmp;
+    if (mode == kVkTfSmooth) {
+        const TFP p = {w, h, w * factor, h * factor, wrap_s, wrap_t, factor, 0};
+        tf_dispatch(cb, kVkTfKernSmooth, src.view, top, p, rects, nrects, factor, 1);
+    } else {
+        // 2x, or 2x twice through the intermediate image mid
+        if (factor == 4 && !mid) {
+            tmp = make_img(w * 2, h * 2, VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
+            mid = tmp.get();
+            barrier(cb);
+        }
+        VkImageView in = src.view;
+        u32 iw = w, ih = h, scale = 1;
+        for (u32 f = factor; f > 1; f /= 2) {
+            VkImageView out = f > 2 ? mid->view : top;
+            const TFP q = {iw, ih, iw * 2, ih * 2, wrap_s, wrap_t, 2, 0};
+            tf_dispatch(cb, kVkTfKernSharp, in, out, q, rects, nrects, scale, 1);  // an invocation per input texel
+            scale *= 2;
+            if (f > 2) barrier(cb);
+            in = out;
+            iw *= 2;
+            ih *= 2;
+        }
+    }
+    u32 ul = 0;
+    while ((1u << ul) < factor) ul++;
+    for (u32 l = 1; l < ul; l++) {
+        barrier(cb);
+        const TFP q = {0, 0, 0, 0, 0, 0, 0, 0};
+        tf_dispatch(cb, kVkTfKernDown, level_view(dst, l - 1), level_view(dst, l), q, rects, nrects, factor, 1u << l);
+    }
+    return true;
 }
 
 // vertex program kernels: storage buffers 0-4 (vertex arrays, ids, parameter blocks, output, each thread's draw), the
@@ -865,26 +980,132 @@ void write_back_depth(GRT &r) {
 }
 
 // ---------------------------------------------------------------- textures and samplers
-// Decoded textures as images, by guest address and layout (uploaded through the arena before the pass)
+// Decoded textures as images, by guest address and layout, uploaded through the arena before the pass. With a texture
+// filter (set_texture_filter, GPU_TEX_FILTER) the 2D textures the game samples are upscaled once per decoded content
+// (vk_texfilter.cpp), as in metal.mm: level 0 is the upscaled image, the next levels down to the original size are
+// reduced from it, and the game's own levels follow (its level l is level l + ul), so get_sampler shifts the LOD clamps.
 struct VTex {
     u64 hash = 0;
     ImgP tex;
+    int req = 0;               // texture filter requested when it was made (0: none)
+    u32 ul = 0;                // log2 of the upscale factor (0: not upscaled)
+    u32 wraps = 0;             // wrap modes of the neighbourhood it was upscaled with
+    size_t bytes = 0;          // GPU memory of an upscaled texture (with src and mid)
+    u64 last_use = 0;          // flush_no
+    u32 changes = 0;           // content changes seen
+    u64 win_start = 0;         // complete re-upscales since win_start (flush_no): textures the game keeps
+    u32 win_changes = 0;       // rewriting completely (video) are no longer upscaled
+    // a texture the game has rewritten (animated tiles in an atlas) keeps what its upscaled image was made from,
+    // so that the next updates only redo the 8x8 tiles that changed
+    ImgP src, mid;             // level 0 as decoded; the sharp filter's 2x image (at 4x)
+    std::vector<u32> prev;     // level 0 as decoded (CPU copy, compared with the new contents)
 };
 std::unordered_map<std::string, VTex> tex_cache;
-u32 st_uploads = 0;
-double st_upload_ms = 0;
+std::atomic<int> want_filter{0};  // set_texture_filter (any thread), applied by the GX thread at the next flush
+int tf_mode = 0;
+u64 flush_no = 0;
+size_t tf_bytes = 0;                      // upscaled textures' memory
+constexpr size_t kTfBudget = 512u << 20;  // beyond: least recently used ones evicted, else no more upscaling
+u32 st_uploads = 0, st_upscaled = 0, st_partial = 0, st_tiles = 0;  // RECOMP_STATS
+double st_upload_ms = 0, st_upscale_ms = 0;
 
-const Img *get_texture(const TexEntry *e) {
-    if (!e || e->lv.empty() || e->lv[0].data.empty()) return nullptr;
-    char key[64];
-    snprintf(key, sizeof key, "%08x:%u:%u:%u:%u", e->addr, e->w, e->h, e->fmt, e->levels);
-    VTex &m = tex_cache[key];
-    if (m.tex && m.hash == e->hash) return m.tex.get();
-    const double t0 = log_timing ? now_ms() : 0;
-    u32 nl = 0;
-    while (nl < e->lv.size() && !e->lv[nl].data.empty() && e->lv[nl].w >= 1) nl++;
-    m.hash = e->hash;
-    m.tex = make_img(e->w, e->h, VK_FORMAT_R8G8B8A8_UNORM, nl, kTexUsage);
+// Guest memory holding GPU output (render targets, or transfer / copy outputs made from them, as long as the bytes
+// are unchanged): render-to-texture, not upscaled. Only tracked while a texture filter is on.
+struct GpuOut {
+    u32 addr, size;
+    u64 hash;
+};
+std::deque<GpuOut> gpu_outs;
+bool gpu_made(u32 addr, u32 size) {
+    for (auto &r : rts)
+        if (overlaps(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_bytes(pptr(r->addr), rt_bytes(*r)) == r->hash))
+            return true;
+    for (const GpuOut &g : gpu_outs)
+        if (overlaps(g.addr, g.size, addr, size) && hash_bytes(pptr(g.addr), g.size) == g.hash) return true;
+    return false;
+}
+void note_gpu_out(u32 addr, u32 size) {
+    if (!pptr(addr) || !pptr(addr + size - 1)) return;
+    for (auto it = gpu_outs.begin(); it != gpu_outs.end(); ++it)
+        if (it->addr == addr) {
+            gpu_outs.erase(it);
+            break;
+        }
+    gpu_outs.push_back({addr, size, hash_bytes(pptr(addr), size)});
+    if (gpu_outs.size() > 64) gpu_outs.pop_front();
+}
+
+// upscale factor of a texture (0: not upscaled): 4x at internal scales above 2, else 2x, up to 1024x1024; never
+// lookup / gradient tables (thin or tiny) or HILO8 (vectors, not colours)
+u32 tf_factor(const TexEntry *e) {
+    const u32 w = e->w, h = e->h, n = w * h;
+    if (e->fmt == 6 || n < 256 || w >= 8 * h || h >= 8 * w || n > 1024 * 1024) return 0;
+    return S > 2 ? 4 : 2;
+}
+u32 tf_wrap(u32 wrap) { return wrap == 2 || wrap == 6 || wrap == 7 ? 1 : wrap == 3 ? 2 : 0; }
+void tf_drop_all() {
+    tex_cache.clear();
+    tf_bytes = 0;
+}
+
+// The 8x8 tiles of an image (w x h texels) that differ between prev and cur, grown by one tile (the filters read up
+// to 3 texels around: tiles next to a changed one change too; across the edges when the texture repeats), one
+// rectangle per tile in rc; copies them from cur to prev. Returns the number of tiles.
+u32 changed_tiles(std::vector<u32> &prev, const std::vector<u32> &cur, u32 w, u32 h, u32 wraps, std::vector<TfRect> &rc) {
+    const u32 tw = w / 8, th = h / 8;
+    std::vector<u8> d((size_t)tw * th), g((size_t)tw * th);
+    bool any = false;
+    for (u32 ty = 0; ty < th; ty++)
+        for (u32 tx = 0; tx < tw; tx++)
+            for (u32 y = 0; y < 8; y++) {
+                const size_t o = (size_t)(ty * 8 + y) * w + tx * 8;
+                if (memcmp(&prev[o], &cur[o], 32)) {
+                    d[ty * tw + tx] = 1;
+                    any = true;
+                    break;
+                }
+            }
+    if (!any) return 0;
+    const bool rs = (wraps & 3) == 1, rt = (wraps >> 2) == 1;
+    for (u32 ty = 0; ty < th; ty++)
+        for (u32 tx = 0; tx < tw; tx++) {
+            if (!d[ty * tw + tx]) continue;
+            for (int dy = -1; dy <= 1; dy++)
+                for (int dx = -1; dx <= 1; dx++) {
+                    int x = (int)tx + dx, y = (int)ty + dy;
+                    if (x < 0 || x >= (int)tw) {
+                        if (!rs) continue;
+                        x = (x + tw) % tw;
+                    }
+                    if (y < 0 || y >= (int)th) {
+                        if (!rt) continue;
+                        y = (y + th) % th;
+                    }
+                    g[y * tw + x] = 1;
+                }
+        }
+    u32 n = 0;
+    for (u32 ty = 0; ty < th; ty++)
+        for (u32 tx = 0; tx < tw;) {
+            if (!g[ty * tw + tx]) {
+                tx++;
+                continue;
+            }
+            u32 e = tx;
+            while (e < tw && g[ty * tw + e]) e++;
+            for (u32 x = tx; x < e; x++) rc.push_back({x * 8, ty * 8, 8, 8});
+            for (u32 y = 0; y < 8; y++) {
+                const size_t o = (size_t)(ty * 8 + y) * w + tx * 8;
+                memcpy(&prev[o], &cur[o], (e - tx) * 32);
+            }
+            n += e - tx;
+            tx = e;
+        }
+    return n;
+}
+
+// the texture's decoded levels into dst's levels (from level `at`), through the arena
+void upload_levels(const TexEntry *e, u32 nl, Img &dst, u32 at = 0) {
     size_t total = 0;
     for (u32 l = 0; l < nl; l++) total += (size_t)e->lv[l].w * e->lv[l].h * 4;
     const Slice s = arena(total);
@@ -894,12 +1115,159 @@ const Img *get_texture(const TexEntry *e) {
         const TexImage &im = e->lv[l];
         if (!im.w || !im.h) continue;
         memcpy(s.p + off, im.data.data(), (size_t)im.w * im.h * 4);
-        cp.push_back(buf_copy(s.off + off, im.w, im.h, VK_IMAGE_ASPECT_COLOR_BIT, l));
+        cp.push_back(buf_copy(s.off + off, im.w, im.h, VK_IMAGE_ASPECT_COLOR_BIT, l + at));
         off += (size_t)im.w * im.h * 4;
     }
     VkCommandBuffer cb = rec();
     barrier(cb);
-    vkCmdCopyBufferToImage(cb, s.buf->b, m.tex->img, VK_IMAGE_LAYOUT_GENERAL, (u32)cp.size(), cp.data());
+    vkCmdCopyBufferToImage(cb, s.buf->b, dst.img, VK_IMAGE_LAYOUT_GENERAL, (u32)cp.size(), cp.data());
+}
+
+// up: the unit sampling it, if it may be upscaled (2D / projected textures); *ul: log2 of the upscale factor
+const Img *get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 *ul = nullptr) {
+    if (ul) *ul = 0;
+    if (!e || e->lv.empty() || e->lv[0].data.empty()) return nullptr;
+    char key[64];
+    snprintf(key, sizeof key, "%08x:%u:%u:%u:%u", e->addr, e->w, e->h, e->fmt, e->levels);
+    VTex &m = tex_cache[key];
+    const int want = up ? tf_mode : 0;
+    if (m.tex && m.hash == e->hash && m.req == want) {
+        m.last_use = flush_no;
+        if (ul) *ul = m.ul;
+        return m.tex.get();
+    }
+    const double t0 = log_timing ? now_ms() : 0;
+    const bool changed = m.tex && m.hash != e->hash;
+    if (changed) m.changes++;
+    m.last_use = flush_no;
+    u32 nl = 0;
+    while (nl < e->lv.size() && !e->lv[nl].data.empty() && e->lv[nl].w >= 1) nl++;
+    u32 f = want ? tf_factor(e) : 0;
+    const u32 u = f == 4 ? 2 : f == 2 ? 1 : 0;
+    const u32 wraps = up ? tf_wrap(up->wrap_s) | tf_wrap(up->wrap_t) << 2 : 0;
+    const u32 w = e->w, h = e->h;
+
+    // an upscaled texture of which only some tiles changed: redo those
+    if (changed && f && m.req == want && m.ul == u && m.wraps == wraps && m.src && nl == 1 && m.prev.size() == (size_t)w * h) {
+        std::vector<TfRect> rc;
+        const u32 nt = changed_tiles(m.prev, e->lv[0].data, w, h, wraps, rc);
+        if (nt * 2 <= (w / 8) * (h / 8)) {
+            if (nt) {
+                size_t total = 0;
+                for (const TfRect &r : rc) total += (size_t)r.w * r.h * 4;
+                const Slice sb = arena(total);
+                std::vector<VkBufferImageCopy> cp;
+                size_t off = 0;
+                for (const TfRect &r : rc) {
+                    for (u32 y = 0; y < r.h; y++)
+                        memcpy(sb.p + off + (size_t)y * r.w * 4, &e->lv[0].data[(size_t)(r.y + y) * w + r.x], r.w * 4);
+                    cp.push_back(buf_copy(sb.off + off, r.w, r.h, VK_IMAGE_ASPECT_COLOR_BIT, 0, (s32)r.x, (s32)r.y));
+                    off += (size_t)r.w * r.h * 4;
+                }
+                VkCommandBuffer cb = rec();
+                barrier(cb);
+                vkCmdCopyBufferToImage(cb, sb.buf->b, m.src->img, VK_IMAGE_LAYOUT_GENERAL, (u32)cp.size(), cp.data());
+                tf_encode(tf_mode, *m.src, *m.tex, m.mid.get(), f, wraps & 3, wraps >> 2, rc.data(), (u32)rc.size());
+                std::vector<VkImageCopy> ic;  // the game's level 0
+                for (const TfRect &r : rc) {
+                    VkImageCopy c{};
+                    c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    c.srcOffset = {(s32)r.x, (s32)r.y, 0};
+                    c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, u, 0, 1};
+                    c.dstOffset = {(s32)r.x, (s32)r.y, 0};
+                    c.extent = {r.w, r.h, 1};
+                    ic.push_back(c);
+                }
+                barrier(cb);
+                vkCmdCopyImage(cb, m.src->img, VK_IMAGE_LAYOUT_GENERAL, m.tex->img, VK_IMAGE_LAYOUT_GENERAL, (u32)ic.size(),
+                               ic.data());
+            }
+            m.hash = e->hash;
+            if (ul) *ul = u;
+            if (log_timing) {
+                st_partial++;
+                st_tiles += nt;
+                st_upscale_ms += now_ms() - t0;
+            }
+            return m.tex.get();
+        }
+    }
+
+    if (changed) {
+        if (flush_no - m.win_start > 600) {
+            m.win_start = flush_no;
+            m.win_changes = 0;
+        }
+        m.win_changes++;
+    }
+    tf_bytes -= m.bytes;
+    m.bytes = 0;
+    m.ul = 0;
+    m.req = want;
+    m.wraps = wraps;
+    m.hash = e->hash;
+    m.src = m.mid = nullptr;
+    m.prev.clear();
+    m.prev.shrink_to_fit();
+    if (f && (m.win_changes > 6 || gpu_made(e->addr, e->size))) f = 0;
+    const bool keep = f && m.changes > 0 && nl == 1;  // rewritten before: keep what partial updates need
+    size_t bytes = 0;
+    for (u32 l = 0; l < nl + u; l++) bytes += (size_t)std::max(1u, (w * f) >> l) * std::max(1u, (h * f) >> l) * 4;
+    if (keep) bytes += (size_t)w * h * 4 * (tf_mode == kVkTfSharp && f == 4 ? 5 : 1);
+    if (f && tf_bytes + bytes > kTfBudget) {
+        for (auto it = tex_cache.begin(); it != tex_cache.end();)
+            if (it->second.bytes && it->second.last_use + 120 < flush_no) {
+                tf_bytes -= it->second.bytes;
+                it = tex_cache.erase(it);
+            } else {
+                ++it;
+            }
+        if (tf_bytes + bytes > kTfBudget) f = 0;
+    }
+    if (f && tf_ok) {
+        ImgP t = make_img(w * f, h * f, VK_FORMAT_R8G8B8A8_UNORM, nl + u, kUpscaledUsage);
+        // the decoded texture, upscaled from and copied below the upscaled levels
+        ImgP src = make_img(w, h, VK_FORMAT_R8G8B8A8_UNORM, nl, kTexUsage);
+        upload_levels(e, nl, *src);
+        ImgP mid = keep && tf_mode == kVkTfSharp && f == 4
+                       ? make_img(w * 2, h * 2, VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)
+                       : nullptr;
+        tf_encode(tf_mode, *src, *t, mid.get(), f, wraps & 3, wraps >> 2);
+        std::vector<VkImageCopy> ic;
+        for (u32 l = 0; l < nl; l++) {
+            const TexImage &im = e->lv[l];
+            if (!im.w || !im.h) continue;
+            VkImageCopy c{};
+            c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l, 0, 1};
+            c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, l + u, 0, 1};
+            c.extent = {im.w, im.h, 1};
+            ic.push_back(c);
+        }
+        VkCommandBuffer cb = rec();
+        barrier(cb);
+        vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, t->img, VK_IMAGE_LAYOUT_GENERAL, (u32)ic.size(), ic.data());
+        m.tex = t;
+        m.ul = u;
+        m.bytes = bytes;
+        tf_bytes += bytes;
+        if (keep) {
+            m.src = src;
+            m.mid = mid;
+            m.prev = e->lv[0].data;
+        }
+        if (ul) *ul = u;
+        if (log_timing) {
+            st_upscaled++;
+            st_upscale_ms += now_ms() - t0;
+        }
+        return m.tex.get();
+    }
+    if (f) {  // no kernels: filter off
+        want_filter = tf_mode = 0;
+        m.req = 0;
+    }
+    m.tex = make_img(w, h, VK_FORMAT_R8G8B8A8_UNORM, nl, kTexUsage);
+    upload_levels(e, nl, *m.tex);
     if (log_timing) {
         st_uploads++;
         st_upload_ms += now_ms() - t0;
@@ -917,29 +1285,41 @@ VkSamplerAddressMode addr_mode(u32 wrap) {
     default: return VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;  // border modes are emulated in the shader
     }
 }
-VkSampler get_sampler(const TexUnitState &tu, u32 levels) {
-    const u64 key = (u64)aniso << 22 | (u64)tu.mag_linear | (u64)tu.min_linear << 1 | (u64)tu.mip_linear << 2 |
-                    (u64)tu.wrap_s << 3 | (u64)tu.wrap_t << 6 | (u64)levels << 9 | (u64)(tu.min_level & 15) << 14 |
-                    (u64)(tu.max_level & 15) << 18;
+// ul: log2 of the texture's upscale factor (its first ul levels come before the game's level 0)
+VkSampler get_sampler(const TexUnitState &tu, u32 levels, u32 ul = 0) {
+    const u64 key = (u64)ul << 28 | (u64)aniso << 22 | (u64)tu.mag_linear | (u64)tu.min_linear << 1 |
+                    (u64)tu.mip_linear << 2 | (u64)tu.wrap_s << 3 | (u64)tu.wrap_t << 6 | (u64)levels << 9 |
+                    (u64)(tu.min_level & 15) << 14 | (u64)(tu.max_level & 15) << 18;
     auto it = sampler_cache.find(key);
     if (it != sampler_cache.end()) return it->second;
+    const u32 glevels = levels - ul;  // the game's
     VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
     ci.magFilter = tu.mag_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
     ci.minFilter = tu.min_linear ? VK_FILTER_LINEAR : VK_FILTER_NEAREST;
-    if (levels > 1) {
+    if (glevels > 1) {
         ci.mipmapMode = tu.mip_linear ? VK_SAMPLER_MIPMAP_MODE_LINEAR : VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ci.minLod = (float)tu.min_level;
         ci.maxLod = (float)std::max(tu.min_level, tu.max_level);
-    } else {
+    } else if (!ul) {
         // not mipmapped: level 0 only, while the LOD still picks the minification or magnification filter
         ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
         ci.minLod = 0;
         ci.maxLod = 0.25f;
     }
+    if (ul) {
+        // upscaled: what the game magnifies may now be minified (LOD 0..ul), so the minification filter follows the
+        // magnification one; the game's levels moved down by ul
+        if (tu.mag_linear) ci.minFilter = VK_FILTER_LINEAR;
+        ci.mipmapMode = glevels > 1 && !tu.mip_linear ? VK_SAMPLER_MIPMAP_MODE_NEAREST : VK_SAMPLER_MIPMAP_MODE_LINEAR;
+        if (!tu.mag_linear && !tu.min_linear) ci.mipmapMode = VK_SAMPLER_MIPMAP_MODE_NEAREST;
+        ci.minLod = tu.min_level > 0 ? (float)(tu.min_level + ul) : 0.0f;
+        ci.maxLod = (glevels > 1 ? (float)std::max(tu.min_level, tu.max_level) : 0.0f) + (float)ul;
+    }
     ci.addressModeU = addr_mode(tu.wrap_s);
     ci.addressModeV = addr_mode(tu.wrap_t);
     ci.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    if (aniso > 1 && tu.min_linear && levels > 1) {
+    // anisotropic filtering where the game asked for linear minification of a mipmapped texture
+    if (aniso > 1 && tu.min_linear && glevels > 1) {
         ci.anisotropyEnable = VK_TRUE;
         ci.maxAnisotropy = (float)aniso;
     }
@@ -1312,6 +1692,7 @@ void finalize(PendingXfer &op) {
     memcpy(pptr(op.out_paddr), op.obytes->p, op.out_size);
     texcache_invalidate(op.out_paddr, op.out_size);
     rts_overwritten(op.out_paddr, op.out_size);
+    if (tf_mode) note_gpu_out(op.out_paddr, op.out_size);
     xbuf_free.push_back(std::move(op.gbytes));
     xbuf_free.push_back(std::move(op.obytes));
     std::lock_guard<std::mutex> lk(disp_mtx);
@@ -1513,7 +1894,7 @@ bool has_ext(const std::vector<VkExtensionProperties> &exts, const char *name) {
     return false;
 }
 
-VkPipeline make_kernel(const char *src, const char *name) {
+VkPipeline make_kernel(const char *src, const char *name, VkPipelineLayout layout = VK_NULL_HANDLE) {
     VkShaderModule m = make_module(compile_glsl(src, shaderc_compute_shader, name));
     if (!m) return VK_NULL_HANDLE;
     VkComputePipelineCreateInfo ci{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
@@ -1521,7 +1902,7 @@ VkPipeline make_kernel(const char *src, const char *name) {
     ci.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     ci.stage.module = m;
     ci.stage.pName = "main";
-    ci.layout = k_layout;
+    ci.layout = layout ? layout : k_layout;
     VkPipeline p = VK_NULL_HANDLE;
     if (vkCreateComputePipelines(dev, VK_NULL_HANDLE, 1, &ci, nullptr, &p) != VK_SUCCESS) p = VK_NULL_HANDLE;
     vkDestroyShaderModule(dev, m, nullptr);
@@ -1730,6 +2111,24 @@ bool init_device() {
         VK_CHECK(vkCreatePipelineLayout(dev, &li, nullptr, &k_layout));
     }
     {
+        const VkDescriptorSetLayoutBinding b[3] = {
+            {0, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {1, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr},
+            {2, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr}};
+        VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        ci.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        ci.bindingCount = 3;
+        ci.pBindings = b;
+        VK_CHECK(vkCreateDescriptorSetLayout(dev, &ci, nullptr, &tf_dsl));
+        const VkPushConstantRange pr{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(TFP)};
+        VkPipelineLayoutCreateInfo li{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        li.setLayoutCount = 1;
+        li.pSetLayouts = &tf_dsl;
+        li.pushConstantRangeCount = 1;
+        li.pPushConstantRanges = &pr;
+        VK_CHECK(vkCreatePipelineLayout(dev, &li, nullptr, &tf_layout));
+    }
+    {
         VkDescriptorSetLayoutBinding b[5];
         for (u32 i = 0; i < 5; i++) b[i] = {i, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, VK_SHADER_STAGE_COMPUTE_BIT, nullptr};
         VkDescriptorSetLayoutCreateInfo ci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -1789,6 +2188,8 @@ bool vk_surface_for(u32 addr, u32 w, u32 h, u32 fmt);
 void vk_end_list();
 bool vk_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size);
 void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+void vk_set_texture_filter(int mode);
+const char *vk_texture_filter_name(int mode);
 
 bool vk_init() {
     if (tried) return active;
@@ -1843,6 +2244,15 @@ bool vk_init() {
     dump_shaders = getenv("GPU_DUMP_SHADERS") != nullptr;
     eager_writeback = getenv("GPU_METAL_EAGER") != nullptr || getenv("GPU_EAGER") != nullptr;
     log_timing = getenv("RECOMP_STATS") != nullptr;
+    // texture filters
+    {
+        const char *tfname[kVkTfKernCount] = {"texture filter (sharp)", "texture filter (smooth)", "texture filter (levels)"};
+        tf_ok = true;
+        for (int i = 0; i < kVkTfKernCount; i++)
+            tf_ok = (tf_pipe[i] = make_kernel(vk_texfilter_glsl((VkTfKernel)i), tfname[i], tf_layout)) && tf_ok;
+        if (!tf_ok) LOG("gpu vulkan: texture filter kernels unavailable\n");
+        if (const char *tf = getenv("GPU_TEX_FILTER")) vk_set_texture_filter(atoi(tf));
+    }
     // dummies for the bindings a pipeline does not use
     {
         VkSamplerCreateInfo ci{VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO};
@@ -1881,6 +2291,7 @@ void apply_scale(u32 ns) {
         disp_free.clear();
     }
     LOG("gpu vulkan: internal scale %u -> %u\n", S, ns);
+    if (tf_mode && (S > 2) != (ns > 2)) tf_drop_all();  // upscale factors follow the scale (tf_factor)
     S = ns;
 }
 }  // namespace
@@ -1889,11 +2300,16 @@ void vk_set_scale(int s) { want_scale = (u32)std::clamp(s, 1, 4); }
 int vk_scale() { return active ? (int)(want_scale.load() ? want_scale.load() : S) : 0; }
 bool vk_scale_is_auto() { return active && !scale_fixed; }
 float vk_busy() { return active ? busy_frac.load() : 0; }
-void vk_set_texture_filter(int) {}
-int vk_texture_filter_count() { return 1; }
-const char *vk_texture_filter_name(int mode) { return mode == 0 ? "Off" : "?"; }
-bool vk_gpu_made(u32, u32) { return false; }
-void vk_note_gpu_output(u32, u32) {}
+void vk_set_texture_filter(int mode) { want_filter = std::clamp(mode, 0, (int)kVkTfCount - 1); }
+int vk_texture_filter_count() { return kVkTfCount; }
+const char *vk_texture_filter_name(int mode) {
+    static const char *const names[kVkTfCount] = {"Off", "Sharp", "Smooth"};
+    return mode >= 0 && mode < kVkTfCount ? names[mode] : "?";
+}
+bool vk_gpu_made(u32 paddr, u32 size) { return active && tf_mode && size && gpu_made(paddr, size); }
+void vk_note_gpu_output(u32 paddr, u32 size) {
+    if (active && tf_mode && size) note_gpu_out(paddr, size);
+}
 
 namespace {
 // the kernel of a vertex program blob: specialized for its uniforms when the program allows, else generic
@@ -1969,6 +2385,13 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
     const double t0 = g_stats ? now_ms() : 0;
     flushes++;
     if (const u32 ws = want_scale.load(); ws && ws != S) apply_scale(ws);
+    if (const int wf = want_filter.load(); wf != tf_mode) {
+        LOG("gpu vulkan: texture filter %s -> %s\n", vk_texture_filter_name(tf_mode), vk_texture_filter_name(wf));
+        tf_mode = wf;
+        tf_drop_all();
+        gpu_outs.clear();
+    }
+    flush_no++;
     bool uses_depth = false;
     for (const MSeg &seg : mb.segs) uses_depth |= seg.ds->depth_test || seg.ds->depth_write || seg.ds->stencil;
     const bool has_dep = uses_depth && rt.depth_addr && pptr(rt.depth_addr);
@@ -2217,6 +2640,9 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
             for (int k = 0; k < 3; k++) {
                 const TexUnitState &t = ds.tex[k];
                 if (!ds.need_tex[k] || t.null_tex) continue;
+                // upscaling (texture filter): 2D and projected textures only (not cube or shadow maps)
+                const bool up = tf_mode && (k != 0 || t.type == 0 || t.type == 3);
+                u32 ul = 0;
                 const Img *tex = nullptr;
                 if (t.surf) {
                     auto si = surf_tex.find(surf_key(t));
@@ -2224,11 +2650,14 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
                     auto di = surf_decoded.find(surf_key(t));
                     if (di != surf_decoded.end()) tex = get_texture(di->second);
                 } else {
-                    tex = get_texture(t.face[0]);
+                    tex = get_texture(t.face[0], up ? &t : nullptr, &ul);
                 }
                 if (!tex) tex = black.get();
                 pr.tv[k] = tex->view;
-                pr.sm[k] = get_sampler(t, tex->levels);
+                pr.sm[k] = get_sampler(t, tex->levels, ul);
+                // the LOD bias of a texture without mipmaps does nothing on the PICA (games leave any value);
+                // upscaled, it has levels: no bias then, or a positive one would pick the original level
+                if (ul && tex->levels == ul + 1) u.bias[k] = 0;
                 if (k == 0 && (t.type == 1 || t.type == 4))
                     for (int f = 1; f < 6; f++) {
                         const Img *ft = get_texture(t.face[f]);
@@ -2489,10 +2918,12 @@ void vk_poll() {
             LOG("[gpu] GPU busy %.1f ms/s (scale %u, MSAA %ux), %llu command buffers, %llu passes\n",
                 b * 1000 / ((t - last) / 1000), S, MS, (unsigned long long)cbs_made.exchange(0),
                 (unsigned long long)flushes.exchange(0));
-            LOG("[gpu] textures: %u decoded in %.2f ms, %u uploaded in %.2f ms\n", g_tex_decodes, g_tex_decode_ms,
-                st_uploads, st_upload_ms);
-            g_tex_decodes = st_uploads = 0;
-            g_tex_decode_ms = st_upload_ms = 0;
+            LOG("[gpu] textures: %u decoded in %.2f ms, %u uploaded in %.2f ms; filter %s: %u upscaled + %u updated "
+                "(%u tiles) in %.2f ms, %zu MiB\n",
+                g_tex_decodes, g_tex_decode_ms, st_uploads, st_upload_ms, vk_texture_filter_name(tf_mode), st_upscaled,
+                st_partial, st_tiles, st_upscale_ms, tf_bytes >> 20);
+            g_tex_decodes = st_uploads = st_upscaled = st_partial = st_tiles = 0;
+            g_tex_decode_ms = st_upload_ms = st_upscale_ms = 0;
         }
         static double saved = t;
         if (t - saved > 30000) {
