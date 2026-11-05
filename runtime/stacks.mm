@@ -252,14 +252,18 @@ void save_written(const std::string &path) {
 void draw(SDL_Renderer *r, const SDL_FRect &d, float px, float alpha) {
     const profile::Tools &t = profile::tools();
     const profile::Stacks &st = profile::stacks();
-    if (st.kinds.empty() || !d.w || alpha <= 0 || (int)t.slots.size() < kSlots ||
-        !(profile::cond(t.open_cond) || (st.shown_cond >= 0 && profile::cond(st.shown_cond))))
-        return;
+    // once the pockets (or a page like them) have settled: not while they slide in
+    constexpr int kSettleFrames = 12;
+    static int shown_frames;
+    const bool shown = profile::cond(t.open_cond) || (st.shown_cond >= 0 && profile::cond(st.shown_cond));
+    shown_frames = shown ? shown_frames + 1 : 0;
+    if (st.kinds.empty() || !d.w || alpha <= 0 || (int)t.slots.size() < kSlots || shown_frames < kSettleFrames) return;
+    alpha *= std::min(1.0f, (shown_frames - kSettleFrames + 1) / 6.0f);
     int n[kSlots];
     counts(n);
     const float k = d.w / 320;  // render units per bottom-screen pixel
     for (int i = 0; i < kSlots; i++) {
-        if (n[i] < 2) continue;
+        if (n[i] < 2 || onescreen::pocket_alpha(i) < 0.9f) continue;  // (its pocket not there: sliding out)
         const std::string s = std::to_string(n[i]);
         static std::map<std::string, std::pair<text::Texture, float>> cache;  // (by text: one size at a time)
         auto &c = cache[s];

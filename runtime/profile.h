@@ -1,6 +1,7 @@
 // Per-game profiles (games/<title id>/profile.txt): which screen matters in which part of a game, and a HUD
 // drawn over the top screen from values read in guest memory. The file format is described in profile.cpp.
 #pragma once
+#include <map>
 #include <string>
 #include <vector>
 
@@ -74,6 +75,11 @@ struct Tools {
     u32 record = 0, first = 0, category_off = 0, kind_lo = 0, kind_hi = 0;
     int icon_size = 28;           // items' icons: squares this big around the pockets, kept while they show
     std::string names;            // item names (RomFS MSBT, or several in a umsbt: the first)
+    std::string textures;         // items' icon textures (a RomFS darc of 32x32 ETC1A4 BCLIMs, "<prefix>%03d.bclim")
+    std::string texture_prefix;   // ...their names before the number
+    u32 texture_field = 0;        // the record's u16 that numbers an item's icon...
+    int texture_add = 0;          // ...plus this
+    std::map<u32, int> texture_of;  // items whose icon is numbered otherwise
     u32 hold_fn = 0, hold_on = 0;  // the game's own "hold this item" (fn(&item, 0, 0)), called when its thread
                                    // dispatches to hold_on; else the pockets are worked through out of sight
 };

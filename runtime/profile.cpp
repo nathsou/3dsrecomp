@@ -25,15 +25,17 @@
 //       "> off" follows a pointer: the address so far is read as a u32 and off is added (a null or unmapped
 //       pointer makes the value absent, and every condition using it false). Numbers: decimal or 0x hex.
 //   value <name> = runtime <flag>
-//       A number the runtime sets: "single" is 1 while one screen is shown (the single-screen layouts).
+//       A number the runtime sets: "single" is 1 while one screen is shown (the single-screen layouts),
+//       "bottom_dark" the share (percent) of the bottom screen's picture that is dark and opaque.
 //   set <value> = <number> [when <condition>]
 //       Writes the number to the value's place in guest memory every frame while the condition holds (data
 //       changes only: e.g. a layout pane's visible flag).
-//   focus top|bottom|both|panel [when <condition>]
+//   focus top|bottom|both|panel [after <frames>] [when <condition>]
 //       Which screen matters (first rule that holds wins; none: the user's own layout). "both": the top
 //       screen with the bottom one shown beside it (picture in picture). "panel": in the single-screen layouts,
 //       the bottom screen over the top one, as a card over the dimmed picture (or floating on its own
-//       transparency when its background is hidden, see "set"), nothing when it shows nothing.
+//       transparency when its background is hidden, see "set"), nothing when it shows nothing. "after": the
+//       condition must have held that many frames in a row (a page whose first frames are not to be shown).
 //   bind <host input> <target>
 //       One-screen controls (in the single-screen layouts with "onescreen"): a gamepad input by position (a b x y
 //       l r zl zr start back ls rs dup ddown dleft dright rs-up rs-down rs-left rs-right; the keyboard's keys
@@ -50,6 +52,10 @@
 //   tools pockets <value> held <value> [empty <item>]
 //   tools items <romfs file> record <bytes> first <item> category <offset> kinds <lo> <hi>
 //   tools icon <size>
+//   tools textures <darc> <prefix> field <offset> plus <n> [<item>=<number>]...
+//       The items' icons from the game's own textures: in the RomFS darc, <prefix><number>.bclim (32x32 ETC1A4),
+//       <number> being the u16 at <offset> in the item's record plus <n>, or the one given for an item. (Before
+//       the pockets show: icons kept from them only once they have.)
 //   tools names <romfs msbt/umsbt>
 //   tools slots <x> <y> ...
 //   tools equip <portrait x> <portrait y> open <buttons> when-open <value> <op> <n> ready <value> <op> <n>
@@ -169,7 +175,7 @@ struct Value {
 struct Term { int value; std::string op; s64 n; bool or_next = false; };  // or_next: "or" follows
 struct Cond { std::vector<Term> terms; bool state = false; };
 struct SetRule { int value; s64 n; int cond; };
-struct FocusRule { Focus f; int cond; };
+struct FocusRule { Focus f; int cond; int after = 0; int held = 0; };  // (after: frames the condition must hold)
 
 bool is_loaded;
 std::vector<Value> values;
@@ -509,9 +515,18 @@ bool parse_line(const std::string &line, std::string &err) {
             err = "expected 'focus top|bottom|both|panel'";
             return false;
         }
-        const int c = when(t, 2, err);
+        size_t i = 2;
+        s64 after = 0;
+        if (i < t.size() && t[i] == "after") {
+            if (i + 1 >= t.size() || !num(t[i + 1], after) || after < 0) {
+                err = "expected 'after <frames>'";
+                return false;
+            }
+            i += 2;
+        }
+        const int c = when(t, i, err);
         if (c == -2) return false;
-        focus_rules.push_back({f, c});
+        focus_rules.push_back({f, c, (int)after});
         return true;
     }
     if (d == "set") {
@@ -633,6 +648,27 @@ bool parse_line(const std::string &line, std::string &err) {
             u32 v;
             if (!n(2, v) || v < 4 || v > 64) return false;
             c.icon_size = (int)v;
+            return true;
+        }
+        if (t[1] == "textures") {
+            if (t.size() < 8 || t[4] != "field" || t[6] != "plus") {
+                err = "expected 'tools textures <darc> <prefix> field <offset> plus <n> [<item>=<number>]...'";
+                return false;
+            }
+            c.textures = t[2];
+            c.texture_prefix = t[3];
+            s64 add;
+            if (!n(5, c.texture_field) || !num(t[7], add)) return false;
+            c.texture_add = (int)add;
+            for (size_t i = 8; i < t.size(); i++) {
+                const size_t eq = t[i].find('=');
+                s64 item, number;
+                if (eq == std::string::npos || !num(t[i].substr(0, eq), item) || !num(t[i].substr(eq + 1), number)) {
+                    err = "expected <item>=<number>, got " + t[i];
+                    return false;
+                }
+                c.texture_of[(u32)item] = (int)number;
+            }
             return true;
         }
         if (t[1] == "names" && t.size() == 3) {
@@ -1027,11 +1063,10 @@ void update() {
         }
     }
     cur_focus = FOCUS_NONE;
-    for (auto &r : focus_rules)
-        if (r.cond < 0 || conds[r.cond].state) {
-            cur_focus = r.f;
-            break;
-        }
+    for (auto &r : focus_rules) {
+        r.held = r.cond < 0 || conds[r.cond].state ? r.held + 1 : 0;
+        if (cur_focus == FOCUS_NONE && r.held > r.after) cur_focus = r.f;
+    }
     frames++;
     if (trace_every > 0 && frames % trace_every == 0) {
         std::string s;

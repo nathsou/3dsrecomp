@@ -19,6 +19,7 @@ symbol hold_handler = pockets_page + 0x30 > 0               # the pockets' "Hold
 symbol hold_request = hold_handler call 3                   # the request it makes: finds the player, changes tools
 symbol player = hold_handler call 0 global 0                # the current player's data
 symbol player_update = vtable AcPlayer slot 9               # AcPlayer's update
+symbol player_actor = hold_request call 0 global 0 + 0x29204   # the table its lookup reads: the player's AcPlayer
 symbol menu_pages = vtable BsMenuItem slot 7 call 0 global 0 + 4  # the open pockets-like page's holder (its +0xc)
 
 # The game's own keyboard (names, the town's name, letters, chat): BsSkb, whose instance is set while it is up.
@@ -52,13 +53,19 @@ unsaved garden_plus.dat 0x2452a 0x02 crc32c 0x1ee20 0x6b84
 onescreen
 value single = runtime single
 value debug = runtime debug
+value actor = u32 player_actor                  # the player's AcPlayer (none on the title screen, nor on the train
+                                                # before a new game's town is chosen)
 value map = u32 map_page > 0                   # BsMenuMap while the field's map shows: the player is free in the
                                                 # field (dialogs hide it)
 # BsMenuBg's layout: N_mvmnt_Uscrn > P_base_00 (the plaid), hidden (alpha 0: not drawn). The bottom screen's pass
 # reuses the top screen's render target, so it is cleared to transparent first ("clearbottom").
 clearbottom
 value bg_alpha = u8 menu_bg > 0x78 > 0xbc > 0x14 > 0xb0
-set bg_alpha = 0 when single == 1
+# (kept while talking: a page that opens then, such as a shop's "Sell what?", shows as the 3DS shows it, a card over
+# the dialog, its bubbles' dotted shade on the plaid it is meant for)
+value talk_state = u8 player_actor > 0x1a9
+set bg_alpha = 0 when single == 1 and talk_state != 0x0f
+set bg_alpha = 255 when single == 1 and talk_state == 0x0f
 set bg_alpha = 255 when single == 0 and debug == 0
 set bg_alpha = 0 when debug == 1
 # The title screen's bottom layout (BsTitle, found through the game's tree of modes, slot 0x3fc): N_All > N_set
@@ -69,7 +76,24 @@ value title_set_name = u32 mode_tree > 0x3fc > 0x620 > 0x14 > 0x10 > 0xb4
 value title_set_flags = u8 mode_tree > 0x3fc > 0x620 > 0x14 > 0x10 > 0xb3
 set title_set_flags = 0 when single == 1 and title == BsTitle and title_set_name == 0x65735f4e
 set title_set_flags = 1 when single == 0 and debug == 0 and title == BsTitle and title_set_name == 0x65735f4e
-focus top when map == BsMenuMap
+# The bottom screen shows as a panel only when it has something to touch: the pockets and the pages like them (a
+# shop's "Sell what?"), the keyboard, a dialog's choices, menus. Standing, walking or talking (AcPlayer's state), it shows only its tabs
+# or a dimmed pattern behind the dialog: the top screen alone.
+# No player yet (the title screen, between modes): the top screen alone too, the title's "Press A" and copyright
+# lines would cover its logo.
+value player_state = u8 player_actor > 0x1a9
+value item_page = u32 menu_pages > 0xc          # the open pockets-like page (none: 0)
+value bottom_dark = runtime bottom_dark          # how much of the bottom screen is dark (percent)
+focus top when map == BsMenuMap and actor != 0
+focus panel when map == BsMenuMap               # the map without a player: a new game's choice of town (touched)
+focus panel when skb != 0
+focus panel when item_page != 0
+focus top when actor == 0
+focus top when player_state == 0x16            # opening the pockets, before their page is up
+# talking, a list of choices up (a dark box on the plaid): once its box has opened (it shows a stale picture for
+# about 30 frames as it does)
+focus panel after 32 when player_state == 0x0f and bottom_dark > 6
+focus top when player_state == 0x06 or player_state == 0x0d or player_state == 0x0f
 focus panel
 value pockets_open = u32 pockets_page > 0      # BsMenuItem while the pockets show (the pointer stays after they
                                                 # close; the page's memory is reused)
@@ -92,14 +116,14 @@ bind rs-up R
 # the hub: the field's buttons (bottom-screen pixels; outdoors only: indoors the bottom screen has none), their
 # icons kept from the bottom screen
 hub "Pockets" press X icon 2 0 46 22 when held >= 0
-hub "Designs" tap 72 12 icon 54 0 46 22 when map == BsMenuMap
-hub "Critterpedia" tap 123 12 icon 106 0 48 22 when map == BsMenuMap
-hub "TPC" tap 178 12 icon 158 0 48 22 when map == BsMenuMap
-hub "Map" map when map == BsMenuMap
+hub "Designs" tap 72 12 icon 54 0 46 22 when map == BsMenuMap and actor != 0
+hub "Critterpedia" tap 123 12 icon 106 0 48 22 when map == BsMenuMap and actor != 0
+hub "TPC" tap 178 12 icon 158 0 48 22 when map == BsMenuMap and actor != 0
+hub "Map" map when map == BsMenuMap and actor != 0
 hub "Tools" tools when held >= 0
-hub "Chat" tap 160 226 icon 136 214 48 26 when map == BsMenuMap
+hub "Chat" tap 160 226 icon 136 214 48 26 when map == BsMenuMap and actor != 0
 hub "Save" press START glyph "✓" when held >= 0
-map 64 27 192 184 when map == BsMenuMap
+map 64 27 192 184 when map == BsMenuMap and actor != 0
 
 # the tool ring: pockets whose category is a tool (axes to toy hammers), held with the game's own request (the one
 # the pockets' "Hold" makes), made as the player's update is called
@@ -107,13 +131,18 @@ tools pockets pocket0 held held empty 0x7ffe
 tools items /Item/Param/Item.bin record 30 first 0x2000 category 10 kinds 0x0e 0x14
 tools icon 30
 tools names /Script/Str/STR_Item_name.umsbt
+# the tools' icons from the game's own textures (icn_<n>: the record's first u16 plus 9; silver tools, slingshots and
+# toy hammers numbered otherwise)
+tools textures /Layout/ItemWin/item_icon_tex.arc icn_ field 0 plus 9 0x334e=350 0x3352=353 0x3356=352 0x335a=351 0x335e=354 0x3360=363 0x3361=363 0x3362=363 0x3363=363 0x3364=383 0x3365=383
 tools slots 35 115 85 115 235 115 285 115 35 157 85 157 135 157 185 157 235 157 285 157 35 197 85 197 135 197 185 197 235 197 285 197
-tools equip 160 80 open X when-open pockets_open == BsMenuItem ready map == BsMenuMap
+tools equip 160 80 open X when-open pockets_open == BsMenuItem ready map == BsMenuMap and player_state == 0x06 or map == BsMenuMap and player_state == 0x0d
 tools hold hold_request on player_update
 
-# stacks in the pockets (the menu's "Stack items"), as in New Horizons: seed bags, saplings, shrub starts, shells,
-# mushrooms, flowers, pitfall seeds, fertilizer, wrapping paper, candy, lollipops, fortune cookies and coffee beans
-# up to 10, nuggets and gems up to 30 (fruit and stationery count in the game already). Each player of each town
+# stacks in the pockets (the menu's "Stack items", on by default), as in New Horizons and with its sizes: seed bags,
+# saplings, shrub starts, shells, mushrooms, flowers, pitfall seeds, fertilizer, wrapping paper, candy, lollipops,
+# fortune cookies, coffee beans, cooking ingredients, medicine and chocolates up to 10, nuggets and gems up to 30.
+# Fruit, stationery, turnips and Bells count in the game already; tools, clothes, furniture, fish, bugs, fossils
+# and the like do not stack in New Horizons either. Each player of each town
 # (ids next to their names in the player data) keeps their own; the pockets are tidied as the player's update runs,
 # while the player stands or walks (not in a dialog, a menu or a shop's screen). As a conversation starts (a shop's
 # counter, a villager) the stacks are laid out in free pockets, one left free for what it may give, so a whole stack
@@ -130,3 +159,4 @@ value open_page = u32 menu_pages > 0xc > 0
 stack shown when open_page == BsMenuItemSelect
 stack kinds 0x36 0x37 0x38 0x3c 0x3e 0x40 0x41 0x46 0x49 0x52 0x53 0x5a 0x71 max 10
 stack kinds 0x42 0x43 max 30
+stack kinds 0x44 0x4a 0x72 0x87 max 10            # cooking ingredients, medicine, chocolates
