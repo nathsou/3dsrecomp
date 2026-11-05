@@ -1,6 +1,10 @@
 // What differs between the host systems, behind one interface: runtime/platform_apple.mm (macOS, iOS) and
 // runtime/platform_posix.cpp (Linux and other POSIX systems). New system-specific code goes here, not into the
 // portable files.
+// Still POSIX outside this layer, for a Windows port to take over: the guest address space (mmap in core.cpp, mprotect
+// in watch.cpp), host threads (pthreads in kernel.cpp), files and folders (unistd/fcntl/dirent in services/fs.cpp,
+// cloud.cpp, settings.cpp, gsp.cpp's dumps), loadable code (dlopen/dladdr in core.cpp, main.cpp, kernel.cpp), signals
+// (watch.cpp), restarting the process (execv in frontend.cpp) and realpath (core.cpp).
 #pragma once
 #if defined(__has_include)
 #if __has_include(<TargetConditionals.h>)

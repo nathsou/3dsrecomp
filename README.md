@@ -1,7 +1,8 @@
 # 3dsrecomp
 
-A static recompiler for **Nintendo 3DS** games that produces native **macOS** applications (Apple Silicon).
-The game's ARM11 code is translated to C ahead of time and compiled for the Mac; the 3DS operating system
+A static recompiler for **Nintendo 3DS** games that produces native **macOS** applications (Apple Silicon) and
+**Linux** ones (x86-64, Vulkan; see [Linux](#linux)).
+The game's ARM11 code is translated to C ahead of time and compiled for the Mac or the PC; the 3DS operating system
 (Horizon kernel and services), the PICA200 GPU, the DSP audio and the input devices are replaced by host
 implementations. It is not an emulator: the game runs as a native program.
 
@@ -101,6 +102,33 @@ Apple Silicon Mac, Xcode command line tools, Homebrew `llvm` (clang), `cmake`, `
 brew install llvm cmake ninja sdl3
 python3 -m venv .venv && .venv/bin/pip install capstone unicorn   # only for tools/test_cpu.py and tools/disasm.py
 ```
+
+### Linux
+
+x86-64 with a Vulkan 1.3 GPU and driver (tested on CachyOS with an RTX 4060 Ti, NVIDIA 615): clang, CMake, Ninja,
+SDL3, the Vulkan loader and headers, shaderc, FreeType, HarfBuzz, Fontconfig, libcurl and, for AAC music, FFmpeg.
+On Arch-based systems:
+
+```sh
+sudo pacman -S clang cmake ninja sdl3 vulkan-icd-loader vulkan-headers shaderc freetype2 harfbuzz fontconfig curl ffmpeg
+sudo pacman -S vulkan-validation-layers   # optional: GPU_VALIDATE=1
+```
+
+The steps below are the same (`tools/extract.py` decrypts with OpenSSL's libcrypto). Saves go to `save/<title id>/`,
+or `~/.local/share/3dsrecomp/<title id>/` (`$XDG_DATA_HOME`) for app folders made by
+`tools/bundle_linux.sh <name> data/<name> ["App Name"]` (the executable, `resources/game/` and a `.desktop`
+launcher; an AppImage too when `appimagetool` is installed). The GPU backend is Vulkan (`runtime/gpu/vulkan.cpp`,
+the Metal backend's design: see [Graphics options](#graphics-options)); text is drawn with the desktop's sans-serif
+font through Fontconfig, FreeType and HarfBuzz; cloud saves use libcurl; AAC music FFmpeg's decoder.
+
+- `GPU_DEVICE=<index or part of the name>` picks the GPU (default: the first discrete one); `GPU_VALIDATE=1` turns on
+  the Vulkan validation layer, its messages in the log.
+- On Wayland, separate windows' positions are not restored (Wayland lets no application place its windows);
+  `SDL_VIDEO_DRIVER=x11` runs through XWayland. A window the compositor does not show gets presents without vsync
+  until it shows again, so the game keeps its pace.
+- The Vulkan backend is meant to build on a Mac too, with MoltenVK (`-DRECOMP_VULKAN=ON`, Homebrew `molten-vk
+  vulkan-loader vulkan-headers shaderc pkg-config`), and run with `GPU_BACKEND=vulkan` for comparisons with Metal (not
+  tried yet).
 
 ## Building a game
 
@@ -412,8 +440,10 @@ with the directives that use it left out.
   - `service.cpp` + `services/`: IPC to HLE services: srv, APT, fs (RomFS from `romfs.bin`, saves in host
     folders), gsp::Gpu (interrupt relay queue, GX command queue, framebuffers), hid, cfg, dsp, ptm, ac, frd,
     ldr:ro (CRO modules, below), and stubs for the rest.
-  - `gpu/`: the PICA200 GPU, either on **Metal** (default) or in a multithreaded **software** rasterizer that
-    is the reference implementation. With Metal, vertex programs are translated to compute kernels, one
+  - `gpu/`: the PICA200 GPU, either on **Metal** (default on Apple), **Vulkan** (`vulkan.cpp`, default elsewhere,
+    the same design) or in a multithreaded **software** rasterizer that is the reference implementation. The
+    backends sit behind `HwBackend` (`pica.h`, `hw.cpp`); the fragment shader generator (`fsgen.cpp`) and the
+    vertex kernel writer (`shader.cpp`) write MSL or GLSL, checked by `tools/gpu_test`'s `make golden`. With Metal, vertex programs are translated to compute kernels, one
     per program and set of bool/int uniforms (`shader_msl_spec()`: the uniform-dependent ifs, calls and loop
     counts are resolved when the kernel is generated, leaving structured code; programs whose flow is not
     properly nested use `shader_msl()`, a program-counter switch that reproduces the interpreter exactly), run
@@ -428,6 +458,7 @@ with the directives that use it left out.
     vertex programs still compiling run in the CPU interpreter (pre-decoded, 4-wide SIMD).
   - `audio/`: HLE of the DSP audio firmware, output through SDL3.
   - `frontend.cpp`: SDL3 window, input, VBlank pacing.
+  - `platform.h`: what differs between the systems (`platform_apple.mm`, `platform_posix.cpp`).
 
 ### CRO modules (ldr:ro)
 
@@ -446,7 +477,12 @@ constants by the recompiler. `tools/disasm.py` shows module code at slot address
 
 ## Graphics options
 
-- `GPU_BACKEND=metal|sw` (default `metal`).
+- `GPU_BACKEND=metal|vulkan|sw` (default: `metal` on Apple, `vulkan` elsewhere). The Vulkan backend works as the
+  Metal one below (internal scale, MSAA, GPU vertex kernels, precompiled pipelines, GPU copies), with fragment shaders
+  in GLSL compiled by shaderc and the driver's compiled pipelines kept in `<saves>/shadercache/<title id>.vkpc`.
+  Where it differs: logic ops are done by the blender (Metal blends them in the shader); without the
+  `VK_EXT_shader_stencil_export` extension (NVIDIA) a multisampled depth/stencil buffer restored from guest memory
+  gets its stencil bit by bit.
 - `GPU_SCALE=1..4`: internal resolution of the Metal backend, in multiples of the 3DS screens. Without it the
   scale follows the window: the smallest one that covers the window's pixels (4x for the default window on a
   Retina display, 2x on a standard one), re-chosen when the window is resized. F3 cycles auto, 1x to 4x.
