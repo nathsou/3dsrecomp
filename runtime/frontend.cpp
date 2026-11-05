@@ -87,6 +87,25 @@ static int swapped_layout(int l) {
 static SDL_Window *window2;
 static SDL_Renderer *renderer2;
 static int vsync = 0;  // presents wait for the display's refresh (no tearing) at normal speed; off when sped up
+// A window the compositor does not show (another virtual desktop, covered, minimised: Wayland and XWayland stop its
+// frame callbacks) makes a present that waits for the refresh block, up to a second: the game would crawl. A present
+// that took that long turns vsync off for a while; then it is tried again
+// (for twice as long each time it happens again, up to 30 s; back to 2 s once presents are quick)
+static std::chrono::steady_clock::time_point vsync_held_until;
+static std::chrono::seconds vsync_hold{2};
+static void present_renderer(SDL_Renderer *r) {
+    const auto t0 = std::chrono::steady_clock::now();
+    SDL_RenderPresent(r);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    if (vsync && took <= std::chrono::milliseconds(50)) vsync_hold = std::chrono::seconds(2);
+    if (vsync && took > std::chrono::milliseconds(50)) {
+        vsync_held_until = std::chrono::steady_clock::now() + vsync_hold;
+        vsync_hold = std::min(vsync_hold * 2, std::chrono::seconds(30));
+        vsync = 0;  // (the main loop sets it again once the hold is over)
+        SDL_SetRenderVSync(renderer, 0);
+        if (renderer2) SDL_SetRenderVSync(renderer2, 0);
+    }
+}
 static SDL_Texture *tex_bottom2, *hi_bottom2;
 static int hb2w, hb2h;
 static u64 shown_ver[2];  // display image versions already uploaded (per screen)
@@ -955,7 +974,7 @@ static void present() {
         SDL_RenderTexture(renderer2, t_bottom, nullptr, &full);
         stacks::draw(renderer2, full, r.w > 0 ? r.w / 320 : 1, 1);
         write_window_shot(renderer2, "window2");
-        SDL_RenderPresent(renderer2);
+        present_renderer(renderer2);
     }
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
@@ -1017,7 +1036,7 @@ static void present() {
     if (touch::enabled() && !menu::is_open() && !menu::keyboard_open()) touch::draw();
     menu::draw();
     write_window_shot(renderer, "window");
-    SDL_RenderPresent(renderer);
+    present_renderer(renderer);
     frame_count++;
     g_frame = frame_count;
     if (shot_frame && frame_count >= shot_from && frame_count % shot_frame == 0) {
@@ -1567,7 +1586,8 @@ void frontend_run() {
         }
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
         kernel::set_clock_speed((u32)g_settings.speed);
-        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC"); v != vsync) {
+        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC") && steady_clock::now() >= vsync_held_until;
+            v != vsync) {
             vsync = v;
             SDL_SetRenderVSync(renderer, vsync);
             if (renderer2) SDL_SetRenderVSync(renderer2, vsync);
