@@ -62,6 +62,13 @@ extracted from the CIA with `--boot9`/`--keys`). It needs the shared font system
 not supported. In the first lesson, the way on is to walk into the Pullblox itself (Papa Blox only reacts once
 Mallo touches the block), not up to Papa Blox.
 
+**Hey! Pikmin** (EUR, `CTR-P-BRCP`, title 00040000001AF800) runs: the first-boot dialogs, the title screen, file
+select, a new game's opening (the crash on PNF-404, with its streamed music) and the first scenes with Olimar, and,
+from a real console's save, the area map and the levels: walking with the circle pad, the touch screen (the mouse)
+for everything else, the pause menu, at full speed with music and sound (built with `-DGAME=pikmin` from
+`data/pikmin`). Its CIA uses seed crypto: extract it with its seed (`--seed` or `--seeddb`, see step 1 below).
+amiibo is not supported.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
@@ -92,7 +99,9 @@ python3 -m venv .venv && .venv/bin/pip install capstone unicorn   # only for too
    decrypted while they are read, with keys from your own console: `--boot9 boot9.bin` (boot9strap dumps it to
    the SD card's `boot9strap/` folder when the console is powered on with Start + Select + X held) and, for a
    CIA, `--keys aes_keys.txt` in the Citra/Azahar format with the ticket's common KeyY (`common0=...`). Titles
-   that use seed crypto are not supported. See `tools/ctrcrypto.py`.
+   that use seed crypto (released for firmware 9.6 and later, such as Hey! Pikmin) also need their seed:
+   `--seeddb seeddb.bin`, which GodMode9 writes to `gm9/out/` with "Build support files" (HOME menu > More...)
+   from the titles installed on the console, or `--seed <32 hex digits>`. See `tools/ctrcrypto.py`.
 
 2. **Recompile** the code to C (`generated/<name>/`, a few seconds):
 
