@@ -15,6 +15,9 @@ else
 # the Vulkan backend (runtime/gpu/vulkan.cpp) with shaderc
 LDFLAGS ?= -lpthread -ldl $(shell pkg-config --libs vulkan shaderc 2>/dev/null)
 CXXFLAGS += -I$(ROOT)/third_party
+ifeq ($(wildcard /usr/include/vulkan/vulkan.h),)
+CXXFLAGS += -I$(ROOT)/external/Vulkan-Headers/include  # (until the system's vulkan-headers are installed)
+endif
 GPU_MM :=
 endif
 ifneq ($(shell pkg-config --exists shaderc && echo y),)

@@ -950,10 +950,12 @@ struct Pipe {
     int state = 0;       // 0 queued, 1 compiling, 2 done (ps is null if it failed)
     bool known = false;  // from a pipeline list: wait for it rather than skipping its draws
 };
-std::mutex pipe_mtx;
-std::condition_variable pipe_cv;
-std::unordered_map<std::string, std::unique_ptr<Pipe>> pipe_cache;
-std::deque<std::string> pipe_queue;
+// (never destroyed: the workers wait on them until the process ends, and glibc's condition variables cannot be
+// destroyed while waited on)
+std::mutex &pipe_mtx = *new std::mutex;
+std::condition_variable &pipe_cv = *new std::condition_variable;
+std::unordered_map<std::string, std::unique_ptr<Pipe>> &pipe_cache = *new std::unordered_map<std::string, std::unique_ptr<Pipe>>;
+std::deque<std::string> &pipe_queue = *new std::deque<std::string>;
 int pipe_workers = 0;
 FILE *key_log;
 struct {
