@@ -160,13 +160,28 @@ static int vsync = 0;  // presents wait for the display's refresh (no tearing) a
 // frame callbacks) makes a present that waits for the refresh block, up to a second: the game would crawl. A present
 // that took that long turns vsync off for a while; then it is tried again
 // (for twice as long each time it happens again, up to 30 s; back to 2 s once presents are quick)
-static std::chrono::steady_clock::time_point vsync_held_until;
+// (the hold goes back to 2 s only once presents with vsync have stayed quick for 10 s: right after vsync is turned
+// back on the first presents are quick anyway, while the swapchain has free images.) A window the system says is
+// covered or minimized presents without vsync until it is shown again.
+static std::chrono::steady_clock::time_point vsync_held_until, vsync_on_since;
 static std::chrono::seconds vsync_hold{2};
+static bool window_hidden;
+// for the [stats] lines: the UI thread's time getting the screens' images and presenting (average and max ms), and
+// how many presents waited for vsync
+struct UiTimes {
+    double get, get_max, present, present_max;
+    int frames, vsynced;
+} ui_times;
 static void present_renderer(SDL_Renderer *r) {
     const auto t0 = std::chrono::steady_clock::now();
     SDL_RenderPresent(r);
     const auto took = std::chrono::steady_clock::now() - t0;
-    if (vsync && took <= std::chrono::milliseconds(50)) vsync_hold = std::chrono::seconds(2);
+    const double ms = std::chrono::duration<double, std::milli>(took).count();
+    ui_times.present += ms;
+    ui_times.present_max = std::max(ui_times.present_max, ms);
+    ui_times.vsynced += vsync != 0;
+    if (vsync && took <= std::chrono::milliseconds(50) && t0 - vsync_on_since > std::chrono::seconds(10))
+        vsync_hold = std::chrono::seconds(2);
     if (vsync && took > std::chrono::milliseconds(50)) {
         vsync_held_until = std::chrono::steady_clock::now() + vsync_hold;
         vsync_hold = std::min(vsync_hold * 2, std::chrono::seconds(30));
@@ -1074,6 +1089,12 @@ static void present() {
     SDL_Texture *t_top = upload_screen(renderer, 0, hi_top, tex_top, top);
     SDL_Texture *t_bottom = window2 ? upload_screen(renderer2, 1, hi_bottom2, tex_bottom2, bottom)
                                     : upload_screen(renderer, 1, hi_bottom, tex_bottom, bottom);
+    {
+        const double ms = std::chrono::duration<double, std::milli>(steady_clock::now() - t).count();
+        ui_times.get += ms;
+        ui_times.get_max = std::max(ui_times.get_max, ms);
+        ui_times.frames++;
+    }
     if (window2) {
         SDL_SetRenderDrawColor(renderer2, 0, 0, 0, 255);
         SDL_RenderClear(renderer2);
@@ -1602,6 +1623,15 @@ void frontend_run() {
             }
             if (ev.type == SDL_EVENT_WINDOW_MOVED || ev.type == SDL_EVENT_WINDOW_RESIZED)
                 store_geometry(SDL_GetWindowFromID(ev.window.windowID));
+            if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST &&
+                ev.window.windowID == SDL_GetWindowID(window)) {
+                if (ev.type == SDL_EVENT_WINDOW_OCCLUDED || ev.type == SDL_EVENT_WINDOW_HIDDEN ||
+                    ev.type == SDL_EVENT_WINDOW_MINIMIZED)
+                    window_hidden = true;
+                if (ev.type == SDL_EVENT_WINDOW_EXPOSED || ev.type == SDL_EVENT_WINDOW_SHOWN ||
+                    ev.type == SDL_EVENT_WINDOW_RESTORED)
+                    window_hidden = false;
+            }
             int ex, ey;  // Esc while the game's own keyboard is up: its close key, when the profile names one
             if (typing && ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_ESCAPE && !menu::is_open() &&
                 profile::key("escape", ex, ey)) {
@@ -1698,9 +1728,11 @@ void frontend_run() {
         }
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
         kernel::set_clock_speed((u32)g_settings.speed);
-        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC") && steady_clock::now() >= vsync_held_until;
+        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC") && !window_hidden &&
+                          steady_clock::now() >= vsync_held_until;
             v != vsync) {
             vsync = v;
+            vsync_on_since = steady_clock::now();
             SDL_SetRenderVSync(renderer, vsync);
             if (renderer2) SDL_SetRenderVSync(renderer2, vsync);
         }
@@ -1779,10 +1811,21 @@ void frontend_run() {
                     u64 lists = kernel::gx_stats.cmdlists, ns = kernel::gx_stats.gpu_ns;
                     u64 xf = kernel::gx_stats.transfers;
                     static u64 last_games;
-                    LOG("[stats] %llu vblanks/%.0fs, %llu game frames, %llu cmdlists, %llu display transfers, gpu %.1f ms/s\n",
+                    LOG("[stats] %llu vblanks/%.0fs, %llu game frames, %llu cmdlists, %llu display transfers, "
+                        "command lists %.1f ms/s\n",
                         (unsigned long long)(frame_count - last_frames), span, (unsigned long long)(game_frames - last_games),
                         (unsigned long long)(lists - last_lists), (unsigned long long)(xf - last_xfers),
                         (ns - last_ns) / (span * 1e6));
+                    if (ui_times.frames) {
+                        const UiTimes &u = ui_times;
+                        LOG("[stats] UI: images %.1f ms (max %.1f), present %.1f ms (max %.1f), %d of %d with vsync\n",
+                            u.get / u.frames, u.get_max, u.present / u.frames, u.present_max, u.vsynced, u.frames);
+                        ui_times = {};
+                    }
+                    {
+                        const std::string th = platform::thread_cpu_report(span);
+                        if (!th.empty()) LOG("[stats] CPU ms/s: %s\n", th.c_str());
+                    }
                     last_games = game_frames;
                     last_xfers = xf;
                     last_frames = frame_count;

@@ -2,6 +2,7 @@
 #include "platform.h"
 
 #include <SDL3/SDL.h>
+#include <dirent.h>
 #include <execinfo.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -13,8 +14,12 @@
 #include <cerrno>
 #include <climits>
 #include <cstdio>
+#include <cstring>
 #include <ctime>
+#include <map>
 #include <mutex>
+#include <string>
+#include <vector>
 
 #include "uiview.h"
 
@@ -48,6 +53,49 @@ void set_thread_name(const char *name) {
     char n[16];
     snprintf(n, sizeof n, "%s", name);
     pthread_setname_np(pthread_self(), n);
+}
+
+// each thread's time on a CPU (ns) from /proc/self/task/<tid>/schedstat, its name from comm
+std::string thread_cpu_report(double span_s) {
+#ifdef __linux__
+    static std::map<long, uint64_t> last;
+    std::map<long, uint64_t> now;
+    std::map<std::string, double> by_name;
+    if (DIR *d = opendir("/proc/self/task")) {
+        while (dirent *e = readdir(d)) {
+            const long tid = atol(e->d_name);
+            if (tid <= 0) continue;
+            char path[64], name[32] = {};
+            unsigned long long ns = 0;
+            snprintf(path, sizeof path, "/proc/self/task/%ld/schedstat", tid);
+            if (FILE *f = fopen(path, "r")) {
+                if (fscanf(f, "%llu", &ns) != 1) ns = 0;
+                fclose(f);
+            }
+            snprintf(path, sizeof path, "/proc/self/task/%ld/comm", tid);
+            if (FILE *f = fopen(path, "r")) {
+                if (!fgets(name, sizeof name, f)) name[0] = 0;
+                fclose(f);
+            }
+            name[strcspn(name, "\n")] = 0;
+            now[tid] = ns;
+            const auto it = last.find(tid);
+            if (it != last.end() && ns > it->second) by_name[name] += (ns - it->second) / 1e6 / span_s;
+        }
+        closedir(d);
+    }
+    last = std::move(now);
+    std::vector<std::pair<double, std::string>> v;
+    for (auto &[n, ms] : by_name)
+        if (ms >= 5) v.push_back({ms, n});
+    std::sort(v.rbegin(), v.rend());
+    std::string out;
+    for (auto &[ms, n] : v) out += (out.empty() ? "" : ", ") + n + " " + std::to_string((int)(ms + 0.5));
+    return out;
+#else
+    (void)span_s;
+    return "";
+#endif
 }
 
 // ---------------------------------------------------------------- thread sampling

@@ -42,6 +42,9 @@ std::string device_name();
 void set_thread_interactive();
 // names the calling thread for debuggers, profilers and top (at most 15 characters are kept)
 void set_thread_name(const char *name);
+// CPU time each named thread used since the last call, in ms per second of span_s, busiest first ("gx 312,
+// guest-00100000 508, ..."; threads sharing a name are added up, idle ones left out; "" where not supported)
+std::string thread_cpu_report(double span_s);
 // Sampling another thread's stack (thread dumps show the guest functions a thread is in): a handle for the thread
 // (0: none), whether it is the calling one, and the return addresses on its stack, innermost first (pc first)
 uint64_t thread_handle(pthread_t t);

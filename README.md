@@ -585,6 +585,10 @@ keep the Metal compiler out of gameplay:
 - If a game submits no GPU work for 5 s, the log records the state of every thread (`[diag]`), each with the
   chain of game functions it is in (`in <innermost> < <caller> < ...`); outside `RECOMP_STATS` runs a stats line
   is logged every 30 s.
+- `RECOMP_STATS=1`: the stats lines every 2 s instead. Each covers frames shown and VBlanks (60 a second unless
+  presenting holds the main loop up), the GX thread's wall time in command lists (`command lists`, waits for the
+  GPU included), the UI thread's time getting the screens' images and presenting, and (Linux) each thread's CPU
+  time (`CPU ms/s`: `gx`, `guest-<entry>`, the main thread under the program's name, ...).
 - `RECOMP_REGION` / `RECOMP_LANGUAGE`: the console region (0 JPN, 1 USA, 2 EUR, ...) and language (0 JP, 1 EN, ...)
   the system settings report. The region defaults to the game's own, from its icon's region lockout.
 - `RECOMP_FS_DELAY=0`: RomFS reads return at once instead of taking as long as on a 3DS (the reading thread
