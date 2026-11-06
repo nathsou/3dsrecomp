@@ -358,7 +358,7 @@ void main() {
     const uint z = p.w == 0u ? (uint(src[o]) | (uint(src[o + 1u]) << 8))
                              : (uint(src[o]) | (uint(src[o + 1u]) << 8) | (uint(src[o + 2u]) << 16));
     dz[gid.y * W + gid.x] = float(z) * (p.w == 0u ? 1.0 / 65536.0 : 1.0 / 16777216.0);
-    dsn[gid.y * W + gid.x] = p.w == 3u ? src[o + 3u] : uint8_t(0);
+    dsn[gid.y * W + gid.x] = uint8_t(p.w == 3u ? uint(src[o + 3u]) : 0u);  // (no 8-bit arithmetic: shaderInt8)
 }
 )";
 

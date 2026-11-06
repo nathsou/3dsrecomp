@@ -122,7 +122,8 @@ the Metal backend's design: see [Graphics options](#graphics-options)); text is 
 font through Fontconfig, FreeType and HarfBuzz; cloud saves use libcurl; AAC music FFmpeg's decoder.
 
 - `GPU_DEVICE=<index or part of the name>` picks the GPU (default: the first discrete one); `GPU_VALIDATE=1` turns on
-  the Vulkan validation layer, its messages in the log.
+  the Vulkan validation layer, its messages in the log (with `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=1`, synchronisation
+  validation too).
 - On Wayland, separate windows' positions are not restored (Wayland lets no application place its windows);
   `SDL_VIDEO_DRIVER=x11` runs through XWayland. A window the compositor does not show gets presents without vsync
   until it shows again, so the game keeps its pace.

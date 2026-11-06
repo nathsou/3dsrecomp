@@ -2031,6 +2031,7 @@ bool init_device() {
     e13.dynamicRendering = VK_TRUE;
     e13.synchronization2 = VK_TRUE;
     e13.maintenance4 = f13.maintenance4;
+    e13.shaderDemoteToHelperInvocation = f13.shaderDemoteToHelperInvocation;  // (glslang compiles discard to it for 1.3)
     e12.timelineSemaphore = VK_TRUE;
     e12.storageBuffer8BitAccess = VK_TRUE;
     e12.uniformAndStorageBuffer8BitAccess = f12.uniformAndStorageBuffer8BitAccess;
