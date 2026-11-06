@@ -5,7 +5,7 @@ ROOT := ../..
 ifeq ($(origin CXX),default)
 CXX := clang++
 endif
-CXXFLAGS ?= -std=c++20 -O2 -g -Wall -Wno-unused-function -Wno-unused-variable -I$(ROOT)/runtime -I. -DRECOMP_SOURCE_DIR=\"$(abspath $(ROOT))\"
+CXXFLAGS ?= -std=c++20 -O2 -g -Wall -Wno-unused-function -Wno-unused-variable -I$(ROOT)/runtime -I$(ROOT)/third_party -I. -DRECOMP_SOURCE_DIR=\"$(abspath $(ROOT))\"
 GPU_SRC := $(wildcard $(ROOT)/runtime/gpu/*.cpp)
 ifeq ($(shell uname),Darwin)
 LDFLAGS ?= -lpthread -framework Metal -framework Foundation
@@ -14,7 +14,6 @@ GPU_SRC := $(filter-out $(wildcard $(ROOT)/runtime/gpu/vulkan*.cpp $(ROOT)/runti
 else
 # the Vulkan backend (runtime/gpu/vulkan.cpp) with shaderc
 LDFLAGS ?= -lpthread -ldl $(shell pkg-config --libs vulkan shaderc 2>/dev/null)
-CXXFLAGS += -I$(ROOT)/third_party
 ifeq ($(wildcard /usr/include/vulkan/vulkan.h),)
 CXXFLAGS += -I$(ROOT)/external/Vulkan-Headers/include  # (until the system's vulkan-headers are installed)
 endif

@@ -1,10 +1,14 @@
 // PICA200 command processing, register side effects, thread pool and shared helpers.
+#include <pthread.h>
+
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 
 #include "gpu/pica.h"
+#define XXH_INLINE_ALL
+#include "xxhash/xxhash.h"
 
 namespace gpu {
 
@@ -70,6 +74,23 @@ u64 hash_bytes(const u8 *p, size_t n) {
     h *= k2;
     h ^= h >> 29;
     return h;
+}
+
+u64 hash_mem(const u8 *p, size_t n) { return XXH3_64bits(p, n); }
+
+u64 copy_hash(u8 *dst, const u8 *src, size_t n) {
+    if (n <= 16384) {
+        memcpy(dst, src, n);
+        return XXH3_64bits(dst, n);
+    }
+    XXH3_state_t st;
+    XXH3_64bits_reset(&st);
+    for (size_t i = 0; i < n; i += 16384) {  // (each chunk hashed while it is still in L1)
+        const size_t c = n - i < 16384 ? n - i : 16384;
+        memcpy(dst + i, src + i, c);
+        XXH3_64bits_update(&st, dst + i, c);
+    }
+    return XXH3_64bits_digest(&st);
 }
 
 static inline u32 c5to8(u32 v) { return (v << 3) | (v >> 2); }
@@ -157,6 +178,11 @@ inline void run_items(u32 gen, u32 tid) {
 }
 
 void worker_main(u32 tid) {
+#ifdef __APPLE__
+    pthread_setname_np("gpu-pool");
+#else
+    pthread_setname_np(pthread_self(), "gpu-pool");
+#endif
     u32 seen = 0;
     for (;;) {
         u32 gen;
@@ -385,7 +411,7 @@ void handle_special(u32 id, u32 value) {
         u32 index = cfg & 0xff, type = (cfg >> 8) & 0x1f;
         if (type < 24 && g.light_lut[type][index] != value) {
             g.light_lut[type][index] = value;
-            g.light_lut_dirty = true;
+            g.light_lut_dirty |= 1u << type;
         }
         cfg = (cfg & ~0xffu) | ((index + 1) & 0xff);
         return;
@@ -532,7 +558,8 @@ void init() {
     g.regs[R::IRQ_MASK] = 0xFFFFFFF0;
     g.regs[R::IRQ_CMP] = 0x12345678;
     g.regs[R::GS + R::SH_INPUT_CFG] = 1 | (0xA0u << 24);
-    g.light_lut_dirty = g.fog_lut_dirty = g.pt_dirty = true;
+    g.light_lut_dirty = ~0u;
+    g.fog_lut_dirty = g.pt_dirty = true;
     g.imm_reset_gs = true;
     g.regs_version = 1;
     init_special();
@@ -639,7 +666,8 @@ bool load_state(const char *path) {
         state_fields([&](void *p, size_t n) { ok &= fread(p, 1, n, fp) == n; });
         g.vs.dirty = g.gs.dirty = true;
         g.vs.prog = g.gs.prog = nullptr;
-        g.light_lut_dirty = g.fog_lut_dirty = g.pt_dirty = true;
+        g.light_lut_dirty = ~0u;
+        g.fog_lut_dirty = g.pt_dirty = true;
         g.regs_version++;
         g.ds_version = 0;
     }

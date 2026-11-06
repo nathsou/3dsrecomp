@@ -40,6 +40,8 @@ void open_folder(const std::string &path);
 std::string device_name();
 // the calling thread serves the player directly (GPU commands, input, audio): scheduled ahead of others
 void set_thread_interactive();
+// names the calling thread for debuggers, profilers and top (at most 15 characters are kept)
+void set_thread_name(const char *name);
 // Sampling another thread's stack (thread dumps show the guest functions a thread is in): a handle for the thread
 // (0: none), whether it is the calling one, and the return addresses on its stack, innermost first (pc first)
 uint64_t thread_handle(pthread_t t);

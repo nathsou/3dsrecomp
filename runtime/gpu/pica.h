@@ -367,7 +367,8 @@ struct GpuState {
     u32 light_lut[24][256];
     u32 fog_lut[128];
     u32 pt_noise[128], pt_cmap[128], pt_amap[128], pt_color[256], pt_cdiff[256];
-    bool light_lut_dirty, fog_lut_dirty, pt_dirty;
+    u32 light_lut_dirty;  // a bit per light LUT changed since its snapshot was made
+    bool fog_lut_dirty, pt_dirty;
     std::shared_ptr<const LightLuts> light_luts;
     std::shared_ptr<const FogLut> fog_luts;
     std::shared_ptr<const ProcTexLuts> pt_luts;
@@ -442,8 +443,18 @@ struct MSeg {
     const DrawState *ds;
     u32 first, count;  // in MBatch::idx (three per triangle)
 };
+// a std::allocator whose resize() leaves new elements uninitialised (buffers filled right after)
+template <class T> struct NoInitAlloc : std::allocator<T> {
+    template <class U> struct rebind {
+        using other = NoInitAlloc<U>;
+    };
+    NoInitAlloc() = default;
+    template <class U> NoInitAlloc(const NoInitAlloc<U> &) {}
+    template <class U> void construct(U *p) noexcept { ::new ((void *)p) U; }
+    template <class U, class... A> void construct(U *p, A &&...a) { ::new ((void *)p) U(std::forward<A>(a)...); }
+};
 struct MBatch {
-    std::vector<u8> vdata;  // copied vertex arrays
+    std::vector<u8, NoInitAlloc<u8>> vdata;  // copied vertex arrays
     std::vector<u32> vids;
     std::vector<GpuVsJob> jobs;
     u32 gpu_verts = 0;
@@ -518,8 +529,7 @@ struct HwBackend {
     void (*note_gpu_output)(u32 paddr, u32 size);
     // the frontend's side (gpu_iface.h, gpu.h), from other threads
     bool (*get_display_image_for)(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h);
-    u64 (*use_display_image)(u32 fb_paddr, u32 stride, u32 lines, u64 have,
-                             const std::function<void(const u32 *, int, int)> &fn);
+    u64 (*use_display_image)(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::function<void(const ScreenImage &)> &fn);
     bool (*get_display_image)(int screen, const u32 **rgba, int *w, int *h);
     void (*set_scale)(int s);
     int (*scale)();
@@ -532,7 +542,14 @@ struct HwBackend {
     void (*set_key_black_bottom)(bool on);
     // build step: precompile the shaders of pipeline lists (may be null)
     int (*emit_shaders)(int argc, char **argv);
+    // presenting on the backend's device (gpu_iface.h; null: not supported)
+    bool (*present_device)(PresentDevice *pd);
+    u64 (*present_image_create)(int w, int h);
+    void (*present_image_destroy)(u64 image);
+    void (*present_hold)(bool on);
 };
+// set_present_extensions' list (for the backend's init)
+const std::vector<std::string> &present_extensions();
 const HwBackend *metal_backend();   // metal.mm (Apple)
 const HwBackend *vulkan_backend();  // vulkan.cpp (RECOMP_VULKAN)
 extern const HwBackend *g_hw;       // the active backend (null: the software renderer)
@@ -633,6 +650,11 @@ inline u32 cbuf_to_pixfmt(u32 cf) {
 }
 
 u64 hash_bytes(const u8 *p, size_t n);
+// Whether memory changed (XXH3: twice as fast as hash_bytes; its values are never stored, so it may change, unlike
+// hash_bytes, whose values key files in the shader caches). copy_hash copies n bytes and returns hash_mem(dst, n)
+// without a second pass over dst.
+u64 hash_mem(const u8 *p, size_t n);
+u64 copy_hash(u8 *dst, const u8 *src, size_t n);
 
 // timing statistics (GPU_STATS=1)
 extern bool g_stats, g_trace;

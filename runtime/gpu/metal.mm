@@ -3009,19 +3009,11 @@ bool wait_for_view(u32 fb, u32 stride, u32 lines) {
     if (cb) [cb waitUntilCompleted];
     return true;
 }
-// calls fn with the view's pixels (rows of v.w), copied out of the image only when it is a part of it
-// (px: the image's pixels, rows of dw, dh rows)
-void view_pixels(const u32 *px, u32 dw, u32 dh, const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
-    if (v.x0 == 0 && v.y0 == 0 && v.w == dw && v.h == dh) {
-        fn(px, (int)v.w, (int)v.h);
-        return;
-    }
-    thread_local std::vector<u32> part;
-    part.resize((size_t)v.w * v.h);
-    for (u32 y = 0; y < v.h; y++) memcpy(&part[(size_t)y * v.w], px + (size_t)(v.y0 + y) * dw + v.x0, v.w * 4);
-    fn(part.data(), (int)v.w, (int)v.h);
+// calls fn with the view's pixels, in place (px: the image's pixels, rows of dw)
+void view_pixels(const u32 *px, u32 dw, u32 dh, const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+    fn(ScreenImage{px + (size_t)v.y0 * dw + v.x0, (int)v.w, (int)v.h, (int)dw, {}});
 }
-void with_view(const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
+void with_view(const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
     if (v.d->cb) [v.d->cb waitUntilCompleted];
     view_pixels((const u32 *)v.d->buf.contents, v.d->w, v.d->h, v, fn);
 }
@@ -3033,17 +3025,17 @@ bool metal_get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 
     std::lock_guard<std::mutex> lk(disp_mtx);
     DisplayView v;
     if (!find_view(fb_paddr, stride, lines, v)) return false;
-    with_view(v, [&](const u32 *px, int vw, int vh) {
-        out.assign(px, px + (size_t)vw * vh);
-        *w = vw;
-        *h = vh;
+    with_view(v, [&](const ScreenImage &si) {
+        out.resize((size_t)si.w * si.h);
+        for (int y = 0; y < si.h; y++) memcpy(&out[(size_t)y * si.w], si.px + (size_t)y * si.pitch, (size_t)si.w * 4);
+        *w = si.w;
+        *h = si.h;
     });
     *rgba = out.data();
     return true;
 }
 
-u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
-                      const std::function<void(const u32 *, int, int)> &fn) {
+u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::function<void(const ScreenImage &)> &fn) {
     if (!wait_for_view(fb_paddr, stride, lines)) return 0;
     // fn (an upload to the UI's texture: slow for a large image) runs without disp_mtx held, the buffer kept from
     // being reused meanwhile

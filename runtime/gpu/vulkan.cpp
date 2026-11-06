@@ -24,6 +24,8 @@
 
 #include <shaderc/shaderc.h>
 
+#include <pthread.h>
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -56,6 +58,12 @@ VkPhysicalDevice phys;
 VkDevice dev;
 VkQueue queue;
 u32 qfam = 0;
+// Presenting on this device (gpu_iface.h's present_device): SDL's Vulkan renderer submits to queue 0 of qfam from
+// the UI thread, our work then goes to queue 1. queue_mtx: around our submissions (present_hold keeps them back
+// while SDL waits for the whole device).
+bool present_ok = false;
+VkQueue sdl_queue = VK_NULL_HANDLE;
+std::mutex &queue_mtx = *new std::mutex;
 VmaAllocator vma;
 VkPhysicalDeviceProperties props;
 PFN_vkCmdPushDescriptorSetKHR vkPushDescriptors;
@@ -299,7 +307,10 @@ u64 submit() {
     si.pCommandBufferInfos = &cbi;
     si.signalSemaphoreInfoCount = 1;
     si.pSignalSemaphoreInfos = &sig;
-    VK_CHECK(vkQueueSubmit2(queue, 1, &si, VK_NULL_HANDLE));
+    {
+        std::lock_guard<std::mutex> lk(queue_mtx);
+        VK_CHECK(vkQueueSubmit2(queue, 1, &si, VK_NULL_HANDLE));
+    }
     tl_submitted = v;
     cur->value = v;
     inflight.push_back(cur);
@@ -873,7 +884,7 @@ LoadAction sync_rt(GRT &r) {
     if (!p) return la;
     const u64 frame = g_frame.load(std::memory_order_relaxed);
     if (r.synced && r.checked == frame) return la;
-    const u64 hv = hash_bytes(p, rt_bytes(r));
+    const u64 hv = hash_mem(p, rt_bytes(r));
     r.checked = frame;
     if (r.synced && hv == r.hash) return la;
     if (r.own) {
@@ -922,7 +933,7 @@ LoadAction sync_rt(GRT &r) {
 }
 
 bool guest_kept(GRT &r) {
-    if (hash_bytes(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
+    if (hash_mem(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
     static int logged;
     if (logged < 8 || g_stats) {
         logged++;
@@ -943,8 +954,7 @@ void write_back_color(GRT &r) {
     encode_guest_color(cb, r, *stage_color);
     wait_value(submit(), "colour write-back", r.addr);
     stage_color->invalidate();
-    memcpy(pptr(r.addr), stage_color->p, rt_bytes(r));
-    r.hash = hash_bytes(pptr(r.addr), rt_bytes(r));
+    r.hash = copy_hash(pptr(r.addr), stage_color->p, rt_bytes(r));
     r.checked = g_frame.load(std::memory_order_relaxed);
     r.synced = true;
     r.gpu_newer = false;
@@ -972,9 +982,8 @@ void write_back_depth(GRT &r) {
     dispatch(cb, K_ENC_DEPTH, {kb(0, *stage_depth), kb(1, *stage_stencil), kb(2, *stage_dbytes)}, prm, nullptr, r.w, r.h);
     wait_value(submit(), "depth write-back", r.addr);
     stage_dbytes->invalidate();
-    memcpy(p, stage_dbytes->p, rt_bytes(r));
     r.gpu_newer = false;
-    r.hash = hash_bytes(p, rt_bytes(r));
+    r.hash = copy_hash(p, stage_dbytes->p, rt_bytes(r));
     r.checked = g_frame.load(std::memory_order_relaxed);
     r.synced = true;
 }
@@ -1018,10 +1027,10 @@ struct GpuOut {
 std::deque<GpuOut> gpu_outs;
 bool gpu_made(u32 addr, u32 size) {
     for (auto &r : rts)
-        if (overlaps(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_bytes(pptr(r->addr), rt_bytes(*r)) == r->hash))
+        if (overlaps(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_mem(pptr(r->addr), rt_bytes(*r)) == r->hash))
             return true;
     for (const GpuOut &g : gpu_outs)
-        if (overlaps(g.addr, g.size, addr, size) && hash_bytes(pptr(g.addr), g.size) == g.hash) return true;
+        if (overlaps(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
     return false;
 }
 void note_gpu_out(u32 addr, u32 size) {
@@ -1031,7 +1040,7 @@ void note_gpu_out(u32 addr, u32 size) {
             gpu_outs.erase(it);
             break;
         }
-    gpu_outs.push_back({addr, size, hash_bytes(pptr(addr), size)});
+    gpu_outs.push_back({addr, size, hash_mem(pptr(addr), size)});
     if (gpu_outs.size() > 64) gpu_outs.pop_front();
 }
 
@@ -1367,7 +1376,16 @@ VkPipeline build_pipeline(const DrawState &ds) {
     return p;
 }
 
+// (as platform::set_thread_name, which the gpu_test tools do not link)
+void name_thread(const char *n) {
+#ifdef __APPLE__
+    pthread_setname_np(n);
+#else
+    pthread_setname_np(pthread_self(), n);
+#endif
+}
 void pipe_worker() {
+    name_thread("vk-pipelines");
     std::unique_lock<std::mutex> lk(pipe_mtx);
     for (;;) {
         pipe_cv.wait(lk, [] { return !pipe_queue.empty(); });
@@ -1446,6 +1464,7 @@ std::mutex &vs_queue_mtx = *new std::mutex;
 std::condition_variable &vs_queue_cv = *new std::condition_variable;
 std::deque<std::pair<VsKern *, std::string>> &vs_queue = *new std::deque<std::pair<VsKern *, std::string>>;
 void vs_worker() {
+    name_thread("vk-vertex-progs");
     std::unique_lock<std::mutex> lk(vs_queue_mtx);
     for (;;) {
         vs_queue_cv.wait(lk, [] { return !vs_queue.empty(); });
@@ -1685,12 +1704,11 @@ void finalize(PendingXfer &op) {
     const u32 nb = rt_bytes(r);
     if (op.rt_writeback && guest_kept(r)) {
         op.gbytes->invalidate();
-        memcpy(pptr(r.addr), op.gbytes->p, nb);
-        r.hash = hash_bytes(pptr(r.addr), nb);
+        r.hash = copy_hash(pptr(r.addr), op.gbytes->p, nb);
         r.checked = g_frame.load(std::memory_order_relaxed);
     }
     op.obytes->invalidate();
-    memcpy(pptr(op.out_paddr), op.obytes->p, op.out_size);
+    const u64 out_hash = copy_hash(pptr(op.out_paddr), op.obytes->p, op.out_size);
     texcache_invalidate(op.out_paddr, op.out_size);
     rts_overwritten(op.out_paddr, op.out_size);
     if (tf_mode) note_gpu_out(op.out_paddr, op.out_size);
@@ -1700,7 +1718,7 @@ void finalize(PendingXfer &op) {
     auto it = displays.find(op.out_paddr);
     if (it != displays.end() && it->second.tl == op.tl && it->second.buf == op.disp) {
         DisplayImage &d = it->second;
-        d.out_hash = hash_bytes(pptr(d.out_addr), d.out_size);
+        d.out_hash = out_hash;  // (d.out_addr, d.out_size are the transfer's output)
         d.tl = 0;
     } else if (recyclable(op.disp)) {
         disp_free.push_back(std::move(op.disp));
@@ -1933,6 +1951,12 @@ bool init_device() {
     std::vector<VkExtensionProperties> iep(ni);
     vkEnumerateInstanceExtensionProperties(nullptr, &ni, iep.data());
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
+    // the window system's surface extensions (set_present_extensions), for presenting on this device
+    bool present_inst = !present_extensions().empty() && !getenv("GPU_PRESENT_CPU");
+    for (const std::string &e : present_extensions()) present_inst = present_inst && has_ext(iep, e.c_str());
+    if (present_inst)
+        for (const std::string &e : present_extensions())
+            if (std::find_if(iexts.begin(), iexts.end(), [&](const char *x) { return e == x; }) == iexts.end()) iexts.push_back(e.c_str());
     if (has_ext(iep, VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME)) {  // (MoltenVK)
         iexts.push_back(VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME);
         ici.flags |= VK_INSTANCE_CREATE_ENUMERATE_PORTABILITY_BIT_KHR;
@@ -2050,11 +2074,14 @@ bool init_device() {
         elr.dynamicRenderingLocalRead = VK_TRUE;
         e13.pNext = &elr;
     }
-    const float prio = 1.0f;
+    // a second queue for SDL's renderer when presenting on this device
+    present_ok = present_inst && qf[qfam].queueCount >= 2 && has_ext(dep, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    if (present_ok) dexts.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+    const float prio[2] = {1.0f, 1.0f};
     VkDeviceQueueCreateInfo qci{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     qci.queueFamilyIndex = qfam;
-    qci.queueCount = 1;
-    qci.pQueuePriorities = &prio;
+    qci.queueCount = present_ok ? 2 : 1;
+    qci.pQueuePriorities = prio;
     VkDeviceCreateInfo dci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
     dci.pNext = &e2;
     dci.queueCreateInfoCount = 1;
@@ -2065,7 +2092,8 @@ bool init_device() {
         LOG("gpu vulkan: cannot create a device on %s, using the software renderer\n", props.deviceName);
         return false;
     }
-    vkGetDeviceQueue(dev, qfam, 0, &queue);
+    vkGetDeviceQueue(dev, qfam, present_ok ? 1 : 0, &queue);
+    if (present_ok) vkGetDeviceQueue(dev, qfam, 0, &sdl_queue);
     vkPushDescriptors = (PFN_vkCmdPushDescriptorSetKHR)vkGetDeviceProcAddr(dev, "vkCmdPushDescriptorSetKHR");
     // depth / stencil format
     VkFormatProperties fp;
@@ -2988,7 +3016,7 @@ void vk_guest_written(u32 paddr, u32 size, bool definite) {
     if (!active) return;
     for (auto &r : rts)
         if (overlaps(r->addr, rt_bytes(*r), paddr, size)) {
-            if (definite || !r->synced || hash_bytes(pptr(r->addr), rt_bytes(*r)) != r->hash) r->synced = false;
+            if (definite || !r->synced || hash_mem(pptr(r->addr), rt_bytes(*r)) != r->hash) r->synced = false;
         }
     drop_displays(paddr, size, definite);
 }
@@ -2999,7 +3027,7 @@ void drop_displays(u32 paddr, u32 size, bool definite) {
     for (auto it = displays.begin(); it != displays.end();) {
         DisplayImage &d = it->second;
         if (overlaps(d.out_addr, d.out_size, paddr, size) &&
-            (definite || ((!d.tl || d.direct) && hash_bytes(pptr(d.out_addr), d.out_size) != d.out_hash))) {
+            (definite || ((!d.tl || d.direct) && hash_mem(pptr(d.out_addr), d.out_size) != d.out_hash))) {
             if (g_stats)
                 LOG("gpu vulkan: display image %08x dropped (%s write %08x+%x)\n", d.out_addr, definite ? "GPU" : "CPU",
                     paddr, size);
@@ -3070,11 +3098,20 @@ bool vk_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u
     if (!active || eager_writeback || (flags & 2)) return false;
     u32 row0 = 0;
     GRT *src = transfer_source(in_paddr, in_dims, out_dims, row0);
-    if (!src || !src->gpu_newer || overlaps(src->addr, rt_bytes(*src), out_paddr, out_size)) return false;
+    if (!src || overlaps(src->addr, rt_bytes(*src), out_paddr, out_size)) return false;
+    bool writing_back = false;  // a pending transfer writes the target back already
     for (auto &op : pending)
-        if (op->rt_writeback && op->rt == src) return false;
+        if (op->rt_writeback && op->rt == src) writing_back = true;
+    // Drawn into since its last write-back: this transfer writes it back (after an earlier pending one: they land
+    // in order; vk_flush keeps a target's own write-backs pending while it is drawn into). Otherwise its GPU copy is
+    // what guest memory holds once that pending write-back lands, or holds already (its hash unchanged): a second
+    // transfer from it is made on the GPU too, without waiting for the first one or converting on the CPU.
+    const bool writeback = src->gpu_newer;
+    if (!writeback && (src->clear_next || (!writing_back && (!src->synced || hash_mem(pptr(src->addr), rt_bytes(*src)) != src->hash))))
+        return false;  // (clear_next: cleared to transparent since; guest memory keeps the picture)
     vk_guest_prewrite(out_paddr, out_size);
     auto op = std::make_unique<PendingXfer>();
+    op->rt_writeback = writeback;
     const u32 TW = src->w * S, rows = (out_dims >> 16) * S;
     VkCommandBuffer cb = new_cb();
     if (src->clear_next) clear_now(*src);
@@ -3198,7 +3235,7 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
         if (g_stats) LOG("gpu vulkan: transfer %08x -> %08x: no matching render target, no display image\n", in_paddr, out_paddr);
         return;
     }
-    if (hash_bytes(pptr(src->addr), rt_bytes(*src)) != src->hash) {
+    if (hash_mem(pptr(src->addr), rt_bytes(*src)) != src->hash) {
         if (g_stats) LOG("gpu vulkan: transfer %08x -> %08x: target changed in guest memory, no display image\n", in_paddr, out_paddr);
         return;
     }
@@ -3218,7 +3255,7 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
     const u32 out_size = (out_w0 >> hs) * (out_h0 >> vs) * pixel_bytes((flags >> 12) & 7);
     std::lock_guard<std::mutex> lk(disp_mtx);
     DisplayImage &d = new_display(out_paddr, out_size, out_dims, flags, rows, TW);
-    d.out_hash = hash_bytes(pptr(out_paddr), out_size);
+    d.out_hash = hash_mem(pptr(out_paddr), out_size);
     d.tl = tl;
     d.direct = true;
     d.buf = buf;
@@ -3267,17 +3304,167 @@ bool wait_for_view(u32 fb, u32 stride, u32 lines) {
     wait_value(tl);
     return true;
 }
-void view_pixels(const u32 *px, u32 dw, u32 dh, const DisplayView &v, const std::function<void(const u32 *, int, int)> &fn) {
-    if (v.x0 == 0 && v.y0 == 0 && v.w == dw && v.h == dh) {
-        fn(px, (int)v.w, (int)v.h);
-        return;
+
+// ---------------------------------------------------------------- presenting on this device (gpu_iface.h)
+// SDL's renderer draws present images (made here, kept in SHADER_READ_ONLY_OPTIMAL); a new screen image is copied
+// into one on the GPU, on SDL's queue from the UI thread (SDL's thread), after the GX work that made it. The copy is
+// waited for, so that the display buffer can be reused once use_display_image returns.
+struct PresentImage {
+    VkImage img = VK_NULL_HANDLE;
+    VmaAllocation a = nullptr;
+    int w = 0, h = 0;
+};
+std::mutex present_mtx;
+std::unordered_map<u64, PresentImage> present_images;
+VkCommandPool ui_pool = VK_NULL_HANDLE;  // (UI thread)
+VkCommandBuffer ui_cb = VK_NULL_HANDLE;
+VkFence ui_fence = VK_NULL_HANDLE;
+
+VkCommandBuffer ui_begin() {
+    if (!ui_pool) {
+        VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        pci.queueFamilyIndex = qfam;
+        VK_CHECK(vkCreateCommandPool(dev, &pci, nullptr, &ui_pool));
+        VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        ai.commandPool = ui_pool;
+        ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        ai.commandBufferCount = 1;
+        VK_CHECK(vkAllocateCommandBuffers(dev, &ai, &ui_cb));
+        VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        VK_CHECK(vkCreateFence(dev, &fci, nullptr, &ui_fence));
     }
-    thread_local std::vector<u32> part;
-    part.resize((size_t)v.w * v.h);
-    for (u32 y = 0; y < v.h; y++) memcpy(&part[(size_t)y * v.w], px + (size_t)(v.y0 + y) * dw + v.x0, v.w * 4);
-    fn(part.data(), (int)v.w, (int)v.h);
+    VK_CHECK(vkResetCommandBuffer(ui_cb, 0));
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    VK_CHECK(vkBeginCommandBuffer(ui_cb, &bi));
+    return ui_cb;
+}
+// submits ui_cb on SDL's queue, after GX timeline value wait_tl (0: none), and waits for it
+void ui_submit_wait(u64 wait_tl) {
+    VK_CHECK(vkEndCommandBuffer(ui_cb));
+    VkSemaphoreSubmitInfo wt{VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO};
+    wt.semaphore = timeline;
+    wt.value = wait_tl;
+    wt.stageMask = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT;
+    VkCommandBufferSubmitInfo cbi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO};
+    cbi.commandBuffer = ui_cb;
+    VkSubmitInfo2 si{VK_STRUCTURE_TYPE_SUBMIT_INFO_2};
+    si.waitSemaphoreInfoCount = wait_tl ? 1 : 0;
+    si.pWaitSemaphoreInfos = &wt;
+    si.commandBufferInfoCount = 1;
+    si.pCommandBufferInfos = &cbi;
+    VK_CHECK(vkQueueSubmit2(sdl_queue, 1, &si, ui_fence));
+    VK_CHECK(vkWaitForFences(dev, 1, &ui_fence, VK_TRUE, UINT64_MAX));
+    VK_CHECK(vkResetFences(dev, 1, &ui_fence));
+}
+void image_barrier(VkCommandBuffer cb, VkImage img, VkImageLayout from, VkImageLayout to, VkPipelineStageFlags2 ss,
+                   VkAccessFlags2 sa, VkPipelineStageFlags2 ds, VkAccessFlags2 da) {
+    VkImageMemoryBarrier2 b{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2};
+    b.srcStageMask = ss;
+    b.srcAccessMask = sa;
+    b.dstStageMask = ds;
+    b.dstAccessMask = da;
+    b.oldLayout = from;
+    b.newLayout = to;
+    b.srcQueueFamilyIndex = b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.image = img;
+    b.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    VkDependencyInfo di{VK_STRUCTURE_TYPE_DEPENDENCY_INFO};
+    di.imageMemoryBarrierCount = 1;
+    di.pImageMemoryBarriers = &b;
+    vkCmdPipelineBarrier2(cb, &di);
+}
+// copies the view of a display buffer (rows of dw pixels) into a present image of its size
+bool copy_view(const Buf &buf, u32 dw, const DisplayView &v, u64 tl, u64 image) {
+    PresentImage pi;
+    {
+        std::lock_guard<std::mutex> lk(present_mtx);
+        auto it = present_images.find(image);
+        if (it == present_images.end()) return false;
+        pi = it->second;
+    }
+    if (pi.w != (int)v.w || pi.h != (int)v.h) return false;
+    VkCommandBuffer cb = ui_begin();
+    image_barrier(cb, pi.img, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT, VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_COPY_BIT,
+                  VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    VkBufferImageCopy c{};
+    c.bufferOffset = ((VkDeviceSize)v.y0 * dw + v.x0) * 4;
+    c.bufferRowLength = dw;
+    c.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.imageExtent = {v.w, v.h, 1};
+    vkCmdCopyBufferToImage(cb, buf.b, pi.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &c);
+    image_barrier(cb, pi.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    ui_submit_wait(tl);
+    return true;
+}
+// fn's ScreenImage for a view of a display buffer (copy_to only when presenting on this device)
+void view_pixels(const BufP &buf, u32 dw, u64 tl, const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+    ScreenImage si{(const u32 *)buf->p + (size_t)v.y0 * dw + v.x0, (int)v.w, (int)v.h, (int)dw, {}};
+    if (present_ok) si.copy_to = [&](u64 image) { return copy_view(*buf, dw, v, tl, image); };
+    fn(si);
 }
 }  // namespace
+
+bool vk_present_device(PresentDevice *pd) {
+    if (!active || !present_ok) return false;
+    pd->instance = inst;
+    pd->physical_device = phys;
+    pd->device = dev;
+    pd->queue_family = qfam;
+    return true;
+}
+u64 vk_present_image_create(int w, int h) {
+    if (!present_ok || w <= 0 || h <= 0) return 0;
+    PresentImage pi;
+    pi.w = w;
+    pi.h = h;
+    VkImageCreateInfo ci{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+    ci.imageType = VK_IMAGE_TYPE_2D;
+    ci.format = VK_FORMAT_R8G8B8A8_UNORM;
+    ci.extent = {(u32)w, (u32)h, 1};
+    ci.mipLevels = 1;
+    ci.arrayLayers = 1;
+    ci.samples = VK_SAMPLE_COUNT_1_BIT;
+    ci.tiling = VK_IMAGE_TILING_OPTIMAL;
+    ci.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;  // (as SDL's own)
+    ci.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VmaAllocationCreateInfo ai{};
+    ai.usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE;
+    if (vmaCreateImage(vma, &ci, &ai, &pi.img, &pi.a, nullptr) != VK_SUCCESS) return 0;
+    VkCommandBuffer cb = ui_begin();  // (cleared: shown before the first copy, e.g. while pipelines compile)
+    image_barrier(cb, pi.img, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_PIPELINE_STAGE_2_NONE,
+                  VK_ACCESS_2_NONE, VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+    const VkClearColorValue black{};
+    const VkImageSubresourceRange all{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+    vkCmdClearColorImage(cb, pi.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &black, 1, &all);
+    image_barrier(cb, pi.img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_CLEAR_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT,
+                  VK_ACCESS_2_SHADER_SAMPLED_READ_BIT);
+    ui_submit_wait(0);
+    std::lock_guard<std::mutex> lk(present_mtx);
+    present_images[(u64)pi.img] = pi;
+    return (u64)pi.img;
+}
+void vk_present_image_destroy(u64 image) {
+    PresentImage pi;
+    {
+        std::lock_guard<std::mutex> lk(present_mtx);
+        auto it = present_images.find(image);
+        if (it == present_images.end()) return;
+        pi = it->second;
+        present_images.erase(it);
+    }
+    vkQueueWaitIdle(sdl_queue);  // (the renderer's frames that drew it; called on its thread)
+    vmaDestroyImage(vma, pi.img, pi.a);
+}
+void vk_present_hold(bool on) {
+    if (on) queue_mtx.lock();
+    else queue_mtx.unlock();
+}
 
 bool vk_get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h) {
     thread_local std::vector<u32> out;
@@ -3287,20 +3474,21 @@ bool vk_get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **r
     if (!find_disp_view(fb_paddr, stride, lines, v)) return false;
     wait_value(v.d->tl);
     v.d->buf->invalidate();
-    view_pixels((const u32 *)v.d->buf->p, v.d->w, v.d->h, v, [&](const u32 *px, int vw, int vh) {
-        out.assign(px, px + (size_t)vw * vh);
-        *w = vw;
-        *h = vh;
-    });
+    const u32 *px = (const u32 *)v.d->buf->p + (size_t)v.y0 * v.d->w + v.x0;
+    out.resize((size_t)v.w * v.h);
+    for (u32 y = 0; y < v.h; y++) memcpy(&out[(size_t)y * v.w], px + (size_t)y * v.d->w, (size_t)v.w * 4);
+    *w = (int)v.w;
+    *h = (int)v.h;
     *rgba = out.data();
     return true;
 }
 
-u64 vk_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::function<void(const u32 *, int, int)> &fn) {
+u64 vk_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::function<void(const ScreenImage &)> &fn) {
     if (!wait_for_view(fb_paddr, stride, lines)) return 0;
     DisplayView v;
     BufP buf;
-    u32 dw, dh;
+    u32 dw;
+    u64 tl;
     {
         std::unique_lock<std::mutex> lk(disp_mtx);
         if (!find_disp_view(fb_paddr, stride, lines, v)) return 0;
@@ -3312,14 +3500,14 @@ u64 vk_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const st
             return have;
         }
         hc = 0;
-        wait_value(v.d->tl);
+        tl = v.d->tl;
+        wait_value(tl);
         buf = v.d->buf;
         dw = v.d->w;
-        dh = v.d->h;
         disp_reading.push_back(buf.get());
     }
     buf->invalidate();
-    view_pixels((const u32 *)buf->p, dw, dh, v, fn);
+    view_pixels(buf, dw, tl, v, fn);
     std::lock_guard<std::mutex> lk(disp_mtx);
     for (size_t i = 0; i < disp_reading.size(); i++)
         if (disp_reading[i] == buf.get()) {
@@ -3371,6 +3559,10 @@ const HwBackend *vulkan_backend() {
         .set_clear_after_top_transfer = vk_set_clear_after_top_transfer,
         .set_key_black_bottom = vk_set_key_black_bottom,
         .emit_shaders = nullptr,
+        .present_device = vk_present_device,
+        .present_image_create = vk_present_image_create,
+        .present_image_destroy = vk_present_image_destroy,
+        .present_hold = vk_present_hold,
     };
     return &b;
 }

@@ -115,16 +115,25 @@ void raster_init() {
 // ---------------------------------------------------------------- LUT snapshots
 static void update_luts() {
     if (g.light_lut_dirty || !g.light_luts) {
-        auto L = std::make_shared<LightLuts>();
-        for (u32 t = 0; t < 24; t++)
+        // (a game may change one table between draws: the others are copied from the last snapshot, still used by
+        // the draws already batched)
+        const LightLuts *old = g.light_luts.get();
+        std::shared_ptr<LightLuts> L(new LightLuts);  // (not zeroed: every value is written)
+        for (u32 t = 0; t < 24; t++) {
+            if (old && !(g.light_lut_dirty >> t & 1)) {
+                memcpy(L->val[t], old->val[t], sizeof L->val[t]);
+                memcpy(L->diff[t], old->diff[t], sizeof L->diff[t]);
+                continue;
+            }
             for (u32 i = 0; i < 256; i++) {
                 u32 raw = g.light_lut[t][i];
                 L->val[t][i] = (raw & 0xfff) / 4095.0f;
                 float d = ((raw >> 12) & 0x7ff) / 2047.0f;
                 L->diff[t][i] = (raw >> 23) & 1 ? -d : d;
             }
+        }
         g.light_luts = L;
-        g.light_lut_dirty = false;
+        g.light_lut_dirty = 0;
     }
     if (g.fog_lut_dirty || !g.fog_luts) {
         auto F = std::make_shared<FogLut>();

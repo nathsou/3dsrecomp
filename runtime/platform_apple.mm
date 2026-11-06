@@ -48,6 +48,8 @@ std::string device_name() {
 
 void set_thread_interactive() { pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); }
 
+void set_thread_name(const char *name) { pthread_setname_np(name); }
+
 uint64_t thread_handle(pthread_t t) { return pthread_mach_thread_np(t); }
 
 bool is_current_thread(uint64_t handle) { return handle && pthread_mach_thread_np(pthread_self()) == handle; }

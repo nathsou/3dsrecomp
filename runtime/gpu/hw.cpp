@@ -46,9 +46,21 @@ bool hw_init() {
 bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h) {
     return g_hw && g_hw->get_display_image_for(fb_paddr, stride, lines, rgba, w, h);
 }
-u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
-                      const std::function<void(const u32 *, int, int)> &fn) {
+u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::function<void(const ScreenImage &)> &fn) {
     return g_hw ? g_hw->use_display_image(fb_paddr, stride, lines, have, fn) : 0;
+}
+namespace {
+std::vector<std::string> present_exts;
+}
+void set_present_extensions(const std::vector<std::string> &exts) { present_exts = exts; }
+const std::vector<std::string> &present_extensions() { return present_exts; }
+bool present_device(PresentDevice *pd) { return g_hw && g_hw->present_device && g_hw->present_device(pd); }
+u64 present_image_create(int w, int h) { return g_hw && g_hw->present_image_create ? g_hw->present_image_create(w, h) : 0; }
+void present_image_destroy(u64 image) {
+    if (g_hw && g_hw->present_image_destroy && image) g_hw->present_image_destroy(image);
+}
+void present_hold(bool on) {
+    if (g_hw && g_hw->present_hold) g_hw->present_hold(on);
 }
 bool get_display_image(int screen, const u32 **rgba, int *w, int *h) {
     return g_hw && g_hw->get_display_image(screen, rgba, w, h);

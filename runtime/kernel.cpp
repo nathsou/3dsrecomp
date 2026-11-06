@@ -334,6 +334,9 @@ static void thread_exit_locked(Thread *t, Lock &lk);
 static void *thread_main(void *arg) {
     Thread *t = (Thread *)arg;
     tls_thread = t;
+    char name[16];
+    snprintf(name, sizeof name, "guest-%08x", t->entry);
+    platform::set_thread_name(name);
     {
         Lock lk(kmutex);
         t->cv.wait(lk, [&] { return running == t; });

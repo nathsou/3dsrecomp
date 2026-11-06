@@ -592,8 +592,9 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
         u32 j = i + 1, end = rs[i].end;
         while (j < nr && rs[j].start <= end + 64) end = std::max(end, rs[j++].end);
         const u32 at = (u32)mb.vdata.size();
-        mb.vdata.resize(at + ((end - rs[i].start + 3) & ~3u));
+        mb.vdata.resize(at + ((end - rs[i].start + 3) & ~3u));  // (not zeroed)
         memcpy(&mb.vdata[at], pptr(rs[i].start), end - rs[i].start);
+        memset(&mb.vdata[at] + (end - rs[i].start), 0, mb.vdata.size() - at - (end - rs[i].start));
         for (u32 k = i; k < j; k++) {
             const LoaderAttr &la = L.a[rs[k].attr];
             P.attr[rs[k].attr].offset = (s32)(at + (rs[k].start - rs[i].start)) - (s32)(la.stride * minv);

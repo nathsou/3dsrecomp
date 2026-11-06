@@ -9,6 +9,11 @@ __attribute__((weak)) void display_transfer(u32, u32, u32, u32, u32) {}
 __attribute__((weak)) void invalidate_memory(u32, u32) {}
 __attribute__((weak)) bool save_state(const char *) { return false; }
 __attribute__((weak)) bool get_display_image_for(u32, u32, u32, const u32 **, int *, int *) { return false; }
+__attribute__((weak)) void set_present_extensions(const std::vector<std::string> &) {}
+__attribute__((weak)) bool present_device(PresentDevice *) { return false; }
+__attribute__((weak)) u64 present_image_create(int, int) { return 0; }
+__attribute__((weak)) void present_image_destroy(u64) {}
+__attribute__((weak)) void present_hold(bool) {}
 __attribute__((weak)) void set_trust_invalidations(bool) {}
 __attribute__((weak)) void set_clear_after_top_transfer(bool) {}
 __attribute__((weak)) void set_key_black_bottom(bool) {}

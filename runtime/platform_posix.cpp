@@ -12,6 +12,7 @@
 #include <atomic>
 #include <cerrno>
 #include <climits>
+#include <cstdio>
 #include <ctime>
 #include <mutex>
 
@@ -42,6 +43,12 @@ std::string device_name() {
 }
 
 void set_thread_interactive() { SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH); }
+
+void set_thread_name(const char *name) {
+    char n[16];
+    snprintf(n, sizeof n, "%s", name);
+    pthread_setname_np(pthread_self(), n);
+}
 
 // ---------------------------------------------------------------- thread sampling
 // The sampled thread is sent a signal; its handler walks its own stack with the unwinder (x86-64 code keeps no

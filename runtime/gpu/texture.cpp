@@ -189,7 +189,7 @@ const TexEntry *texcache_get(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) {
     if (e.epoch == epoch && !e.stale) return &e;
     const u8 *p = pptr(addr);
     if (!p || !pptr(addr + e.size - 1)) return nullptr;
-    u64 hv = hash_bytes(p, e.size);
+    u64 hv = hash_mem(p, e.size);
     if (hv != e.hash || e.lv.empty()) {
         const double t0 = now_ms();
         for (auto &l : e.lv) total_bytes -= l.data.size() * 4;
