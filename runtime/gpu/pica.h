@@ -571,6 +571,7 @@ inline void hw_note_gpu_output(u32 paddr, u32 size) { if (g_hw) g_hw->note_gpu_o
 extern std::atomic<u64> g_frame;
 // the display transfer's pixel conversion (src/dst: first input / output byte)
 void transfer_convert(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 flags);
+void transfer_convert_ref(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 flags);  // (the generic loop, for tests)
 // deferred draws (vertex.cpp): draws are recorded and processed in parallel at batch flush
 bool vtx_jobs_pending();
 void vtx_finish_jobs();
