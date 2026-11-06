@@ -131,6 +131,9 @@ static SDL_Renderer *make_renderer(SDL_Window *w) {
             SDL_DestroyProperties(p);
             if (r) {
                 device_renderers.push_back({r, s});
+                static bool logged;
+                if (!logged) LOG("frontend: screens drawn by SDL's Vulkan renderer on the GPU's device (no read-back)\n");
+                logged = true;
                 return r;
             }
             LOG("frontend: no Vulkan renderer on the GPU's device (%s); the screens go through the CPU\n", SDL_GetError());
