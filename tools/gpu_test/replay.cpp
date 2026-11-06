@@ -57,7 +57,7 @@ static void write_fb(const std::string &path, u32 paddr, u32 width, u32 height, 
     fprintf(stderr, "wrote %s (%ux%u)\n", path.c_str(), height, width);
 }
 
-// the Metal backend's high-resolution image of a framebuffer, if it has one
+// the GPU backend's high-resolution image of a framebuffer (lines: its height, 400 or 320), if it has one
 static void write_hires(const std::string &path, u32 fb_paddr, u32 stride = 0, u32 lines = 0) {
     const u32 *px;
     int w, h;
@@ -70,7 +70,10 @@ static void write_hires(const std::string &path, u32 fb_paddr, u32 stride = 0, u
 
 int main(int argc, char **argv) {
     if (argc < 3) {
-        fprintf(stderr, "usage: gpu_replay <dumpdir> <out.png> [-t] [-r n] [--trust] [--inval] [-p presets] [-f addr w h]\n");
+        fprintf(stderr, "usage: gpu_replay <dumpdir> <out.png> [-t] [-r n] [--trust] [--inval] [-p presets] [-f addr w h]\n"
+                        "                  [--scribble <iteration> <paddr> <bytes>]...\n"
+                        "  --scribble: before that iteration (1 to n), the bytes at paddr are changed (xor 0xa5): a texture the\n"
+                        "  game rewrites, for the texture filter's partial updates\n");
         return 1;
     }
     const std::string dir = argv[1], out = argv[2];
@@ -79,6 +82,11 @@ int main(int argc, char **argv) {
     int repeat = 1;
     std::string preset;
     u32 final_addr = 0, final_w = 0, final_h = 0;
+    struct Scribble {
+        int it;
+        u32 paddr, n;
+    };
+    std::vector<Scribble> scribbles;
     for (int i = 3; i < argc; i++) {
         std::string a = argv[i];
         if (a == "-t") dump_transfers = true;
@@ -86,6 +94,10 @@ int main(int argc, char **argv) {
         if (a == "--trust") gpu::set_trust_invalidations(true);
         if (a == "-r" && i + 1 < argc) repeat = atoi(argv[++i]);
         if (a == "-p" && i + 1 < argc) preset = argv[++i];
+        if (a == "--scribble" && i + 3 < argc) {
+            scribbles.push_back({atoi(argv[i + 1]), (u32)strtoul(argv[i + 2], nullptr, 16), (u32)strtoul(argv[i + 3], nullptr, 0)});
+            i += 3;
+        }
         if (a == "-f" && i + 3 < argc) {
             final_addr = strtoul(argv[i + 1], nullptr, 16);
             final_w = atoi(argv[i + 2]);
@@ -134,8 +146,15 @@ int main(int argc, char **argv) {
         while (fgets(buf, sizeof buf, f)) lines.push_back(buf);
         fclose(f);
     }
+    auto scribble = [&](int it) {
+        for (const Scribble &sc : scribbles)
+            if (sc.it == it)
+                for (u32 k = 0; k < sc.n; k++)
+                    if (u8 *p = mem::paddr_ptr(sc.paddr + k)) *p ^= 0xa5;
+    };
     // extra warm-up iterations (without output) to measure steady-state cost
     for (int it = 1; it < repeat; it++) {
+        scribble(it);
         gpu::vblank();  // (each iteration a frame: what the GPU caches is re-validated as in a game)
         auto t0 = std::chrono::steady_clock::now();
         double per[4] = {0, 0, 0, 0};  // cmdlist, fill, transfer, copy
@@ -153,6 +172,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "iteration %d: %.2f ms (cmdlists %.2f, fills %.2f, transfers %.2f, copies %.2f)\n", it,
                 std::chrono::duration<double, std::milli>(t1 - t0).count(), per[0], per[1], per[2], per[3]);
     }
+    scribble(repeat);
     gpu::vblank();
     char line[512];
     int presents = 0, transfers = 0;
@@ -185,7 +205,7 @@ int main(int argc, char **argv) {
                     gpu_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
                     write_fb(out_name(out, "_xfer" + std::to_string(transfers)), b, w, h,
                              w * gpu::pixel_bytes(fmt), fmt);
-                    write_hires(out_name(out, "_xfer" + std::to_string(transfers) + "_hires"), b);
+                    write_hires(out_name(out, "_xfer" + std::to_string(transfers) + "_hires"), b, 0, h);
                     transfers++;
                     continue;
                 }

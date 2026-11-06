@@ -63,6 +63,7 @@ golden: build/shader_golden
 	./build/shader_golden $(ROOT)/games/*/pipelines.bin
 	./build/shader_golden --glsl $(ROOT)/games/*/pipelines.bin
 	./build/shader_golden --glsl --samples 4 $(ROOT)/games/*/pipelines.bin
+	./build/shader_golden --glsl --samples 4 --no-logic-op $(ROOT)/games/*/pipelines.bin
 
 clean:
 	rm -rf build

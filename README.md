@@ -124,6 +124,14 @@ font through Fontconfig, FreeType and HarfBuzz; cloud saves use libcurl; AAC mus
 - `GPU_DEVICE=<index or part of the name>` picks the GPU (default: the first discrete one); `GPU_VALIDATE=1` turns on
   the Vulkan validation layer, its messages in the log (with `VK_KHRONOS_VALIDATION_VALIDATE_SYNC=1`, synchronisation
   validation too).
+- The screens are drawn by SDL's Vulkan renderer made on the backend's own device: new pictures are copied into its
+  textures on the GPU, never read back. `GPU_PRESENT_CPU=1` (or a device with a single queue in its graphics family)
+  sends them through the CPU to SDL's default renderer instead, as without a window (`SDL_VIDEO_DRIVER=offscreen`).
+- For tests on a device that has everything: `GPU_VK_DISABLE=stencil_export,logic_op,local_read` (any of them) takes
+  the paths for devices without those features (MSAA stencil restored a bit at a time; logic ops blended in the
+  shader, as on MoltenVK; no blending in the shader). `GPU_TF_VERIFY=1` checks every partial update of an upscaled
+  texture against upscaling it all again (`tools/gpu_test`'s `gpu_replay --scribble <iteration> <paddr> <bytes>`
+  makes textures change between repeats, `-r`).
 - On Wayland, separate windows' positions are not restored (Wayland lets no application place its windows);
   `SDL_VIDEO_DRIVER=x11` runs through XWayland. A window the compositor does not show gets presents without vsync
   until it shows again, so the game keeps its pace.

@@ -1015,7 +1015,7 @@ int tf_mode = 0;
 u64 flush_no = 0;
 size_t tf_bytes = 0;                      // upscaled textures' memory
 constexpr size_t kTfBudget = 512u << 20;  // beyond: least recently used ones evicted, else no more upscaling
-u32 st_uploads = 0, st_upscaled = 0, st_partial = 0, st_tiles = 0;  // RECOMP_STATS
+u32 st_uploads = 0, st_upscaled = 0, st_partial = 0, st_tiles = 0, st_fetch = 0;  // RECOMP_STATS
 double st_upload_ms = 0, st_upscale_ms = 0;
 
 // Guest memory holding GPU output (render targets, or transfer / copy outputs made from them, as long as the bytes
@@ -1132,6 +1132,50 @@ void upload_levels(const TexEntry *e, u32 nl, Img &dst, u32 at = 0) {
     vkCmdCopyBufferToImage(cb, s.buf->b, dst.img, VK_IMAGE_LAYOUT_GENERAL, (u32)cp.size(), cp.data());
 }
 
+// GPU_TF_VERIFY=1: each partial update of an upscaled texture is checked against upscaling all of it again (both
+// read back and compared, every level), for tests (tools/gpu_test's gpu_replay --scribble makes textures change)
+bool tf_verify = false;
+void verify_partial(const TexEntry *e, const VTex &m, u32 f, u32 u, u32 wraps) {
+    const u32 w = e->w, h = e->h;
+    ImgP t = make_img(w * f, h * f, VK_FORMAT_R8G8B8A8_UNORM, 1 + u, kUpscaledUsage);
+    ImgP src = make_img(w, h, VK_FORMAT_R8G8B8A8_UNORM, 1, kTexUsage);
+    upload_levels(e, 1, *src);
+    ImgP mid = m.mid ? make_img(w * 2, h * 2, VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT)
+                     : nullptr;
+    tf_encode(tf_mode, *src, *t, mid.get(), f, wraps & 3, wraps >> 2);
+    VkCommandBuffer cb = rec();
+    barrier(cb);
+    VkImageCopy c{};
+    c.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    c.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, u, 0, 1};
+    c.extent = {w, h, 1};
+    vkCmdCopyImage(cb, src->img, VK_IMAGE_LAYOUT_GENERAL, t->img, VK_IMAGE_LAYOUT_GENERAL, 1, &c);
+    barrier(cb);
+    size_t total = 0;
+    for (u32 l = 0; l <= u; l++) total += (size_t)((w * f) >> l) * ((h * f) >> l) * 4;
+    BufP a = make_buf(total, Mem::Readback), b = make_buf(total, Mem::Readback);
+    size_t off = 0;
+    for (u32 l = 0; l <= u; l++) {
+        const u32 lw = (w * f) >> l, lh = (h * f) >> l;
+        const VkBufferImageCopy bc = buf_copy(off, lw, lh, VK_IMAGE_ASPECT_COLOR_BIT, l);
+        vkCmdCopyImageToBuffer(cb, m.tex->img, VK_IMAGE_LAYOUT_GENERAL, a->b, 1, &bc);
+        vkCmdCopyImageToBuffer(cb, t->img, VK_IMAGE_LAYOUT_GENERAL, b->b, 1, &bc);
+        off += (size_t)lw * lh * 4;
+    }
+    wait_value(submit());
+    a->invalidate();
+    b->invalidate();
+    off = 0;
+    for (u32 l = 0; l <= u; l++) {
+        const u32 lw = (w * f) >> l, lh = (h * f) >> l;
+        u32 bad = 0;
+        for (size_t i = 0; i < (size_t)lw * lh; i++) bad += ((const u32 *)(a->p + off))[i] != ((const u32 *)(b->p + off))[i];
+        LOG("gpu vulkan: GPU_TF_VERIFY texture %08x %ux%u level %u (%ux%u): %u texels differ from a full upscale\n", e->addr,
+            w, h, l, lw, lh, bad);
+        off += (size_t)lw * lh * 4;
+    }
+}
+
 // up: the unit sampling it, if it may be upscaled (2D / projected textures); *ul: log2 of the upscale factor
 const Img *get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 *ul = nullptr) {
     if (ul) *ul = 0;
@@ -1190,9 +1234,11 @@ const Img *get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 
                 barrier(cb);
                 vkCmdCopyImage(cb, m.src->img, VK_IMAGE_LAYOUT_GENERAL, m.tex->img, VK_IMAGE_LAYOUT_GENERAL, (u32)ic.size(),
                                ic.data());
+                if (tf_verify) verify_partial(e, m, f, u, wraps);
             }
             m.hash = e->hash;
             if (ul) *ul = u;
+            if (g_stats) LOG("gpu vulkan: texture %08x %ux%u: %u tiles upscaled again\n", e->addr, w, h, nt);
             if (log_timing) {
                 st_partial++;
                 st_tiles += nt;
@@ -1269,6 +1315,7 @@ const Img *get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 
             st_upscaled++;
             st_upscale_ms += now_ms() - t0;
         }
+        if (g_stats) LOG("gpu vulkan: texture %08x %ux%u (%u levels) upscaled %ux%s\n", e->addr, w, h, nl, f, keep ? ", kept for partial updates" : "");
         return m.tex.get();
     }
     if (f) {  // no kernels: filter off
@@ -2029,7 +2076,10 @@ bool init_device() {
         return false;
     }
     dexts.push_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);
-    has_stencil_export = has_ext(dep, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
+    // GPU_VK_DISABLE=stencil_export,logic_op,local_read: the paths for devices without them, tried on one with them
+    const char *dis = getenv("GPU_VK_DISABLE");
+    auto disabled = [&](const char *f) { return dis && strstr(dis, f); };
+    has_stencil_export = has_ext(dep, VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME) && !disabled("stencil_export");
     if (has_stencil_export) dexts.push_back(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME);
     if (has_ext(dep, "VK_KHR_portability_subset")) dexts.push_back("VK_KHR_portability_subset");
     // features
@@ -2047,8 +2097,8 @@ bool init_device() {
         LOG("gpu vulkan: %s lacks features this backend needs, using the software renderer\n", props.deviceName);
         return false;
     }
-    has_logic_op = f2.features.logicOp;
-    has_local_read = lr_ext && lrf.dynamicRenderingLocalRead;
+    has_logic_op = f2.features.logicOp && !disabled("logic_op");
+    has_local_read = lr_ext && lrf.dynamicRenderingLocalRead && !disabled("local_read");
     VkPhysicalDeviceDynamicRenderingLocalReadFeaturesKHR elr{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_LOCAL_READ_FEATURES_KHR};
     VkPhysicalDeviceVulkan13Features e13{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES};
     VkPhysicalDeviceVulkan12Features e12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
@@ -2276,6 +2326,7 @@ bool vk_init() {
     dump_shaders = getenv("GPU_DUMP_SHADERS") != nullptr;
     eager_writeback = getenv("GPU_METAL_EAGER") != nullptr || getenv("GPU_EAGER") != nullptr;
     log_timing = getenv("RECOMP_STATS") != nullptr;
+    tf_verify = getenv("GPU_TF_VERIFY") != nullptr;
     // texture filters
     {
         const char *tfname[kVkTfKernCount] = {"texture filter (sharp)", "texture filter (smooth)", "texture filter (levels)"};
@@ -2303,6 +2354,7 @@ bool vk_init() {
         props.deviceName, nv ? dv >> 22 : VK_API_VERSION_MAJOR(dv), nv ? (dv >> 14) & 0xff : VK_API_VERSION_MINOR(dv),
         nv ? (dv >> 6) & 0xff : VK_API_VERSION_PATCH(dv), scale_fixed ? "" : "auto, now ", S, MS, aniso,
         has_logic_op ? "" : ", no logic ops", has_local_read ? "" : ", no blending in shaders");
+    if (!has_stencil_export && MS > 1) LOG("gpu vulkan: no stencil export: MSAA stencil restored a bit at a time\n");
     pipelines_init();
     return true;
 }
@@ -2580,6 +2632,8 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         pr.seg = &seg;
         pr.pipe = pipe;
         pr.fetch = fetch;
+        st_fetch += fetch;
+        if (fetch && g_stats) LOG("gpu vulkan: draw blending in the shader (logic op %u, blend %u)\n", ds.logic_op, ds.blend);
         pr.sc = {{0, 0}, {rt.w * S, rt.h * S}};
         if (ds.scissor_mode == 3) {
             const s32 x1 = std::clamp<s32>(ds.sc_x1, 0, rt.w), x2 = std::clamp<s32>(ds.sc_x2, 0, rt.w);
@@ -2948,9 +3002,11 @@ void vk_poll() {
         gpu_busy = 0;
         busy_frac = (float)(b * 1000 / (t - last));
         if (log_timing) {
-            LOG("[gpu] GPU busy %.1f ms/s (scale %u, MSAA %ux), %llu command buffers, %llu passes\n",
+            LOG("[gpu] GPU busy %.1f ms/s (scale %u, MSAA %ux), %llu command buffers, %llu passes, %u draws blending in "
+                "the shader\n",
                 b * 1000 / ((t - last) / 1000), S, MS, (unsigned long long)cbs_made.exchange(0),
-                (unsigned long long)flushes.exchange(0));
+                (unsigned long long)flushes.exchange(0), st_fetch);
+            st_fetch = 0;
             LOG("[gpu] textures: %u decoded in %.2f ms, %u uploaded in %.2f ms; filter %s: %u upscaled + %u updated "
                 "(%u tiles) in %.2f ms, %zu MiB\n",
                 g_tex_decodes, g_tex_decode_ms, st_uploads, st_upload_ms, vk_texture_filter_name(tf_mode), st_upscaled,
