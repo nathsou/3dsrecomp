@@ -2533,39 +2533,53 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         // and each thread's draw in tj (draws are often only a few vertices). The draws write disjoint ranges of gbuf.
         ensure_buffer(gbuf_dev, gbytes, Mem::Device);
         const Slice dbuf = upload(mb.vdata.data(), mb.vdata.size());
+        // (counted first, then each group's vertex ids, parameter blocks and draw indices written straight into the
+        // arena: no vectors to grow and copy)
         struct Group {
             VkPipeline ps;
-            std::vector<VsParamsG> params;
-            std::vector<u32> vids, tj;
+            u32 njobs = 0, nverts = 0, jw = 0, vw = 0;
+            Slice vb{}, pb{}, tb{};
         };
         std::vector<Group> groups;
-        for (const GpuVsJob &j : mb.jobs) {
-            VkPipeline ps = ((const VsKern *)j.kernel)->ps;
-            Group *g = nullptr;
-            for (Group &x : groups)
-                if (x.ps == ps) g = &x;
-            if (!g) {
-                groups.push_back({ps, {}, {}, {}});
-                g = &groups.back();
-            }
-            VsParamsG &P = g->params.emplace_back(j.p);
-            P.first = (u32)g->vids.size();
-            g->vids.insert(g->vids.end(), mb.vids.begin() + j.vids_off, mb.vids.begin() + j.vids_off + j.p.nverts);
-            g->tj.insert(g->tj.end(), j.p.nverts, (u32)g->params.size() - 1);
+        thread_local std::vector<u32> job_group;
+        job_group.resize(mb.jobs.size());
+        for (size_t k = 0; k < mb.jobs.size(); k++) {
+            const GpuVsJob &j = mb.jobs[k];
+            const VkPipeline ps = ((const VsKern *)j.kernel)->ps;
+            u32 gi = 0;
+            while (gi < groups.size() && groups[gi].ps != ps) gi++;
+            if (gi == groups.size()) groups.push_back({ps});
+            groups[gi].njobs++;
+            groups[gi].nverts += j.p.nverts;
+            job_group[k] = gi;
+        }
+        for (Group &g : groups) {
+            g.vb = arena((size_t)g.nverts * 4);
+            g.pb = arena((size_t)g.njobs * sizeof(VsParamsG));
+            g.tb = arena((size_t)g.nverts * 4);
+        }
+        for (size_t k = 0; k < mb.jobs.size(); k++) {
+            const GpuVsJob &j = mb.jobs[k];
+            Group &g = groups[job_group[k]];
+            VsParamsG *P = (VsParamsG *)g.pb.p + g.jw;
+            memcpy((void *)P, &j.p, sizeof(VsParamsG));
+            P->first = g.vw;
+            memcpy(g.vb.p + (size_t)g.vw * 4, &mb.vids[j.vids_off], (size_t)j.p.nverts * 4);
+            u32 *t = (u32 *)g.tb.p + g.vw;
+            for (u32 i = 0; i < j.p.nverts; i++) t[i] = g.jw;
+            g.vw += j.p.nverts;
+            g.jw++;
         }
         VkCommandBuffer vcb = rec();
         barrier(vcb);
         for (const Group &g : groups) {
-            if (g.vids.empty()) continue;
-            const Slice vb = upload(g.vids.data(), g.vids.size() * 4);
-            const Slice pb = upload(g.params.data(), g.params.size() * sizeof(VsParamsG));
-            const Slice tb = upload(g.tj.data(), g.tj.size() * 4);
+            if (!g.nverts) continue;
             vkCmdBindPipeline(vcb, VK_PIPELINE_BIND_POINT_COMPUTE, g.ps);
             VkDescriptorBufferInfo bi[5] = {{dbuf.buf->b, dbuf.off, std::max<size_t>(16, mb.vdata.size())},
-                                            {vb.buf->b, vb.off, g.vids.size() * 4},
-                                            {pb.buf->b, pb.off, g.params.size() * sizeof(VsParamsG)},
+                                            {g.vb.buf->b, g.vb.off, (size_t)g.nverts * 4},
+                                            {g.pb.buf->b, g.pb.off, (size_t)g.njobs * sizeof(VsParamsG)},
                                             {gbuf_dev->b, 0, gbytes},
-                                            {tb.buf->b, tb.off, g.tj.size() * 4}};
+                                            {g.tb.buf->b, g.tb.off, (size_t)g.nverts * 4}};
             VkWriteDescriptorSet w[5];
             for (u32 i = 0; i < 5; i++) {
                 w[i] = {VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
@@ -2575,9 +2589,9 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
                 w[i].pBufferInfo = &bi[i];
             }
             vkPushDescriptors(vcb, VK_PIPELINE_BIND_POINT_COMPUTE, v_layout, 0, 5, w);
-            const u32 nt[4] = {(u32)g.vids.size(), 0, 0, 0};
+            const u32 nt[4] = {g.nverts, 0, 0, 0};
             vkCmdPushConstants(vcb, v_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 16, nt);
-            vkCmdDispatch(vcb, ((u32)g.vids.size() + 63) / 64, 1, 1);
+            vkCmdDispatch(vcb, (g.nverts + 63) / 64, 1, 1);
         }
     }
 
