@@ -3050,12 +3050,13 @@ GRT *transfer_source(u32 in_paddr, u32 in_dims, u32 out_dims, u32 &row0) {
         src = r.get();
         row0 = off / line;
     }
-    if (src && (out_dims & 0xffff) != src->w) return nullptr;
+    if (src && (out_dims & 0xffff) > src->w) return nullptr;  // (narrower: the transfer keeps the first columns)
     return src;
 }
 
-void encode_rot(VkCommandBuffer cb, GRT &src, const Buf &dst, u32 rows, u32 flags, u32 row0) {
-    const u32 TW = src.w * S;
+// rows x TW (scaled) of a target as an upright image: TW its first columns (all of them, or fewer for a transfer
+// keeping only those), from row row0 (1x)
+void encode_rot(VkCommandBuffer cb, GRT &src, const Buf &dst, u32 rows, u32 TW, u32 flags, u32 row0) {
     const u32 key = key_black_bottom && rows == 320 * S ? 2 : 0;
     const u32 prm[4] = {TW, rows, (flags & 1) | key, row0 * S};
     dispatch(cb, K_ROT, {ki(4, *src.tex), kb(0, dst)}, prm, nullptr, rows, TW);
@@ -3112,7 +3113,7 @@ bool vk_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u
     vk_guest_prewrite(out_paddr, out_size);
     auto op = std::make_unique<PendingXfer>();
     op->rt_writeback = writeback;
-    const u32 TW = src->w * S, rows = (out_dims >> 16) * S;
+    const u32 TW = (out_dims & 0xffff) * S, rows = (out_dims >> 16) * S;  // (the columns transferred)
     VkCommandBuffer cb = new_cb();
     if (src->clear_next) clear_now(*src);
     op->gbytes = take_buffer(xbuf_free, rt_bytes(*src));
@@ -3123,7 +3124,7 @@ bool vk_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u
     }
     barrier(cb);
     encode_guest_color(cb, *src, *op->gbytes);
-    encode_rot(cb, *src, *op->disp, rows, flags, row0);
+    encode_rot(cb, *src, *op->disp, rows, TW, flags, row0);
     barrier(cb);
     const u32 scaling = (flags >> 24) & 3;
     const u32 out_w = (out_dims & 0xffff) >> (scaling ? 1 : 0), out_h = (out_dims >> 16) >> (scaling == 2 ? 1 : 0);
@@ -3232,7 +3233,9 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
     u32 row0 = 0;
     GRT *src = transfer_source(in_paddr, in_dims, out_dims, row0);
     if (!src) {
-        if (g_stats) LOG("gpu vulkan: transfer %08x -> %08x: no matching render target, no display image\n", in_paddr, out_paddr);
+        if (g_stats)
+            LOG("gpu vulkan: transfer %08x -> %08x (%08x -> %08x, flags %08x): no matching render target, no display image\n",
+                in_paddr, out_paddr, in_dims, out_dims, flags);
         return;
     }
     if (hash_mem(pptr(src->addr), rt_bytes(*src)) != src->hash) {
@@ -3240,7 +3243,7 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
         return;
     }
     const u32 out_w0 = out_dims & 0xffff, out_h0 = out_dims >> 16;
-    const u32 TW = src->w * S, rows = out_h0 * S;
+    const u32 TW = out_w0 * S, rows = out_h0 * S;  // (the columns transferred)
     BufP buf;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
@@ -3249,7 +3252,7 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
     VkCommandBuffer cb = new_cb();
     if (src->clear_next) clear_now(*src);
     barrier(cb);
-    encode_rot(cb, *src, *buf, rows, flags, row0);
+    encode_rot(cb, *src, *buf, rows, TW, flags, row0);
     const u64 tl = submit();  // (not waited for: the UI waits if it reads the image before the GPU made it)
     const u32 hs = ((flags >> 24) & 3) ? 1 : 0, vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
     const u32 out_size = (out_w0 >> hs) * (out_h0 >> vs) * pixel_bytes((flags >> 12) & 7);

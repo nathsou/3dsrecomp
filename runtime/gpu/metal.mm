@@ -2704,12 +2704,12 @@ GRT *transfer_source(u32 in_paddr, u32 in_dims, u32 out_dims, u32 &row0) {
         src = r.get();
         row0 = off / line;
     }
-    if (src && (out_dims & 0xffff) != src->w) return nullptr;
+    if (src && (out_dims & 0xffff) > src->w) return nullptr;  // (narrower: the transfer keeps the first columns)
     return src;
 }
 
-void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u32 rows, u32 flags, u32 row0) {
-    const u32 TW = src.w * S;
+// TW: the target's first columns (scaled) the transfer keeps (all, or fewer)
+void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u32 rows, u32 TW, u32 flags, u32 row0) {
     [ce setComputePipelineState:k_rot];
     [ce setTexture:src.tex atIndex:0];
     [ce setBuffer:dst offset:0 atIndex:0];
@@ -2770,7 +2770,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         if (op->rt_writeback && op->rt == src) return false;
     metal_guest_prewrite(out_paddr, out_size);
     auto op = std::make_unique<PendingXfer>();
-    const u32 TW = src->w * S, rows = (out_dims >> 16) * S;
+    const u32 TW = (out_dims & 0xffff) * S, rows = (out_dims >> 16) * S;
     @autoreleasepool {
         op->cb = new_cb();
         if (src->clear_next) clear_now(*src, op->cb);
@@ -2792,7 +2792,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         [ce setBytes:tp length:16 atIndex:2];
         [ce setBytes:tq length:16 atIndex:3];
         dispatch2d(ce, out_w, out_h);
-        encode_rot(ce, *src, op->disp, rows, flags, row0);
+        encode_rot(ce, *src, op->disp, rows, TW, flags, row0);
         [ce endEncoding];
         [op->cb commit];
     }
@@ -2930,7 +2930,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
         return;
     }
     const u32 out_w0 = out_dims & 0xffff, out_h0 = out_dims >> 16;
-    const u32 TW = src->w * S, rows = out_h0 * S;
+    const u32 TW = out_w0 * S, rows = out_h0 * S;
     id<MTLBuffer> buf;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
@@ -2940,7 +2940,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
         id<MTLCommandBuffer> cb = new_cb();
         if (src->clear_next) clear_now(*src, cb);
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
-        encode_rot(ce, *src, buf, rows, flags, row0);
+        encode_rot(ce, *src, buf, rows, TW, flags, row0);
         [ce endEncoding];
         [cb commit];
         wait_cb(cb, "display image", out_paddr);
