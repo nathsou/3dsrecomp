@@ -122,6 +122,9 @@ u64 shader_program_hash(const ShaderProgram *p);  // of the code and swizzle wor
 std::string shader_msl(const ShaderProgram *p, u32 entry, const char *name);
 // the same for one set of bool/int uniforms (flow resolved statically), or "" if it cannot be done exactly
 std::string shader_msl_spec(const ShaderProgram *p, u32 entry, const char *name, u32 b, const u8 (*iu)[4]);
+// the same as Vulkan GLSL compute shaders (after vk_shaders.h's kVkVsCommonGLSL)
+std::string shader_glsl(const ShaderProgram *p, u32 entry);
+std::string shader_glsl_spec(const ShaderProgram *p, u32 entry, u32 b, const u8 (*iu)[4]);
 // the bool uniforms (bit mask) and int uniforms (*loops, bit mask) the program's flow control reads
 u32 shader_static_uniforms(const ShaderProgram *p, u32 *loops);
 bool shader_run4(const ShaderProgram *p, ShaderUnit4 &u, const V4 *uniforms, const bool *b,
@@ -364,7 +367,8 @@ struct GpuState {
     u32 light_lut[24][256];
     u32 fog_lut[128];
     u32 pt_noise[128], pt_cmap[128], pt_amap[128], pt_color[256], pt_cdiff[256];
-    bool light_lut_dirty, fog_lut_dirty, pt_dirty;
+    u32 light_lut_dirty;  // a bit per light LUT changed since its snapshot was made
+    bool fog_lut_dirty, pt_dirty;
     std::shared_ptr<const LightLuts> light_luts;
     std::shared_ptr<const FogLut> fog_luts;
     std::shared_ptr<const ProcTexLuts> pt_luts;
@@ -430,7 +434,7 @@ struct alignas(16) VsParamsG {  // VsParams in metal.mm
     u32 b, nverts, out_base, first;  // first: the first thread of this draw in its kernel dispatch
 };
 struct GpuVsJob {
-    const void *kernel;  // metal_vs_kernel()
+    const void *kernel;  // hw_vs_kernel()
     u32 vids_off;        // first vertex id in MBatch::vids
     VsParamsG p;
 };
@@ -439,8 +443,18 @@ struct MSeg {
     const DrawState *ds;
     u32 first, count;  // in MBatch::idx (three per triangle)
 };
+// a std::allocator whose resize() leaves new elements uninitialised (buffers filled right after)
+template <class T> struct NoInitAlloc : std::allocator<T> {
+    template <class U> struct rebind {
+        using other = NoInitAlloc<U>;
+    };
+    NoInitAlloc() = default;
+    template <class U> NoInitAlloc(const NoInitAlloc<U> &) {}
+    template <class U> void construct(U *p) noexcept { ::new ((void *)p) U; }
+    template <class U, class... A> void construct(U *p, A &&...a) { ::new ((void *)p) U(std::forward<A>(a)...); }
+};
 struct MBatch {
-    std::vector<u8> vdata;  // copied vertex arrays
+    std::vector<u8, NoInitAlloc<u8>> vdata;  // copied vertex arrays
     std::vector<u32> vids;
     std::vector<GpuVsJob> jobs;
     u32 gpu_verts = 0;
@@ -473,47 +487,108 @@ void raster_set_sink(TriSink *sink);
 // Add triangles (in order) to the current batch. Main thread only.
 void raster_append(const TriSink &tris);
 
-// ---------------------------------------------------------------- Metal backend (metal.mm)
-bool metal_active();  // Metal device available and GPU_BACKEND != sw
-bool metal_init();
-// draw the batch's triangles into the render target and write the color back to guest memory
-void metal_flush(const RTConfig &rt, const MBatch &b);
-// the compute kernel for a vertex program (null while it compiles: shade on the CPU meanwhile)
-const void *metal_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s);
-// guest memory in [paddr, paddr+size) is about to be read by a non-render GPU operation (texture
-// decode, transfer source): write back render-target data held only on the GPU
-void metal_guest_read(u32 paddr, u32 size);
-// guest memory was overwritten by a non-render operation (fill, transfer, copy, CPU)
-// (definite: the bytes were certainly rewritten; else only if their hash changed)
-void metal_guest_written(u32 paddr, u32 size, bool definite = true);
-// guest memory in [paddr, paddr+size) is about to be overwritten by a fill, transfer or copy
-void metal_guest_prewrite(u32 paddr, u32 size);
-// write every GPU-only render-target change back to guest memory
-void metal_writeback_all();
-// finish deferred work whose GPU part completed (called at the start of GPU operations)
-void metal_poll();
-// GPU copies of guest images (render-to-texture without going through guest memory): a texture copy or a tiled-to-tiled
-// display transfer from an image the GPU holds newer contents of, done on the GPU (true: taken care of); whether the
-// GPU holds the w x h texture (formats 0-4) at addr, newer than guest memory (draws then sample it there)
-bool metal_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width, u32 out_gap);
-bool metal_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
-bool metal_surface_for(u32 addr, u32 w, u32 h, u32 fmt);
-// a command list ended: its passes share one command buffer, committed at its end
-void metal_end_list();
+// ---------------------------------------------------------------- hardware backends (hw.cpp)
+// Metal (metal.mm) or Vulkan (vulkan.cpp) draws the batches when one is available and GPU_BACKEND is not "sw"; the
+// software rasterizer is the reference. Without one, the hw_* calls do nothing or answer false.
+struct HwBackend {
+    const char *name;
+    bool (*init)();  // false: not available here (or GPU_BACKEND asks for another)
+    // draw the batch's triangles into the render target and write the color back to guest memory
+    void (*flush)(const RTConfig &rt, const MBatch &b);
+    // the compute kernel for a vertex program (null while it compiles: shade on the CPU meanwhile)
+    const void *(*vs_kernel)(const ShaderProgram *p, u32 entry, const ShaderSetup &s);
+    // guest memory in [paddr, paddr+size) is about to be read by a non-render GPU operation (texture
+    // decode, transfer source): write back render-target data held only on the GPU
+    void (*guest_read)(u32 paddr, u32 size);
+    // guest memory was overwritten by a non-render operation (fill, transfer, copy, CPU)
+    // (definite: the bytes were certainly rewritten; else only if their hash changed)
+    void (*guest_written)(u32 paddr, u32 size, bool definite);
+    // guest memory in [paddr, paddr+size) is about to be overwritten by a fill, transfer or copy
+    void (*guest_prewrite)(u32 paddr, u32 size);
+    // write every GPU-only render-target change back to guest memory
+    void (*writeback_all)();
+    // finish deferred work whose GPU part completed (called at the start of GPU operations)
+    void (*poll)();
+    // GPU copies of guest images (render-to-texture without going through guest memory): a texture copy or a
+    // tiled-to-tiled display transfer from an image the GPU holds newer contents of, done on the GPU (true: taken
+    // care of); whether the GPU holds the w x h texture (formats 0-4) at addr, newer than guest memory (draws then
+    // sample it there)
+    bool (*texture_copy)(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width, u32 out_gap);
+    bool (*gpu_transfer)(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+    bool (*surface_for)(u32 addr, u32 w, u32 h, u32 fmt);
+    // a command list ended: its passes share one command buffer, committed at its end
+    void (*end_list)();
+    // try to run a display transfer from a render target asynchronously (true: taken care of)
+    bool (*defer_transfer)(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size);
+    // a display transfer completed: remember high-resolution sources of framebuffers
+    void (*display_transfer)(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
+    // texture filter (set_texture_filter): textures in guest memory holding GPU output (render-to-texture) are
+    // not upscaled. Both do nothing while no filter is on. gpu_made: [paddr, paddr+size) holds GPU output
+    // (call after hw_guest_read); note_gpu_output: a transfer or copy of GPU output wrote it.
+    bool (*gpu_made)(u32 paddr, u32 size);
+    void (*note_gpu_output)(u32 paddr, u32 size);
+    // the frontend's side (gpu_iface.h, gpu.h), from other threads
+    bool (*get_display_image_for)(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h);
+    u64 (*use_display_image)(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::function<void(const ScreenImage &)> &fn);
+    bool (*get_display_image)(int screen, const u32 **rgba, int *w, int *h);
+    void (*set_scale)(int s);
+    int (*scale)();
+    bool (*scale_is_auto)();
+    float (*busy)();
+    void (*set_texture_filter)(int mode);
+    int (*texture_filter_count)();
+    const char *(*texture_filter_name)(int mode);
+    void (*set_clear_after_top_transfer)(bool on);
+    void (*set_key_black_bottom)(bool on);
+    // build step: precompile the shaders of pipeline lists (may be null)
+    int (*emit_shaders)(int argc, char **argv);
+    // presenting on the backend's device (gpu_iface.h; null: not supported)
+    bool (*present_device)(PresentDevice *pd);
+    u64 (*present_image_create)(int w, int h);
+    void (*present_image_destroy)(u64 image);
+    void (*present_hold)(bool on);
+};
+// set_present_extensions' list (for the backend's init)
+const std::vector<std::string> &present_extensions();
+const HwBackend *metal_backend();   // metal.mm (Apple)
+const HwBackend *vulkan_backend();  // vulkan.cpp (RECOMP_VULKAN)
+extern const HwBackend *g_hw;       // the active backend (null: the software renderer)
+bool hw_init();                     // picks it: GPU_BACKEND=metal|vulkan|sw, else the first available
+inline bool hw_active() { return g_hw != nullptr; }
+inline void hw_flush(const RTConfig &rt, const MBatch &b) { g_hw->flush(rt, b); }
+inline const void *hw_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s) {
+    return g_hw ? g_hw->vs_kernel(p, entry, s) : nullptr;
+}
+inline void hw_guest_read(u32 paddr, u32 size) { if (g_hw) g_hw->guest_read(paddr, size); }
+inline void hw_guest_written(u32 paddr, u32 size, bool definite = true) {
+    if (g_hw) g_hw->guest_written(paddr, size, definite);
+}
+inline void hw_guest_prewrite(u32 paddr, u32 size) { if (g_hw) g_hw->guest_prewrite(paddr, size); }
+inline void hw_writeback_all() { if (g_hw) g_hw->writeback_all(); }
+inline void hw_poll() { if (g_hw) g_hw->poll(); }
+inline bool hw_texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width, u32 in_gap, u32 out_width,
+                            u32 out_gap) {
+    return g_hw && g_hw->texture_copy(in_paddr, out_paddr, size, in_width, in_gap, out_width, out_gap);
+}
+inline bool hw_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
+    return g_hw && g_hw->gpu_transfer(in_paddr, out_paddr, in_dims, out_dims, flags);
+}
+inline bool hw_surface_for(u32 addr, u32 w, u32 h, u32 fmt) { return g_hw && g_hw->surface_for(addr, w, h, fmt); }
+inline void hw_end_list() { if (g_hw) g_hw->end_list(); }
+inline bool hw_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
+    return g_hw && g_hw->defer_transfer(in_paddr, out_paddr, in_dims, out_dims, flags, out_size);
+}
+inline void hw_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
+    if (g_hw) g_hw->display_transfer(in_paddr, out_paddr, in_dims, out_dims, flags);
+}
+inline bool hw_gpu_made(u32 paddr, u32 size) { return g_hw && g_hw->gpu_made(paddr, size); }
+inline void hw_note_gpu_output(u32 paddr, u32 size) { if (g_hw) g_hw->note_gpu_output(paddr, size); }
 // frames (VBlanks) so far: guest memory the GPU caches (decoded textures, render targets) is hashed again at most once
 // per frame unless a write to it is reported (gpu::vblank)
 extern std::atomic<u64> g_frame;
-// try to run a display transfer from a render target asynchronously (true: taken care of)
-bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size);
 // the display transfer's pixel conversion (src/dst: first input / output byte)
 void transfer_convert(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 flags);
-// a display transfer completed: remember high-resolution sources of framebuffers
-void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
-// texture filter (set_texture_filter): textures in guest memory holding GPU output (render-to-texture) are
-// not upscaled. Both do nothing while no filter is on. metal_gpu_made: [paddr, paddr+size) holds GPU output
-// (call after metal_guest_read); metal_note_gpu_output: a transfer or copy of GPU output wrote it.
-bool metal_gpu_made(u32 paddr, u32 size);
-void metal_note_gpu_output(u32 paddr, u32 size);
+void transfer_convert_ref(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 flags);  // (the generic loop, for tests)
 // deferred draws (vertex.cpp): draws are recorded and processed in parallel at batch flush
 bool vtx_jobs_pending();
 void vtx_finish_jobs();
@@ -575,6 +650,11 @@ inline u32 cbuf_to_pixfmt(u32 cf) {
 }
 
 u64 hash_bytes(const u8 *p, size_t n);
+// Whether memory changed (XXH3: twice as fast as hash_bytes; its values are never stored, so it may change, unlike
+// hash_bytes, whose values key files in the shader caches). copy_hash copies n bytes and returns hash_mem(dst, n)
+// without a second pass over dst.
+u64 hash_mem(const u8 *p, size_t n);
+u64 copy_hash(u8 *dst, const u8 *src, size_t n);
 
 // timing statistics (GPU_STATS=1)
 extern bool g_stats, g_trace;

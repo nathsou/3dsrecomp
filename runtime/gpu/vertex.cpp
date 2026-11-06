@@ -406,7 +406,7 @@ void shade_range(DrawJob &j, u32 begin, u32 end, u32 tid) {
                 for (u32 r = 0; r < 16; r++)
                     if (j.outmask & (1u << r)) buf[o++] = out4[l][r];
                 map_vertex(j.m, buf, j.outv[k + l]);
-                if (!metal_active()) raster_prepare_vertex(*j.ds, j.outv[k + l], j.outsv[k + l], j.outcode[k + l]);
+                if (!hw_active()) raster_prepare_vertex(*j.ds, j.outv[k + l], j.outsv[k + l], j.outcode[k + l]);
             }
         }
     }
@@ -416,7 +416,7 @@ void shade_range(DrawJob &j, u32 begin, u32 end, u32 tid) {
         shader_run(j.prog, u, j.b, j.iu, j.entry);
         gather_outputs(u, j.outmask, buf);
         map_vertex(j.m, buf, j.outv[k]);
-        if (!metal_active()) raster_prepare_vertex(*j.ds, j.outv[k], j.outsv[k], j.outcode[k]);
+        if (!hw_active()) raster_prepare_vertex(*j.ds, j.outv[k], j.outsv[k], j.outcode[k]);
     }
 }
 
@@ -463,7 +463,7 @@ void vtx_finish_jobs() {
         shade_range(*jobs[t.job], t.begin, t.end, tid);
     });
     double t1 = g_stats ? now_ms() : 0;
-    if (metal_active()) {
+    if (hw_active()) {
         // the Metal backend clips and sets up triangles itself: hand it the shaded vertices
         MBatch &mb = raster_mbatch();
         for (u32 ji = 0; ji < njobs; ji++) {
@@ -522,7 +522,7 @@ u64 st_gpu_draws = 0, st_cpu_draws = 0;
 // Shades a draw's vertices with the program's compute kernel: copies the vertex arrays it reads and
 // appends the draw to the Metal batch. False if the kernel is not ready (the CPU shades the draw).
 bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask, bool indexed, u32 n) {
-    const void *kernel = metal_vs_kernel(prog, entry, g.vs);
+    const void *kernel = hw_vs_kernel(prog, entry, g.vs);
     if (!kernel) return false;
     vtx_finish_jobs();  // CPU-shaded draws queued before this one go first
     MBatch &mb = raster_mbatch();
@@ -592,8 +592,9 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
         u32 j = i + 1, end = rs[i].end;
         while (j < nr && rs[j].start <= end + 64) end = std::max(end, rs[j++].end);
         const u32 at = (u32)mb.vdata.size();
-        mb.vdata.resize(at + ((end - rs[i].start + 3) & ~3u));
+        mb.vdata.resize(at + ((end - rs[i].start + 3) & ~3u));  // (not zeroed)
         memcpy(&mb.vdata[at], pptr(rs[i].start), end - rs[i].start);
+        memset(&mb.vdata[at] + (end - rs[i].start), 0, mb.vdata.size() - at - (end - rs[i].start));
         for (u32 k = i; k < j; k++) {
             const LoaderAttr &la = L.a[rs[k].attr];
             P.attr[rs[k].attr].offset = (s32)(at + (rs[k].start - rs[i].start)) - (s32)(la.stride * minv);
@@ -664,7 +665,7 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
 void vtx_draw(bool indexed) {
     cur_ds = draw_state();
     if (units.empty()) {
-        gpu_vs = metal_active() && !getenv("GPU_CPU_VS");
+        gpu_vs = hw_active() && !getenv("GPU_CPU_VS");
         units.resize(pool_threads());
         unit_draw.assign(pool_threads(), ~0ull);
         stamp.assign(65536, 0);

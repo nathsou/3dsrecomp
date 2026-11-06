@@ -27,7 +27,10 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 
-SAVE_ROOT = os.path.expanduser('~/Library/Application Support/3dsrecomp')
+if sys.platform == 'darwin':
+    SAVE_ROOT = os.path.expanduser('~/Library/Application Support/3dsrecomp')
+else:  # (runtime/platform_posix.cpp's app_data_dir)
+    SAVE_ROOT = os.path.join(os.environ.get('XDG_DATA_HOME') or os.path.expanduser('~/.local/share'), '3dsrecomp')
 DATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'data')
 TAR_BLOCK = 512
 USTAR_NAME, USTAR_PREFIX = 100, 155

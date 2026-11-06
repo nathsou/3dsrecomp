@@ -1,4 +1,4 @@
-// Cloud saves (runtime/cloud.mm): each device's save of each game in an S3-compatible bucket (Backblaze B2, ...),
+// Cloud saves (runtime/cloud.cpp): each device's save of each game in an S3-compatible bucket (Backblaze B2, ...),
 // the newest one used when the game starts.
 #pragma once
 #include <ctime>

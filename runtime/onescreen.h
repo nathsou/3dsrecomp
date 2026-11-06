@@ -1,4 +1,4 @@
-// Playing a two-screen game on one screen (runtime/onescreen.mm), for games whose profile says "onescreen": in
+// Playing a two-screen game on one screen (runtime/onescreen.cpp), for games whose profile says "onescreen": in
 // the single-screen layouts the bottom screen never shows as such; its menus come up as a panel (frontend.cpp)
 // and the rest is reached through overlays drawn over the top screen, with controls in the manner of a
 // single-screen console: a hub of the bottom screen's buttons, its map enlarged, a ring of the tools in the

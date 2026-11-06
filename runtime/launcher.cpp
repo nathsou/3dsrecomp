@@ -2,7 +2,7 @@
 #include "launcher.h"
 
 #include <SDL3/SDL.h>
-#include <TargetConditionals.h>
+#include "platform.h"
 
 #include <algorithm>
 #include <cmath>

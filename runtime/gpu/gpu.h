@@ -5,6 +5,7 @@
 // the PICA's native formats before the call returns. Callable from one thread at a time.
 #pragma once
 #include "cpu.h"
+#include "gpu_iface.h"
 
 #include <functional>
 
@@ -48,10 +49,7 @@ bool load_state(const char *path);
 // 400*scale x 240*scale, bottom 320*scale x 240*scale. The pointer stays valid until the next call
 // from the same thread. Safe to call from another thread than the one driving the GPU.
 bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h);
-// Without the copy: calls fn(rgba, w, h) under the image lock if the image at fb_paddr is not the one
-// with version `have`; returns the version of the image there (0: none).
-u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have,
-                      const std::function<void(const u32 *, int, int)> &fn);
+// Without the copy: use_display_image (gpu_iface.h).
 // Same, for the most recent display transfer to screen 0 (top, 400 lines) or 1 (bottom, 320).
 bool get_display_image(int screen, const u32 **rgba, int *w, int *h);
 // Internal resolution scale of the Metal backend (1-4), changeable while running from any thread (it

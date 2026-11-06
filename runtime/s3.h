@@ -1,4 +1,4 @@
-// S3 requests: AWS Signature Version 4 and the few replies cloud saves read (runtime/cloud.mm). Any S3-compatible
+// S3 requests: AWS Signature Version 4 and the few replies cloud saves read (runtime/cloud.cpp). Any S3-compatible
 // storage takes them: Backblaze B2, Cloudflare R2, MinIO, AWS. Path-style URLs (https://<host>/<bucket>/<key>).
 #pragma once
 #include <ctime>

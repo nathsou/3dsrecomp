@@ -134,9 +134,9 @@ void set_trust_invalidations(bool trust) { trust_invalidations = trust; }
 void invalidate_memory(u32 paddr, u32 size) {
     ensure_init();
     raster_flush();
-    metal_poll();
+    hw_poll();
     texcache_invalidate(paddr, size);
-    metal_guest_written(paddr, size, false);  // CPU cache maintenance: maybe written
+    hw_guest_written(paddr, size, false);  // CPU cache maintenance: maybe written
 }
 
 void texcache_new_epoch() {
@@ -189,7 +189,7 @@ const TexEntry *texcache_get(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) {
     if (e.epoch == epoch && !e.stale) return &e;
     const u8 *p = pptr(addr);
     if (!p || !pptr(addr + e.size - 1)) return nullptr;
-    u64 hv = hash_bytes(p, e.size);
+    u64 hv = hash_mem(p, e.size);
     if (hv != e.hash || e.lv.empty()) {
         const double t0 = now_ms();
         for (auto &l : e.lv) total_bytes -= l.data.size() * 4;

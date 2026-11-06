@@ -1,5 +1,5 @@
 // The game list of a multi-game app (RECOMP_MODULES): each game's icon and name from its SMDH; a tap or click,
-// Return or a gamepad's A starts one (runtime/launcher.mm). It has its own window, closed before the game opens.
+// Return or a gamepad's A starts one (runtime/launcher.cpp). It has its own window, closed before the game opens.
 #pragma once
 #include <string>
 #include <vector>

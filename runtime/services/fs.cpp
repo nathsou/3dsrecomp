@@ -44,7 +44,7 @@ std::string save_root() {
 }
 
 }  // namespace kernel
-// Held while the game writes its save, and while cloud saves read it (runtime/cloud.mm): never half a write
+// Held while the game writes its save, and while cloud saves read it (runtime/cloud.cpp): never half a write
 static std::mutex g_save_mx;
 void save_lock() { g_save_mx.lock(); }
 void save_unlock() { g_save_mx.unlock(); }

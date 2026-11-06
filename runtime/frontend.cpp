@@ -5,8 +5,8 @@
 #include "cloud.h"
 
 #include <SDL3/SDL.h>
-#include <TargetConditionals.h>
-#include <pthread/qos.h>
+#include <SDL3/SDL_vulkan.h>
+#include "platform.h"
 #include <unistd.h>
 
 #include <algorithm>
@@ -33,8 +33,6 @@
 #include "stacks.h"
 #include "touch.h"
 #include "uiview.h"
-
-#include <mach-o/dyld.h>
 
 using namespace std::chrono;
 
@@ -89,9 +87,123 @@ static int swapped_layout(int l) {
 // its own display; the main window then shows the top screen only
 static SDL_Window *window2;
 static SDL_Renderer *renderer2;
+
+// Renderers made on the GPU backend's own Vulkan device (gpu::present_device): the screens' images go to them on the
+// GPU (no read-back). Elsewhere (Metal, the software renderer, no Vulkan surface, GPU_PRESENT_CPU) SDL's default
+// renderer gets them through the CPU.
+static gpu::PresentDevice present_dev;
+static bool present_on;
+struct DeviceRenderer {
+    SDL_Renderer *r;
+    VkSurfaceKHR surface;
+};
+static std::vector<DeviceRenderer> device_renderers;
+static bool on_device(SDL_Renderer *r) {
+    for (const DeviceRenderer &d : device_renderers)
+        if (d.r == r) return true;
+    return false;
+}
+// before gpu::init: the instance extensions a Vulkan surface needs
+static void init_present() {
+#ifndef __APPLE__
+    if (getenv("GPU_PRESENT_CPU") || !SDL_Vulkan_LoadLibrary(nullptr)) return;
+    Uint32 n = 0;
+    const char *const *e = SDL_Vulkan_GetInstanceExtensions(&n);
+    if (!e || !n) return;
+    gpu::set_present_extensions(std::vector<std::string>(e, e + n));
+#endif
+}
+static SDL_Renderer *make_renderer(SDL_Window *w) {
+    if (present_on && SDL_Vulkan_GetPresentationSupport((VkInstance)present_dev.instance,
+                                                        (VkPhysicalDevice)present_dev.physical_device, present_dev.queue_family)) {
+        VkSurfaceKHR s{};
+        if (SDL_Vulkan_CreateSurface(w, (VkInstance)present_dev.instance, nullptr, &s)) {
+            SDL_PropertiesID p = SDL_CreateProperties();
+            SDL_SetStringProperty(p, SDL_PROP_RENDERER_CREATE_NAME_STRING, "vulkan");
+            SDL_SetPointerProperty(p, SDL_PROP_RENDERER_CREATE_WINDOW_POINTER, w);
+            SDL_SetPointerProperty(p, SDL_PROP_RENDERER_CREATE_VULKAN_INSTANCE_POINTER, present_dev.instance);
+            SDL_SetNumberProperty(p, SDL_PROP_RENDERER_CREATE_VULKAN_SURFACE_NUMBER, (Sint64)(uintptr_t)s);
+            SDL_SetPointerProperty(p, SDL_PROP_RENDERER_CREATE_VULKAN_PHYSICAL_DEVICE_POINTER, present_dev.physical_device);
+            SDL_SetPointerProperty(p, SDL_PROP_RENDERER_CREATE_VULKAN_DEVICE_POINTER, present_dev.device);
+            SDL_SetNumberProperty(p, SDL_PROP_RENDERER_CREATE_VULKAN_GRAPHICS_QUEUE_FAMILY_INDEX_NUMBER, present_dev.queue_family);
+            SDL_SetNumberProperty(p, SDL_PROP_RENDERER_CREATE_VULKAN_PRESENT_QUEUE_FAMILY_INDEX_NUMBER, present_dev.queue_family);
+            SDL_Renderer *r = SDL_CreateRendererWithProperties(p);
+            SDL_DestroyProperties(p);
+            if (r) {
+                device_renderers.push_back({r, s});
+                static bool logged;
+                if (!logged) LOG("frontend: screens drawn by SDL's Vulkan renderer on the GPU's device (no read-back)\n");
+                logged = true;
+                return r;
+            }
+            LOG("frontend: no Vulkan renderer on the GPU's device (%s); the screens go through the CPU\n", SDL_GetError());
+            SDL_Vulkan_DestroySurface((VkInstance)present_dev.instance, s, nullptr);
+        }
+    }
+    return SDL_CreateRenderer(w, nullptr);
+}
+// (and its textures: the screens' ones made on the GPU's device are dropped first, see drop_screen_textures)
+static void destroy_renderer(SDL_Renderer *r) {
+    for (size_t i = 0; i < device_renderers.size(); i++)
+        if (device_renderers[i].r == r) {
+            gpu::present_hold(true);  // (SDL waits for the whole device)
+            SDL_DestroyRenderer(r);
+            gpu::present_hold(false);
+            SDL_Vulkan_DestroySurface((VkInstance)present_dev.instance, device_renderers[i].surface, nullptr);
+            device_renderers.erase(device_renderers.begin() + i);
+            return;
+        }
+    SDL_DestroyRenderer(r);
+}
 static int vsync = 0;  // presents wait for the display's refresh (no tearing) at normal speed; off when sped up
-static SDL_Texture *tex_bottom2, *hi_bottom2;
-static int hb2w, hb2h;
+// A window the compositor does not show (another virtual desktop, covered, minimised: Wayland and XWayland stop its
+// frame callbacks) makes a present that waits for the refresh block, up to a second: the game would crawl. A present
+// that took that long turns vsync off for a while; then it is tried again
+// (for twice as long each time it happens again, up to 30 s; back to 2 s once presents are quick)
+// (the hold goes back to 2 s only once presents with vsync have stayed quick for 10 s: right after vsync is turned
+// back on the first presents are quick anyway, while the swapchain has free images.) A window the system says is
+// covered or minimized presents without vsync until it is shown again.
+static std::chrono::steady_clock::time_point vsync_held_until, vsync_on_since;
+static std::chrono::seconds vsync_hold{2};
+static bool window_hidden;
+// for the [stats] lines: the UI thread's time getting the screens' images and presenting (average and max ms), and
+// how many presents waited for vsync
+struct UiTimes {
+    double get, get_max, present, present_max;
+    int frames, vsynced;
+} ui_times;
+static void present_renderer(SDL_Renderer *r) {
+    const auto t0 = std::chrono::steady_clock::now();
+    SDL_RenderPresent(r);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    const double ms = std::chrono::duration<double, std::milli>(took).count();
+    ui_times.present += ms;
+    ui_times.present_max = std::max(ui_times.present_max, ms);
+    ui_times.vsynced += vsync != 0;
+    if (vsync && took <= std::chrono::milliseconds(50) && t0 - vsync_on_since > std::chrono::seconds(10))
+        vsync_hold = std::chrono::seconds(2);
+    if (vsync && took > std::chrono::milliseconds(50)) {
+        vsync_held_until = std::chrono::steady_clock::now() + vsync_hold;
+        vsync_hold = std::min(vsync_hold * 2, std::chrono::seconds(30));
+        vsync = 0;  // (the main loop sets it again once the hold is over)
+        SDL_SetRenderVSync(renderer, 0);
+        if (renderer2) SDL_SetRenderVSync(renderer2, 0);
+    }
+}
+// a screen's high-resolution texture in one renderer: a streaming one, or (renderers on the GPU's device) one wrapping
+// a present image the backend copies the screen's images into
+struct ScreenTex {
+    SDL_Texture *tex = nullptr;
+    int w = 0, h = 0;
+    u64 image = 0;  // (gpu::present_image_create)
+};
+static void drop_screen_tex(ScreenTex &t) {
+    if (t.tex) SDL_DestroyTexture(t.tex);
+    gpu::present_image_destroy(t.image);
+    t = ScreenTex{};
+}
+static ScreenTex hi_top, hi_bottom, hi_bottom2;
+static SDL_Texture *tex_bottom2;
 static u64 shown_ver[2];  // display image versions already uploaded (per screen)
 // the bottom screen's picture: how much of it the game drew (alpha of its render target, sampled on a grid);
 // with its background hidden by the profile ("set"), what is left floats over the top screen
@@ -185,11 +297,15 @@ void frontend_init() {
     if (const char *s = getenv("RECOMP_SCALE")) scale = atoi(s);
     layout = std::clamp(g_settings.layout, 0, frontend_layout_count() - 1);
     if (getenv("RECOMP_TOUCH")) layout = kTouchLayout;  // (trying the touch controls on a Mac)
+    init_present();
+    gpu::init();
+    present_on = gpu::present_device(&present_dev);
     window = SDL_CreateWindow(g_game.name.c_str(), layouts[layout].w * scale, layouts[layout].h * scale,
-                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (TARGET_OS_IOS ? SDL_WINDOW_FULLSCREEN : 0));
+                              SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (TARGET_OS_IOS ? SDL_WINDOW_FULLSCREEN : 0) |
+                                  (present_on ? SDL_WINDOW_VULKAN : 0));
     if (!window) FATAL("SDL_CreateWindow: %s\n", SDL_GetError());
     restore_geometry(window, g_settings.geom);
-    renderer = SDL_CreateRenderer(window, nullptr);
+    renderer = make_renderer(window);
     if (!renderer) FATAL("SDL_CreateRenderer: %s\n", SDL_GetError());
     SDL_SetRenderVSync(renderer, 0);
     apply_layout();
@@ -202,7 +318,6 @@ void frontend_init() {
     if (const char *s = getenv("RECOMP_SHOT_FROM")) shot_from = (u32)atoi(s);
     // RECOMP_SPEED=<percent>: game speed for this run (tests: e.g. 400 plays intros four times faster)
     if (const char *s = getenv("RECOMP_SPEED")) g_settings.speed = std::clamp(atoi(s), 25, 2000);
-    gpu::init();
     audio::init();
     if (gpu::scale()) scale_mode = gpu::scale_is_auto() ? 0 : gpu::scale();
     if (scale_mode == 0 && g_settings.scale) frontend_set_scale_mode(g_settings.scale);
@@ -235,12 +350,12 @@ void frontend_set_split(bool on) {
         SDL_GetWindowSize(window, &ww, &wh);
         const float k = std::min((float)ww / layouts[from].w, (float)wh / layouts[from].h);
         window2 = SDL_CreateWindow((g_game.name + " (bottom screen)").c_str(), (int)(320 * k), (int)(240 * k),
-                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY);
+                                   SDL_WINDOW_RESIZABLE | SDL_WINDOW_HIGH_PIXEL_DENSITY | (present_on ? SDL_WINDOW_VULKAN : 0));
         if (!window2) {
             LOG("frontend: cannot open the second window: %s\n", SDL_GetError());
             return;
         }
-        renderer2 = SDL_CreateRenderer(window2, nullptr);
+        renderer2 = make_renderer(window2);
         SDL_SetRenderVSync(renderer2, vsync);
         SDL_SetRenderLogicalPresentation(renderer2, 320, 240, SDL_LOGICAL_PRESENTATION_LETTERBOX);
         tex_bottom2 = SDL_CreateTexture(renderer2, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, 320, 240);
@@ -249,11 +364,12 @@ void frontend_set_split(bool on) {
         if (g_settings.fullscreen2) SDL_SetWindowFullscreen(window2, true);
     } else {
         store_geometry(window2);
-        SDL_DestroyRenderer(renderer2);  // (and its textures)
+        drop_screen_tex(hi_bottom2);
+        destroy_renderer(renderer2);  // (and its textures)
         SDL_DestroyWindow(window2);
         window2 = nullptr;
         renderer2 = nullptr;
-        tex_bottom2 = hi_bottom2 = nullptr;
+        tex_bottom2 = nullptr;
     }
     shown_ver[0] = shown_ver[1] = 0;
     apply_layout();
@@ -281,9 +397,7 @@ extern std::string g_start_game;  // main.cpp: (multi-game app) the game playing
 #endif
     LOG("frontend: restarting\n");
     unsetenv("RECOMP_INPUT");  // a test script runs once
-    char exe[4096];
-    uint32_t len = sizeof exe;
-    if (_NSGetExecutablePath(exe, &len) == 0) execv(exe, g_argv);
+    if (const std::string exe = platform::exe_path(); !exe.empty()) execv(exe.c_str(), g_argv);
     FATAL("cannot restart: %s\n", strerror(errno));
 }
 void frontend_restart() {
@@ -421,11 +535,12 @@ static void write_ppm(const char *path, const u32 *px, int w, int h) {
 // In one-screen play a picture that suddenly covers the whole screen for a few frames is a page's transition (Animal
 // Crossing wipes its bottom screen with its menus' pattern as they open and close): it is not shown, the last
 // picture stays (nullptr: keep the texture as it is). One that stays is a page of its own.
-static const u32 *bottom_stats(const u32 *img, int w, int h) {
+// (pitch: pixels from one row to the next; set to w when the picture returned is a copy)
+static const u32 *bottom_stats(const u32 *img, int w, int h, int &pitch) {
     int cover = 0, opaque = 0, dark = 0, shade = 0, n = 0;
     for (int y = h / 60; y < h; y += h / 30)
         for (int x = w / 80; x < w; x += w / 40, n++) {
-            const u32 p = img[(size_t)y * w + x], a = p >> 24;
+            const u32 p = img[(size_t)y * pitch + x], a = p >> 24;
             const u32 m = std::max({p & 255, p >> 8 & 255, p >> 16 & 255});
             cover += a > 32;
             opaque += a > 240;
@@ -445,7 +560,13 @@ static const u32 *bottom_stats(const u32 *img, int w, int h) {
         seen_partial = true;
     }
     if (onescreen::active() && seen_partial && full_run > 0 && full_run < kWipeFrames) return nullptr;
-    static std::vector<u32> keyed;
+    static std::vector<u32> keyed, packed;
+    if (onescreen::active() && pitch != w) {  // (rows next to each other for what follows)
+        packed.resize((size_t)w * h);
+        for (int y = 0; y < h; y++) memcpy(&packed[(size_t)y * w], img + (size_t)y * pitch, (size_t)w * 4);
+        img = packed.data();
+        pitch = w;
+    }
     if (onescreen::active() && n && dark > n * 6 / 10 && w <= 320) {  // (display images: keyed by the GPU)
         keyed.assign(img, img + (size_t)w * h);
         for (u32 &p : keyed) {
@@ -464,32 +585,51 @@ static const u32 *bottom_stats(const u32 *img, int w, int h) {
 }
 
 // Uploads the screen image: the GPU backend's high-resolution one when it has it, else the guest framebuffer.
-// (the high-resolution image is uploaded only when it is a new one)
-static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, SDL_Texture *&hires, int &hw, int &hh,
-                                  SDL_Texture *native, u32 *buf) {
+// (the high-resolution image is uploaded only when it is a new one; to a renderer on the GPU's device, as a copy on
+// the GPU when it is shown as the backend made it)
+static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, ScreenTex &hires, SDL_Texture *native, u32 *buf) {
     u64 *shown = shown_ver;
     kernel::FramebufferInfo f = kernel::gsp_framebuffer(screen);
     int width = screen ? 320 : 400;
     const u32 fb = f.valid ? mem::vaddr_to_paddr(f.addr_left) : 0;
-    const u64 ver = !fb ? 0 : gpu::use_display_image(fb, f.stride, screen ? 320 : 400, hires ? shown[screen] : 0, [&](const u32 *img, int w, int h) {
-        if (!hires || w != hw || h != hh) {
-            if (hires) SDL_DestroyTexture(hires);
-            hires = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, w, h);
-            SDL_SetTextureBlendMode(hires, SDL_BLENDMODE_NONE);  // (the image's alpha is the render target's)
-            hw = w;
-            hh = h;
+    const u64 ver = !fb ? 0 : gpu::use_display_image(fb, f.stride, screen ? 320 : 400, hires.tex ? shown[screen] : 0, [&](const gpu::ScreenImage &si) {
+        int pitch = si.pitch;
+        const u32 *img = screen == 1 ? bottom_stats(si.px, si.w, si.h, pitch) : si.px;
+        if (!img) return;  // (keeps the texture as it is)
+        const bool on_gpu = si.copy_to && img == si.px && on_device(r);
+        if (!hires.tex || si.w != hires.w || si.h != hires.h || on_gpu != (hires.image != 0)) {
+            drop_screen_tex(hires);
+            if (on_gpu && (hires.image = gpu::present_image_create(si.w, si.h))) {
+                SDL_PropertiesID p = SDL_CreateProperties();
+                SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_FORMAT_NUMBER, SDL_PIXELFORMAT_ABGR8888);
+                SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
+                SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, si.w);
+                SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, si.h);
+                SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_VULKAN_TEXTURE_NUMBER, (Sint64)hires.image);
+                hires.tex = SDL_CreateTextureWithProperties(r, p);
+                SDL_DestroyProperties(p);
+                if (!hires.tex) {
+                    LOG("frontend: cannot wrap the GPU's image (%s)\n", SDL_GetError());
+                    gpu::present_image_destroy(hires.image);
+                    hires.image = 0;
+                }
+            }
+            if (!hires.tex) hires.tex = SDL_CreateTexture(r, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING, si.w, si.h);
+            SDL_SetTextureBlendMode(hires.tex, SDL_BLENDMODE_NONE);  // (the image's alpha is the render target's)
+            hires.w = si.w;
+            hires.h = si.h;
         }
-        if (screen == 1) img = bottom_stats(img, w, h);
-        if (img) SDL_UpdateTexture(hires, nullptr, img, w * 4);
+        if (!hires.image || !si.copy_to(hires.image)) SDL_UpdateTexture(hires.tex, nullptr, img, pitch * 4);
     });
     static u32 last_fb;
     if (screen == 0 && (ver ? ver != shown[0] : f.addr_left != last_fb)) game_frames++;  // a new image: the game's fps
     if (screen == 0) last_fb = f.addr_left;
     shown[screen] = ver;
-    if (ver) return hires;
+    if (ver) return hires.tex;
     convert_fb(f, width, buf);
-    const u32 *pic = screen == 1 ? bottom_stats(buf, width, 240) : buf;  // (opaque: no alpha in guest memory)
-    if (pic) SDL_UpdateTexture(native, nullptr, pic, width * 4);
+    int pitch = width;
+    const u32 *pic = screen == 1 ? bottom_stats(buf, width, 240, pitch) : buf;  // (opaque: no alpha in guest memory)
+    if (pic) SDL_UpdateTexture(native, nullptr, pic, pitch * 4);
     return native;
 }
 
@@ -946,11 +1086,15 @@ static void present() {
         return;
     }
     last_drawn = t;
-    static SDL_Texture *hi_top, *hi_bottom;
-    static int htw, hth, hbw, hbh;
-    SDL_Texture *t_top = upload_screen(renderer, 0, hi_top, htw, hth, tex_top, top);
-    SDL_Texture *t_bottom = window2 ? upload_screen(renderer2, 1, hi_bottom2, hb2w, hb2h, tex_bottom2, bottom)
-                                    : upload_screen(renderer, 1, hi_bottom, hbw, hbh, tex_bottom, bottom);
+    SDL_Texture *t_top = upload_screen(renderer, 0, hi_top, tex_top, top);
+    SDL_Texture *t_bottom = window2 ? upload_screen(renderer2, 1, hi_bottom2, tex_bottom2, bottom)
+                                    : upload_screen(renderer, 1, hi_bottom, tex_bottom, bottom);
+    {
+        const double ms = std::chrono::duration<double, std::milli>(steady_clock::now() - t).count();
+        ui_times.get += ms;
+        ui_times.get_max = std::max(ui_times.get_max, ms);
+        ui_times.frames++;
+    }
     if (window2) {
         SDL_SetRenderDrawColor(renderer2, 0, 0, 0, 255);
         SDL_RenderClear(renderer2);
@@ -960,7 +1104,7 @@ static void present() {
         SDL_RenderTexture(renderer2, t_bottom, nullptr, &full);
         stacks::draw(renderer2, full, r.w > 0 ? r.w / 320 : 1, 1);
         write_window_shot(renderer2, "window2");
-        SDL_RenderPresent(renderer2);
+        present_renderer(renderer2);
     }
     SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
     SDL_RenderClear(renderer);
@@ -1022,7 +1166,7 @@ static void present() {
     if (touch::enabled() && !menu::is_open() && !menu::keyboard_open()) touch::draw();
     menu::draw();
     write_window_shot(renderer, "window");
-    SDL_RenderPresent(renderer);
+    present_renderer(renderer);
     frame_count++;
     g_frame = frame_count;
     if (shot_frame && frame_count >= shot_from && frame_count % shot_frame == 0) {
@@ -1324,7 +1468,8 @@ static void swap_screens() {
 // GX commands run on their own thread so a slow frame never delays VBlank or presentation
 
 static void gpu_thread() {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    platform::set_thread_name("gx");
+    platform::set_thread_interactive();
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(gpu_m);
@@ -1342,7 +1487,8 @@ static std::mutex input_m;
 static InputSnapshot input_now{};
 
 static void hid_thread() {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    platform::set_thread_name("hid");
+    platform::set_thread_interactive();
     const auto period = nanoseconds(1000000000ll / 234);
     auto next = steady_clock::now();
     for (;;) {
@@ -1358,7 +1504,8 @@ static void hid_thread() {
 }
 
 static void audio_thread() {
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+    platform::set_thread_name("dsp");
+    platform::set_thread_interactive();
     auto next = steady_clock::now();
     for (;;) {
         next += nanoseconds(1000000000ll * 160 / 32728 * 100 / g_settings.speed);
@@ -1476,6 +1623,15 @@ void frontend_run() {
             }
             if (ev.type == SDL_EVENT_WINDOW_MOVED || ev.type == SDL_EVENT_WINDOW_RESIZED)
                 store_geometry(SDL_GetWindowFromID(ev.window.windowID));
+            if (ev.type >= SDL_EVENT_WINDOW_FIRST && ev.type <= SDL_EVENT_WINDOW_LAST &&
+                ev.window.windowID == SDL_GetWindowID(window)) {
+                if (ev.type == SDL_EVENT_WINDOW_OCCLUDED || ev.type == SDL_EVENT_WINDOW_HIDDEN ||
+                    ev.type == SDL_EVENT_WINDOW_MINIMIZED)
+                    window_hidden = true;
+                if (ev.type == SDL_EVENT_WINDOW_EXPOSED || ev.type == SDL_EVENT_WINDOW_SHOWN ||
+                    ev.type == SDL_EVENT_WINDOW_RESTORED)
+                    window_hidden = false;
+            }
             int ex, ey;  // Esc while the game's own keyboard is up: its close key, when the profile names one
             if (typing && ev.type == SDL_EVENT_KEY_DOWN && ev.key.scancode == SDL_SCANCODE_ESCAPE && !menu::is_open() &&
                 profile::key("escape", ex, ey)) {
@@ -1572,8 +1728,11 @@ void frontend_run() {
         }
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
         kernel::set_clock_speed((u32)g_settings.speed);
-        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC"); v != vsync) {
+        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC") && !window_hidden &&
+                          steady_clock::now() >= vsync_held_until;
+            v != vsync) {
             vsync = v;
+            vsync_on_since = steady_clock::now();
             SDL_SetRenderVSync(renderer, vsync);
             if (renderer2) SDL_SetRenderVSync(renderer2, vsync);
         }
@@ -1652,10 +1811,21 @@ void frontend_run() {
                     u64 lists = kernel::gx_stats.cmdlists, ns = kernel::gx_stats.gpu_ns;
                     u64 xf = kernel::gx_stats.transfers;
                     static u64 last_games;
-                    LOG("[stats] %llu vblanks/%.0fs, %llu game frames, %llu cmdlists, %llu display transfers, gpu %.1f ms/s\n",
+                    LOG("[stats] %llu vblanks/%.0fs, %llu game frames, %llu cmdlists, %llu display transfers, "
+                        "command lists %.1f ms/s\n",
                         (unsigned long long)(frame_count - last_frames), span, (unsigned long long)(game_frames - last_games),
                         (unsigned long long)(lists - last_lists), (unsigned long long)(xf - last_xfers),
                         (ns - last_ns) / (span * 1e6));
+                    if (ui_times.frames) {
+                        const UiTimes &u = ui_times;
+                        LOG("[stats] UI: images %.1f ms (max %.1f), present %.1f ms (max %.1f), %d of %d with vsync\n",
+                            u.get / u.frames, u.get_max, u.present / u.frames, u.present_max, u.vsynced, u.frames);
+                        ui_times = {};
+                    }
+                    {
+                        const std::string th = platform::thread_cpu_report(span);
+                        if (!th.empty()) LOG("[stats] CPU ms/s: %s\n", th.c_str());
+                    }
                     last_games = game_frames;
                     last_xfers = xf;
                     last_frames = frame_count;

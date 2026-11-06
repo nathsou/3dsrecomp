@@ -112,7 +112,7 @@ struct Thread : WaitObject {
     u32 entry = 0;
     std::condition_variable cv;
     std::thread host;
-    unsigned mach = 0;  // host thread's Mach port (thread dumps sample its stack for the guest call chain)
+    u64 host_id = 0;  // the host thread (platform::thread_handle: thread dumps sample its stack for the guest call chain)
     u64 ready_seq = 0;
     // waiting
     std::vector<std::shared_ptr<WaitObject>> wait_objs;

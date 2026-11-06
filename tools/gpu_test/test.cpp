@@ -662,6 +662,29 @@ static void test_transfers() {
 }
 
 // ---------------------------------------------------------------- command list details
+// the per-format display transfer conversion against the generic loop, for every format pair, scaling, flip,
+// tiling and swizzle mode, on random pixels: byte for byte
+static void test_transfer_convert() {
+    const u32 w = 32, h = 16;
+    std::vector<u8> src(w * h * 4 + 64), a(w * h * 4 + 64), b(w * h * 4 + 64);
+    u32 seed = 12345;
+    for (auto &x : src) x = (u8)((seed = seed * 1664525u + 1013904223u) >> 24);
+    int bad = 0, cases = 0;
+    for (u32 inf = 0; inf < 8; inf++)
+        for (u32 outf = 0; outf < 8; outf++)
+            for (u32 sc = 0; sc < 3; sc++)
+                for (u32 m = 0; m < 8; m++) {  // flip, linear input, don't swizzle
+                    const u32 flags = (m & 1) | ((m >> 1) & 1) << 1 | ((m >> 2) & 1) << 5 | inf << 8 | outf << 12 | sc << 24;
+                    const u32 dims = h << 16 | w;
+                    for (size_t i = 0; i < a.size(); i++) a[i] = b[i] = (u8)(i * 7);
+                    transfer_convert_ref(src.data(), a.data(), dims, dims, flags);
+                    transfer_convert(src.data(), b.data(), dims, dims, flags);
+                    cases++;
+                    if (a != b && bad++ < 3) printf("  transfer_convert differs: formats %u -> %u, scaling %u, mode %u\n", inf, outf, sc, m);
+                }
+    CHECK(bad == 0, "transfer_convert matches the generic loop (%d of %d cases differ)", bad, cases);
+}
+
 static void test_cmdlist() {
     Cmd c;
     // masked write
@@ -1185,6 +1208,7 @@ int main(int argc, char **argv) {
     test_cmdlist();
     test_tev();
     test_transfers();
+    test_transfer_convert();
     test_raster_coverage();
     test_cull_and_depth();
     test_vertex_arrays();
