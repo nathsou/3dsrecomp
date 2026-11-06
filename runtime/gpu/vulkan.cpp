@@ -1640,6 +1640,7 @@ struct DisplayImage {
     u64 version = 0;
     BufP buf;     // the image (RGBA8 rows), host-cached
     u64 tl = 0;   // while the image is still being made: the timeline value that completes it
+    bool direct = false;  // made by vk_display_transfer: guest memory is final already, only the image is pending
 };
 std::mutex disp_mtx;
 std::unordered_map<u32, DisplayImage> displays;
@@ -1714,13 +1715,15 @@ void drain(size_t i) {
 void drain_all() {
     if (!pending.empty()) drain(pending.size() - 1);
 }
-bool op_touches(const PendingXfer &op, u32 paddr, u32 size) {
+// keep: a target whose own pending write-back may stay pending (it is about to be drawn into: its GPU copy stays
+// newer than what the write-back puts in guest memory, and its next write-back replaces that)
+bool op_touches(const PendingXfer &op, u32 paddr, u32 size, const GRT *keep = nullptr) {
     return overlaps(op.out_paddr, op.out_size, paddr, size) ||
-           (op.rt_writeback && overlaps(op.rt->addr, rt_bytes(*op.rt), paddr, size));
+           (op.rt_writeback && op.rt != keep && overlaps(op.rt->addr, rt_bytes(*op.rt), paddr, size));
 }
-void drain_touching(u32 paddr, u32 size) {
+void drain_touching(u32 paddr, u32 size, const GRT *keep = nullptr) {
     for (size_t i = pending.size(); i-- > 0;)
-        if (op_touches(*pending[i], paddr, size)) {
+        if (op_touches(*pending[i], paddr, size, keep)) {
             drain(i);
             return;
         }
@@ -2402,8 +2405,9 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
     const u32 H = hc == hd ? hc : rt.h;
     GRT &col = target_for(rt.color_addr, rt.w, H, rt.color_fmt, false);
     GRT *dep = has_dep ? &target_for(rt.depth_addr, rt.w, H, rt.depth_fmt, true) : nullptr;
-    drain_touching(col.addr, rt_bytes(col));
-    if (dep) drain_touching(dep->addr, rt_bytes(*dep));
+    // (a game that draws a frame into the target it just transferred to the screen does not wait for that transfer)
+    drain_touching(col.addr, rt_bytes(col), &col);
+    if (dep) drain_touching(dep->addr, rt_bytes(*dep), dep);
     for (auto &o : rts) {
         if (o.get() == &col || o.get() == dep) continue;
         const bool ov_c = overlaps(o->addr, rt_bytes(*o), col.addr, rt_bytes(col));
@@ -2935,6 +2939,11 @@ void vk_poll() {
     }
     const u64 done = completed_value();
     while (!pending.empty() && pending.front()->tl <= done) drain(0);
+    {  // images vk_display_transfer made that the GPU finished: their buffers can be recycled when replaced
+        std::lock_guard<std::mutex> lk(disp_mtx);
+        for (auto &[addr, d] : displays)
+            if (d.direct && d.tl && d.tl <= done) d.tl = 0;
+    }
 }
 
 void vk_end_list() {
@@ -2989,7 +2998,8 @@ void drop_displays(u32 paddr, u32 size, bool definite) {
     std::lock_guard<std::mutex> lk(disp_mtx);
     for (auto it = displays.begin(); it != displays.end();) {
         DisplayImage &d = it->second;
-        if (overlaps(d.out_addr, d.out_size, paddr, size) && (definite || (!d.tl && hash_bytes(pptr(d.out_addr), d.out_size) != d.out_hash))) {
+        if (overlaps(d.out_addr, d.out_size, paddr, size) &&
+            (definite || ((!d.tl || d.direct) && hash_bytes(pptr(d.out_addr), d.out_size) != d.out_hash))) {
             if (g_stats)
                 LOG("gpu vulkan: display image %08x dropped (%s write %08x+%x)\n", d.out_addr, definite ? "GPU" : "CPU",
                     paddr, size);
@@ -3203,13 +3213,14 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
     if (src->clear_next) clear_now(*src);
     barrier(cb);
     encode_rot(cb, *src, *buf, rows, flags, row0);
-    wait_value(submit(), "display image", out_paddr);
+    const u64 tl = submit();  // (not waited for: the UI waits if it reads the image before the GPU made it)
     const u32 hs = ((flags >> 24) & 3) ? 1 : 0, vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
     const u32 out_size = (out_w0 >> hs) * (out_h0 >> vs) * pixel_bytes((flags >> 12) & 7);
     std::lock_guard<std::mutex> lk(disp_mtx);
     DisplayImage &d = new_display(out_paddr, out_size, out_dims, flags, rows, TW);
     d.out_hash = hash_bytes(pptr(out_paddr), out_size);
-    d.tl = 0;
+    d.tl = tl;
+    d.direct = true;
     d.buf = buf;
     d.incomplete = src->skipped > 0;
     src->skipped = 0;
