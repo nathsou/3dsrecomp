@@ -85,8 +85,9 @@ Time Trials and battles with every course and arena, at full speed with music an
 gives the console one, the Mii selector's standard Mii, in Mii Maker's database (`CFL_DB.dat` in shared extdata
 F000000B, made when it is missing), so the game's own Mii character is that Mii; its face needs the Mii data system
 archive, as in Tomodachi Life. A save from a real console (`system0.dat`, `system1.dat` and `replay/`, copied into
-the save folder) keeps its unlocked cups, characters and parts. Online play, StreetPass, SpotPass, local multiplayer
-and the Mario Kart Channel's communities are not supported.
+the save folder) keeps its unlocked cups, characters and parts; Checkpoint leaves out the save's empty `replay_`
+folder, which the game needs (without it the save is "corrupted" and reset), so make it when copying such a backup.
+Online play, StreetPass, SpotPass, local multiplayer and the Mario Kart Channel's communities are not supported.
 
 **Kid Icarus: Uprising** (EUR, `CTR-P-AKDP`, title 0004000000030200, extracted from the eShop CIA with your
 console's keys, see below) runs: the first-boot dialogs, the title screen, the profile and file select, the Mobiclip
@@ -94,6 +95,32 @@ movies (converted by the `y2r` service), the controls tutorial and Chapter 1's a
 speed (built with `-DGAME=kiu` from `data/kiu`). Its aiming, done with the stylus on a 3DS, also works with the right
 stick or the mouse, without the touch screen (see [Playing on one screen](#playing-on-one-screen)). StreetPass,
 SpotPass, Together (online and local play), AR cards and the Mii data are not supported.
+On Linux (RTX 4060 Ti) the menus and the tutorial run at the game's 30 fps; battles run at 24-28 fps with the default
+4x anti-aliasing (the game draws its bloom into its depth buffer's memory every frame, which costs a multisampled
+depth write-back on devices without stencil export) and at 30 fps with anti-aliasing off (menu: Graphics).
+
+**The Legend of Zelda: A Link Between Worlds** (EUR/USA, `CTR-P-BZLP`, title 00040000000EC400, extracted from its CIA
+with your console's keys) runs (built with `-DGAME=albw` from `data/albw`): the title screen and its attract scenes,
+file select, naming the file on the system keyboard, the opening (the dream, Link's house with Gulley) and Link on
+foot with the bottom-screen map, gear and items, with music and sound. It needed no runtime changes.
+
+**Kirby: Triple Deluxe** (EUR, `CTR-P-BALP`, title 000400000010C000, extracted from its CIA with your console's keys)
+runs (built with `-DGAME=kirbytd` from `data/kirbytd`): save creation, the opening, the title screen and its attract
+movies, file select, the story intro and the first level of Fine Fields (Dreamstalk) with the touch-screen HUD and
+pause menu, with music and sound. It needed no runtime changes.
+
+**Star Fox 64 3D** (EUR, `CTR-P-ANRP`, title 0004000000049100) does not play yet (built with `-DGAME=starfox` from
+`data/starfox`): it boots, formats its save and shows "Initialising game data...", where it stays. Its main thread
+then polls a task in its scheduler (`0x3696c8`: `svcGetSystemTick` and a mutex on every turn) that no thread or
+service ever advances; on a later boot it finds the save empty, calls it corrupted and formats it again.
+
+The European editions of **New Super Mario Bros. 2** (`CTR-P-ABEP`, title 000400000007AF00, `-DGAME=nsmb2`) and
+**Tomodachi Life** (`CTR-P-EC6P`, title 000400000008C400, `-DGAME=tomodachi`), extracted from their CIAs, run as the
+American ones do (NSMB2 also from a real console's save). NSMB2's profile (scene focus, HUD) has the American
+build's addresses, so the European one plays without it.
+
+Titles that use seed crypto (Metroid: Samus Returns EUR, Kirby: Planet Robobot, Captain Toad: Treasure Tracker) need
+their seed to be extracted: `--seeddb` with GodMode9's `seeddb.bin`, see step 1 below.
 
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
