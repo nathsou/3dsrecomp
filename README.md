@@ -95,9 +95,7 @@ movies (converted by the `y2r` service), the controls tutorial and Chapter 1's a
 speed (built with `-DGAME=kiu` from `data/kiu`). Its aiming, done with the stylus on a 3DS, also works with the right
 stick or the mouse, without the touch screen (see [Playing on one screen](#playing-on-one-screen)). StreetPass,
 SpotPass, Together (online and local play), AR cards and the Mii data are not supported.
-On Linux (RTX 4060 Ti) the menus and the tutorial run at the game's 30 fps; battles run at 24-28 fps with the default
-4x anti-aliasing (the game draws its bloom into its depth buffer's memory every frame, which costs a multisampled
-depth write-back on devices without stencil export) and at 30 fps with anti-aliasing off (menu: Graphics).
+On Linux (RTX 4060 Ti) it runs at the game's 30 fps, battles included, at 2x resolution with 4x anti-aliasing.
 
 **The Legend of Zelda: A Link Between Worlds** (EUR/USA, `CTR-P-BZLP`, title 00040000000EC400, extracted from its CIA
 with your console's keys) runs (built with `-DGAME=albw` from `data/albw`): the title screen and its attract scenes,
@@ -109,15 +107,17 @@ runs (built with `-DGAME=kirbytd` from `data/kirbytd`): save creation, the openi
 movies, file select, the story intro and the first level of Fine Fields (Dreamstalk) with the touch-screen HUD and
 pause menu, with music and sound. It needed no runtime changes.
 
-**Star Fox 64 3D** (EUR, `CTR-P-ANRP`, title 0004000000049100) does not play yet (built with `-DGAME=starfox` from
-`data/starfox`): it boots, formats its save and shows "Initialising game data...", where it stays. Its main thread
-then polls a task in its scheduler (`0x3696c8`: `svcGetSystemTick` and a mutex on every turn) that no thread or
-service ever advances; on a later boot it finds the save empty, calls it corrupted and formats it again.
+**Star Fox 64 3D** (EUR, `CTR-P-ANRP`, title 0004000000049100, extracted from its CIA with your console's keys) runs
+(built with `-DGAME=starfox` from `data/starfox`): save creation, the opening, the story intro, the title menu, the
+control settings and the training course, flying the Arwing at the game's 30 fps with music and sound. It formats its
+save on a worker thread and only then marks the task as running, so formatting takes 50 ms here as on a 3DS
+(instant, the worker's "done" was overwritten and the game waited for good). Its main thread runs the game's own
+fibers and polls the clock while they wait, so it keeps one host core busy. The gyroscope reads at rest.
 
 The European editions of **New Super Mario Bros. 2** (`CTR-P-ABEP`, title 000400000007AF00, `-DGAME=nsmb2`) and
 **Tomodachi Life** (`CTR-P-EC6P`, title 000400000008C400, `-DGAME=tomodachi`), extracted from their CIAs, run as the
-American ones do (NSMB2 also from a real console's save). NSMB2's profile (scene focus, HUD) has the American
-build's addresses, so the European one plays without it.
+American ones do (NSMB2 also from a real console's save). The two NSMB2 builds have the same data layout, so they
+share one profile (`games/profiles/nsmb2.txt`: scene focus, the HUD).
 
 Titles that use seed crypto (Metroid: Samus Returns EUR, Kirby: Planet Robobot, Captain Toad: Treasure Tracker) need
 their seed to be extracted: `--seeddb` with GodMode9's `seeddb.bin`, see step 1 below.
