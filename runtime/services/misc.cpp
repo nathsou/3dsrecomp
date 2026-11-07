@@ -1,6 +1,7 @@
 // Small services: ptm, ndm, ac, frd, boss, cecd, news, ir, mic, cam, y2r, ldr:ro, soc, ssl, http, ...
 #include <algorithm>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #include "../loader.h"
@@ -152,10 +153,20 @@ struct Ndm : Service {
     }
 };
 
+// cecd:u (StreetPass): message boxes kept in memory for the session. Games look for their box at start and create it
+// when it is missing (OpenAndRead fails, OpenAndWrite + SetData make it), so files written can be read back; nothing
+// is ever exchanged.
 struct Cecd : Service {
     using Service::Service;
     std::shared_ptr<Event> info = make_event(ONESHOT, "cecd info");
     std::shared_ptr<Event> state = make_event(ONESHOT, "cecd state");
+    std::map<std::pair<u32, u32>, std::vector<u8>> files;  // (program id, path type) -> contents
+    std::pair<u32, u32> cur{0, 0};                           // the file Open chose (one session in practice)
+    static constexpr u32 NOT_FOUND = 0xC8A11BFA;
+    void reply_buffer(IPC &ipc, int pos, u32 size, u32 addr, u32 perm) {
+        ipc.set(pos, (size << 4) | perm);
+        ipc.set(pos + 1, addr);
+    }
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
         case 0x000F:  // GetCecInfoEventHandle
@@ -170,11 +181,70 @@ struct Cecd : Service {
             ipc.ok(2);
             ipc.set(2, 1);  // idle
             break;
-        case 0x0001:  // Open -> fails: no message box
-        case 0x0002:
-            ipc.result(0xC8A11BFA, 2);
-            ipc.set(2, 0);
+        case 0x0001: {  // Open(program id, path type, open mode, pid) -> file size
+            cur = {ipc[1], ipc[2]};
+            auto it = files.find(cur);
+            if (it == files.end() && (ipc[3] & 8)) it = files.emplace(cur, std::vector<u8>{}).first;  // create
+            if (it == files.end()) {
+                ipc.result(NOT_FOUND, 2);
+                ipc.set(2, 0);
+            } else {
+                ipc.ok(2);
+                ipc.set(2, (u32)it->second.size());
+            }
             break;
+        }
+        case 0x0002: {  // Read(size, buffer) -> read size
+            auto it = files.find(cur);
+            u32 n = it == files.end() ? 0 : std::min<u32>(ipc[1], (u32)it->second.size());
+            if (n) memcpy(gptr(ipc[3]), it->second.data(), n);
+            ipc.result(it == files.end() ? NOT_FOUND : 0, 2, 2);
+            ipc.set(2, n);
+            reply_buffer(ipc, 3, ipc[1], ipc[3], 0xC);
+            break;
+        }
+        case 0x0005: {  // Write(size, buffer)
+            const u8 *p = (const u8 *)gptr(ipc[3]);
+            files[cur].assign(p, p + ipc[1]);
+            ipc.ok(1, 2);
+            reply_buffer(ipc, 2, ipc[1], ipc[3], 0xA);
+            break;
+        }
+        case 0x0008:  // Delete(program id, path type, is outbox, message id size, pid, message id)
+            files.erase({ipc[1], ipc[2]});
+            ipc.ok(1, 2);
+            reply_buffer(ipc, 2, ipc[4], ipc[7], 0xA);
+            break;
+        case 0x0009:  // SetData(program id, size, option, buffer)
+            ipc.ok(1, 2);
+            reply_buffer(ipc, 2, ipc[2], ipc[5], 0xA);
+            break;
+        case 0x000A:  // ReadData(dest size, info type, param size, param buffer, dest buffer)
+            memset(gptr(ipc[7]), 0, ipc[1]);
+            ipc.ok(1, 4);
+            reply_buffer(ipc, 2, ipc[3], ipc[5], 0xA);
+            reply_buffer(ipc, 4, ipc[1], ipc[7], 0xC);
+            break;
+        case 0x000B:  // Start
+        case 0x000C:  // Stop
+            ipc.ok();
+            break;
+        case 0x0011: {  // OpenAndWrite(size, program id, path type, open mode, pid, buffer)
+            const u8 *p = (const u8 *)gptr(ipc[8]);
+            files[{ipc[2], ipc[3]}].assign(p, p + ipc[1]);
+            ipc.ok(1, 2);
+            reply_buffer(ipc, 2, ipc[1], ipc[8], 0xA);
+            break;
+        }
+        case 0x0012: {  // OpenAndRead(size, program id, path type, open mode, pid, buffer) -> read size
+            auto it = files.find({ipc[2], ipc[3]});
+            u32 n = it == files.end() ? 0 : std::min<u32>(ipc[1], (u32)it->second.size());
+            if (n) memcpy(gptr(ipc[8]), it->second.data(), n);
+            ipc.result(it == files.end() ? NOT_FOUND : 0, 2, 2);
+            ipc.set(2, n);
+            reply_buffer(ipc, 3, ipc[1], ipc[8], 0xC);
+            break;
+        }
         default:
             unimplemented(ipc);
         }
