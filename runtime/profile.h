@@ -101,6 +101,17 @@ struct Stacks {
     u32 underfoot_off = 0;          // the item the player stands on, at this offset in the player (0: none)
 };
 
+// aiming with a stick and the mouse through the game's own data (runtime/aim.cpp)
+struct Aim {
+    u32 delta_ret = 0, delta_x = 0, delta_y = 0;  // where the frame's aim delta is (sp + offsets)
+    int delta_per = -1;                           // a rate: the frame time is in this s register
+    int active_reg = -1;                          // the game's "aim input" byte: register + offset (-1: none)
+    u32 active_off = 0;
+    std::vector<u32> delta_on;                    // calls made while it is there
+    float stick_speed = 300;                      // the right stick at full tilt: top-screen pixels per second
+    int cond = -2;                                // when it applies (-2: never)
+};
+
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none
 bool loaded();
 bool has_focus_rules();
@@ -124,6 +135,7 @@ const std::vector<HubEntry> &hub();
 const std::vector<MapArea> &map_areas();
 const Tools &tools();
 const Stacks &stacks();
+const Aim &aim();
 // read from guest memory now, from any thread (runtime flags: as of the last update)
 bool value_now(int i, s64 &v, u32 *at = nullptr);
 bool cond_now(int i);

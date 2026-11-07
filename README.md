@@ -88,6 +88,13 @@ archive, as in Tomodachi Life. A save from a real console (`system0.dat`, `syste
 the save folder) keeps its unlocked cups, characters and parts. Online play, StreetPass, SpotPass, local multiplayer
 and the Mario Kart Channel's communities are not supported.
 
+**Kid Icarus: Uprising** (EUR, `CTR-P-AKDP`, title 0004000000030200, extracted from the eShop CIA with your
+console's keys, see below) runs: the first-boot dialogs, the title screen, the profile and file select, the Mobiclip
+movies (converted by the `y2r` service), the controls tutorial and Chapter 1's air battle and land battle, at full
+speed (built with `-DGAME=kiu` from `data/kiu`). Its aiming, done with the stylus on a 3DS, also works with the right
+stick or the mouse, without the touch screen (see [Playing on one screen](#playing-on-one-screen)). StreetPass,
+SpotPass, Together (online and local play), AR cards and the Mii data are not supported.
+
 Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline: a libctru test app (framebuffer graphics,
 console on the bottom screen, sdmc file reading, input) runs, see [Homebrew](#homebrew-3dsx).
 
@@ -376,6 +383,27 @@ bottom screen never shows as such: the game plays like a single-screen Animal Cr
 - The Mac's keyboard types into the game's own keyboard (names, letters, chat) whenever it is up.
 - Tab, the right stick's click and the touch controls' swap button open the hub too (on iOS the hub's entries
   and the menus are tapped).
+
+**Kid Icarus: Uprising on one screen.** In the "top screen only" layout (with "Automatic screen" on) battles fill
+the window with the top screen; the bottom screen, where Palutena and the others talk, comes up in the corner when its
+picture changes. The menus, which are on the bottom screen, come up as a panel over the top one; they all take the
+d-pad (or the circle pad) and A/B, and the mouse clicks them.
+
+In battle the reticle and the camera, which the stylus moves on a 3DS, are moved by the right stick or the mouse,
+in any layout: they go into the game's own aim (the same as its "reticle with buttons" option), so the reticle stays
+where it is put and the camera turns when it reaches the side of the screen, in the air and on land, with the game's
+settings left as they are. Nothing is played on the touch screen. "Aim speed" (menu: Speed & audio) sets how fast
+both aim.
+
+| Kid Icarus: Uprising | Gamepad (Switch Pro Controller, ...) | Mouse and keyboard |
+|---|---|---|
+| Move (a quick push: dash) | Left stick | WASD (Space with a direction: dash) |
+| Aim, turn the camera | Right stick | Mouse (captured during battles; Esc frees it) |
+| Fire (hold: continuous fire, release when charged: charged shot) | ZR or L | Left button |
+| Centre the camera | ZL or R | Right button |
+| Select a power / use it | D-pad left, right / down | Q, E / F |
+| Change the view | D-pad up | R |
+| Pause | Start | Return |
 
 **Stacks in the pockets** (the menu's "Stack items", in any layout, on by default): as in New Horizons, several of
 the same item share one pocket, with the count on it: flowers, seed bags, saplings, shrub starts, shells,
