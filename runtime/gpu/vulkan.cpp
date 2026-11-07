@@ -179,6 +179,7 @@ std::vector<Cmd *> free_cmds;
 Cmd *cur = nullptr;
 std::vector<BufP> chunk_free;
 size_t chunk_off = 0;
+size_t chunk_last = SIZE_MAX;  // offset of the last slice taken from the current chunk (the only one arena_trim may shrink)
 constexpr size_t kChunkBytes = 4u << 20, kMaxFreeChunks = 16;
 VkQueryPool qpool = VK_NULL_HANDLE;
 constexpr u32 kQuerySlots = 256;
@@ -349,11 +350,14 @@ Slice arena(size_t n) {
         chunk_off = 0;
     }
     Slice s{ch.back().get(), chunk_off, ch.back()->p + chunk_off};
+    chunk_last = chunk_off;
     chunk_off += n;
     return s;
 }
+// gives back the end of the last slice taken (only `used` bytes of it were needed); a slice with others taken after
+// it keeps its size (they lie beyond its end)
 void arena_trim(const Slice &s, size_t used) {
-    if (cur && !cur->chunks.empty() && s.buf == cur->chunks.back().get() && s.off <= chunk_off)
+    if (cur && !cur->chunks.empty() && s.buf == cur->chunks.back().get() && s.off == chunk_last)
         chunk_off = std::min(chunk_off, s.off + ((used + 255) & ~(size_t)255));
 }
 void ensure_buffer(BufP &b, size_t n, Mem m = Mem::Readback) {
