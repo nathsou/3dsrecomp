@@ -340,10 +340,15 @@ static void log_romfs_read(u64 off) {
 // load before the code that started it has set up for its end (Animal Crossing: New Leaf's map process cleared
 // its own "ready" flag after a synchronous load, leaving the village's bottom screen blank and untouchable).
 // RECOMP_FS_DELAY=0 turns it off.
-static void romfs_read_delay(IPC &ipc, u32 len) {
+static void fs_delay(IPC &ipc, u64 ns) {
     static const bool on = !getenv("RECOMP_FS_DELAY") || atoi(getenv("RECOMP_FS_DELAY")) != 0;
-    if (on) sleep_current(std::max<u64>((u64)len * 94 + 582778, 663124), *ipc.lk);
+    if (on) sleep_current(ns, *ipc.lk);
 }
+static void romfs_read_delay(IPC &ipc, u32 len) { fs_delay(ipc, std::max<u64>((u64)len * 94 + 582778, 663124)); }
+// Formatting a save takes a while on a 3DS too (erasing the card's flash, or writing the SD card's save image): Star
+// Fox 64 3D formats on a worker thread and marks the task running only after creating it, so an instant format let
+// the worker report "done" first and the mark overwrote it (stuck on "Initialising game data..." for good). The
+// formatting thread sleeps 50 ms after the reply.
 
 static std::string archive_dir(u32 id, const LowPath &p) {
     std::string root = save_root();
@@ -797,6 +802,7 @@ struct FsUser : Service {
             LOG("[fs] formatted save data at %s\n", d.c_str());
             save_changed(d);
             ipc.ok();
+            fs_delay(ipc, 50000000);
             break;
         }
         case 0x0845: {  // GetFormatInfo(archive id, path type, size, desc, ptr)
