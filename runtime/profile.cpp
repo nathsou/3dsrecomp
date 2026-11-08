@@ -5,6 +5,12 @@
 //       a game. Wherever a number goes, a symbol's name may stand instead (defined on an earlier line). Start:
 //         vtable <class>   the address a class's objects hold as their vtable pointer, from the game's RTTI
 //                          (classes outside namespaces with one primary vtable, CRO modules' too)
+//         string "<text>"  the address of that NUL-terminated text in the program's read-only data (its first
+//                          occurrence that starts a string): with "user", the functions using it, for games
+//                          built without RTTI (a RomFS path or a message the code near a value refers to)
+//         code [thumb] "<hex bytes>"
+//                          the first place in the program's code holding those bytes ("??" matches any byte;
+//                          "thumb": Thumb code, bit 0 set): a function found by its own instructions
 //         <symbol> | <n>   an earlier symbol, or a number
 //       Steps, each on the address so far:
 //         slot <n>         the function in its n-th word (a vtable's n-th virtual function)
@@ -308,10 +314,45 @@ std::vector<u32> users_of(u32 v) {
     return fs;
 }
 
+// the address of a NUL-terminated text in the program's read-only data (the first occurrence that starts a string:
+// at the segment's start or after a NUL), 0 if absent
+u32 find_string(const std::string &text) {
+    const u32 a0 = g_game.ro_addr, n = g_game.ro_size;
+    if (text.empty() || !n || !kernel::guest_readable(a0, n)) return 0;
+    const u8 *p = (const u8 *)gptr(a0);
+    for (u32 i = 0; i + text.size() < n; i++)
+        if ((i == 0 || p[i - 1] == 0) && p[i + text.size()] == 0 && memcmp(p + i, text.data(), text.size()) == 0)
+            return a0 + i;
+    return 0;
+}
+
+// the first address in the program's code holding a byte pattern ("e5 9f 00 04 ?? ..."), 0 if absent or malformed
+u32 find_code(const std::string &hex) {
+    std::vector<int> pat;
+    std::istringstream ss(hex);
+    for (std::string b; ss >> b;) {
+        for (size_t k = 0; k < b.size(); k += 2) {
+            const std::string by = b.substr(k, 2);
+            if (by == "??") pat.push_back(-1);
+            else if (by.size() == 2 && isxdigit((u8)by[0]) && isxdigit((u8)by[1])) pat.push_back((int)strtol(by.c_str(), nullptr, 16));
+            else return 0;
+        }
+    }
+    const u32 a0 = g_game.text_addr, n = g_game.text_size;
+    if (pat.empty() || !n || !kernel::guest_readable(a0, n)) return 0;
+    const u8 *p = (const u8 *)gptr(a0);
+    for (u32 i = 0; i + pat.size() <= n; i += 2) {
+        size_t k = 0;
+        while (k < pat.size() && (pat[k] < 0 || p[i + k] == pat[k])) k++;
+        if (k == pat.size()) return a0 + i;
+    }
+    return 0;
+}
+
 // "<start> [<step>]..." from t[i..]
 bool resolve(const std::vector<std::string> &t, size_t i, s64 &out, std::string &err) {
     if (i >= t.size()) {
-        err = "expected 'vtable <class>', a symbol or a number";
+        err = "expected 'vtable <class>', 'string \"<text>\"', 'code \"<bytes>\"', a symbol or a number";
         return false;
     }
     u32 a;
@@ -322,6 +363,32 @@ bool resolve(const std::vector<std::string> &t, size_t i, s64 &out, std::string 
             return false;
         }
         a = c->vptr;
+        i += 2;
+    } else if (t[i] == "code") {
+        const bool thumb = i + 1 < t.size() && t[i + 1] == "thumb";
+        const std::string q = i + 1 + thumb < t.size() ? t[i + 1 + thumb] : "";
+        if (q.size() < 2 || q.front() != '"' || q.back() != '"') {
+            err = "expected code [thumb] \"<hex bytes>\"";
+            return false;
+        }
+        a = find_code(q.substr(1, q.size() - 2));
+        if (!a) {
+            err = "no code " + q + " in the program";
+            return false;
+        }
+        a |= thumb ? 1 : 0;
+        i += 2 + thumb;
+    } else if (t[i] == "string") {
+        const std::string q = i + 1 < t.size() ? t[i + 1] : "";
+        if (q.size() < 2 || q.front() != '"' || q.back() != '"') {
+            err = "expected string \"<text>\"";
+            return false;
+        }
+        a = find_string(q.substr(1, q.size() - 2));
+        if (!a) {
+            err = "no string " + q + " in the program";
+            return false;
+        }
         i += 2;
     } else {
         s64 n;

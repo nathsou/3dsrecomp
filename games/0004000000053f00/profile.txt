@@ -1,26 +1,30 @@
 # Super Mario 3D Land (EUR 0004000000053f00): screen focus rules and a top-screen HUD.
-# Every value hangs off the global at 0x3e23c4 (the game's system object). Its chain
+# Every value hangs off the global at 0x3e23c4 in this build (the game's system object), found through the function
+# that loads it at start (picked out by its first instructions; bl targets left open), so that another build whose
+# code matches resolves it for itself. Its chain
 # > 0x14 > 0x1c > 0x90 > 0x1b0 is the game-data holder; from there
 #   > 0x24  the current play state (stage name, stage id, coins, stock item, star coins)
 #   > 0x20  the save-file table ([+4] = 3 file records of 0x60 bytes, [+8] = current file index)
 
+symbol system = code "01 00 a0 e3 10 40 2d e9 ?? ?? ?? eb ?? ?? ?? eb" global 1  # 0x3e23c4
+
 # play state
-value stage = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0x20  # stage name (char *): 0 on the world map and in cutscenes, 0x3ae764 ("TitleStage") on the title / file select
-value stageid = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0x24  # -1 on the world map, 1 in World 1-1
-value coins = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0  # coins collected in this level (the game's top-screen counter)
-value item = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 8  # stock item in a level: 0 none 1 mushroom 2 fire flower 3 leaf 4 statue leaf 5 boomerang flower 6 P-wing
+value stage = u32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0x20  # stage name (char *): 0 on the world map and in cutscenes, 0x3ae764 ("TitleStage") on the title / file select
+value stageid = s32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0x24  # -1 on the world map, 1 in World 1-1
+value coins = s32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0  # coins collected in this level (the game's top-screen counter)
+value item = s32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 8  # stock item in a level: 0 none 1 mushroom 2 fire flower 3 leaf 4 statue leaf 5 boomerang flower 6 P-wing
 # star coins: byte +0xc+i = coin i taken in this life, byte +0xf+i = coin i kept by a checkpoint (either one: collected)
-value starcoin0 = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xc  # bit 0: +0xc, bit 24: +0xf
-value starcoin1 = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xd  # bit 0: +0xd, bit 24: +0x10
-value starcoin2 = u32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xe  # bit 0: +0xe, bit 24: +0x11
+value starcoin0 = u32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xc  # bit 0: +0xc, bit 24: +0xf
+value starcoin1 = u32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xd  # bit 0: +0xd, bit 24: +0x10
+value starcoin2 = u32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x24 > 0xe  # bit 0: +0xe, bit 24: +0x11
 # save file
-value file = s32 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 8  # current file: 0 A, 1 B, 2 C
-value livesA = s16 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0x3e
-value livesB = s16 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0x9e
-value livesC = s16 0x3e23c4 > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0xfe
+value file = s32 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 8  # current file: 0 A, 1 B, 2 C
+value livesA = s16 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0x3e
+value livesB = s16 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0x9e
+value livesC = s16 system > 0x14 > 0x1c > 0x90 > 0x1b0 > 0x20 > 4 > 0xfe
 # scenes
-value mapgone = u32 0x3e23c4 > 0x5c  # 0 on the world map (non-zero on the title, in cutscenes and in levels)
-value paused = u32 0x3e23c4 > 0x50 > 0x1c > 0x30  # 1 while a level's pause menu (on the bottom screen) is open
+value mapgone = u32 system > 0x5c  # 0 on the world map (non-zero on the title, in cutscenes and in levels)
+value paused = u32 system > 0x50 > 0x1c > 0x30  # 1 while a level's pause menu (on the bottom screen) is open
 
 focus bottom when stage == 0x3ae764                 # title "Press A", file select, first-boot dialogs
 focus bottom when stage != 0 and paused == 1        # pause menu: Continue / Select Course / Quit
