@@ -1,0 +1,9 @@
+game = "sm3dl"
+description = "Super Mario 3D Land from a real console's save: title, file select, a level's card (bottom screen plain)"
+frames = 2400
+save = "checkpoint"
+input = ["A:6 every 300 from 600 to 2400"]
+
+[[checkpoint]]
+frame = 2400
+screens = ["top"]

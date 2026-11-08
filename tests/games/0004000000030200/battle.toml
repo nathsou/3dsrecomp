@@ -1,0 +1,10 @@
+game = "kiu"
+description = "Kid Icarus: Uprising from a real console's save: an air battle at the game's 30 fps"
+frames = 5600
+save = "checkpoint"
+input = "1616:A:6,1780:A:6,1944:A:6,2108:T@100/50:8,2324:T@130/80:8,2540:A:6,2754:START:6,3668:L:120,3826:L+CLEFT:90,4032:L:200"
+fps = { from = 4400, to = 5600, min = 29 }
+
+[[checkpoint]]
+frame = 5000
+screens = ["top", "bottom"]

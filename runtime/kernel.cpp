@@ -156,7 +156,25 @@ static Thread *best_ready() {
     return best;
 }
 
+// RECOMP_SCHEDLOG=all (or a thread id): a timeline of the scheduler in the log ([sched] lines): threads made and
+// ended, each wait (on what, called from where) and each wake-up, with the frame number every log line has
+static int schedlog_thread() {
+    static const int v = [] {
+        const char *e = getenv("RECOMP_SCHEDLOG");
+        return !e ? -1 : strcmp(e, "all") == 0 || !*e ? 0 : atoi(e);
+    }();
+    return v;
+}
+static bool schedlog(const Thread *t) {
+    const int v = schedlog_thread();
+    return v == 0 || (v > 0 && t && t->id == (u32)v);
+}
+
 static void make_ready(Thread *t, bool front = false) {
+    if (schedlog(t) && t->status != TStatus::Ready && t->status != TStatus::Running) {
+        static const char *was[] = {"ready", "running", "a wait", "a sleep", "an arbiter", "dormant", "dead"};
+        LOG("[sched] thread %u wakes from %s\n", t->id, was[(int)t->status]);
+    }
     t->status = TStatus::Ready;
     t->ready_seq = front ? 0 : ready_counter++;
 }
@@ -240,6 +258,7 @@ static void yield_current(Lock &lk) {
 
 void sleep_current(u64 ns, Lock &lk) {
     Thread *t = current_thread();
+    if (schedlog(t)) LOG("[sched] thread %u sleeps %llu us (lr %08x)\n", t->id, (unsigned long long)(ns / 1000), t->cpu.r[14]);
     t->status = TStatus::WaitSleep;
     u64 gen = t->wait_gen;
     add_timeout(now_ns() + ns, [t, gen] {
@@ -368,11 +387,13 @@ std::shared_ptr<Thread> create_thread(u32 entry, u32 arg, u32 stack_top, s32 pri
     if (pthread_create(&pt, &attr, thread_main, t.get())) FATAL("pthread_create failed\n");
     t->host_id = platform::thread_handle(pt);
     pthread_detach(pt);
+    if (schedlog_thread() >= 0) LOG("[sched] thread %u made: entry %08x, priority %d\n", t->id, entry, prio);
     if (start) make_ready(t.get());
     return t;
 }
 
 static void thread_exit_locked(Thread *t, Lock &lk) {
+    if (schedlog_thread() >= 0) LOG("[sched] thread %u ends\n", t->id);
     t->status = TStatus::Dead;
     tls_used.erase((t->tls - mem::TLS_BASE) / mem::TLS_SLOT);
     t->wakeup_waiters();
@@ -477,6 +498,12 @@ static void linear_free_range(u32 a, u32 size) {
 // ---------------------------------------------------------------- SVCs
 static void wait_on(Thread *t, std::vector<std::shared_ptr<WaitObject>> objs, bool all, s64 timeout, Lock &lk,
                     CPU *c, bool out_index) {
+    if (schedlog(t)) {
+        std::string what;
+        for (auto &o : objs) what += (what.empty() ? "" : all ? " and " : " or ") + (o->name.empty() ? std::string("?") : o->name);
+        LOG("[sched] thread %u waits on %s%s (lr %08x)\n", t->id, what.c_str(),
+            timeout >= 0 ? (" for " + std::to_string(timeout / 1000) + " us").c_str() : "", c ? c->r[14] : 0);
+    }
     t->wait_objs = objs;
     t->wait_all = all;
     t->status = TStatus::WaitSync;
@@ -601,6 +628,7 @@ static u32 svc_arbitrate(CPU *c, Lock &lk) {
         if (g_verbose >= 3) LOG("[arb] thread %u type %u addr %08x mem %d value %d (lr %08x)\n", t->id, type, addr, mv, value, c->r[14]);
         if (!(mv < value)) return RES_OK;
         if (type == 2 || type == 4) w32(addr, (u32)(mv - 1));
+        if (schedlog(t)) LOG("[sched] thread %u waits at address %08x (value %d < %d, lr %08x)\n", t->id, addr, mv, value, c->r[14]);
         t->status = TStatus::WaitArb;
         t->arb = arb.get();
         t->arb_addr = addr;
@@ -1011,9 +1039,28 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
 }
 
 void svc_dispatch(CPU *c, u32 imm) {
+    static const int svclog = getenv("RECOMP_SVCLOG") ? atoi(getenv("RECOMP_SVCLOG")) : -1;
+    if (imm == 0x28 && !rt_preempt_flag && svclog < 0) {
+        // GetSystemTick without the kernel lock (the clock has its own; deferred work, which every other SVC runs,
+        // raises rt_preempt_flag and takes the slow path). Games poll it in loops (Star Fox 64 3D's fiber scheduler
+        // while its fibers wait: ~80000 calls a second): a thread asking more than a million times a second is only
+        // spinning on the clock, so it gives its host core away for 30 us every 64 calls (on a 3DS that core is the
+        // game's; here it is someone else's).
+        const u64 tk = system_tick();
+        c->r[0] = (u32)tk;
+        c->r[1] = (u32)(tk >> 32);
+        thread_local u64 window_start;
+        thread_local u32 window_calls;
+        if (++window_calls == 64) {
+            const u64 now = real_ns();
+            if (now - window_start < 64000) usleep(30);
+            window_start = real_ns();
+            window_calls = 0;
+        }
+        return;
+    }
     Lock lk(kmutex);
     flush_deferred();
-    static int svclog = getenv("RECOMP_SVCLOG") ? atoi(getenv("RECOMP_SVCLOG")) : -1;
     if (svclog >= 0 && (svclog == 0 || current_thread()->id == (u32)svclog))
         LOG("[svc %u] %02x lr=%08x r0=%08x r1=%08x r2=%08x r3=%08x\n", current_thread()->id, imm, c->r[14], c->r[0],
             c->r[1], c->r[2], c->r[3]);

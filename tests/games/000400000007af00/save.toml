@@ -1,0 +1,10 @@
+game = "nsmb2"
+description = "New Super Mario Bros. 2 (EUR) from a real console's save: the world map, with its profile"
+frames = 2400
+save = "checkpoint"
+input = ["A:6 every 250 from 600 to 1600"]
+
+[[checkpoint]]
+frame = 2400
+screens = ["top", "bottom"]
+values = { scene = 18, saved_lives = 153 }

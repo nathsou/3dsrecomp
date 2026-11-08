@@ -1,0 +1,10 @@
+game = "mk7"
+description = "Mario Kart 7 from a real console's save: the menus, Grand Prix, character and kart select"
+frames = 2400
+save = "checkpoint"
+save_dirs = ["replay_"]  # empty in the save, so not in Checkpoint's backup; the game resets the save without it
+input = ["A:6 every 300 from 600 to 2400"]
+
+[[checkpoint]]
+frame = 2400
+screens = ["top", "bottom"]

@@ -1,0 +1,9 @@
+game = "tomodachi"
+description = "Tomodachi Life (EUR): save creation, the date and time setup (touch)"
+frames = 2000
+swkbd = "Isle"
+input = ["T@160/205:8 every 250 from 600 to 2000"]
+
+[[checkpoint]]
+frame = 2000
+screens = ["top", "bottom"]

@@ -1,0 +1,12 @@
+game = "kiu"
+description = "Kid Icarus: Uprising: first boot, profile, the controls tutorial with its movies (top screen)"
+frames = 7800
+input = "1133:A:6,1270:A:6,1404:A:6,3498:T@135/160:8,4412:A:6,4516:A:6,4620:A:6,4724:A:6,7013:A:6,7150:A:6,7285:A:6"
+
+[[checkpoint]]
+frame = 7400
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 7800
+screens = ["top", "bottom"]

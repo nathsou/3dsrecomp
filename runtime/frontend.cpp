@@ -1571,6 +1571,7 @@ static void audio_thread() {
 
 void watch_init();
 void watch_report();
+void watch_poll();
 
 void frontend_run() {
     parse_script();
@@ -1830,6 +1831,7 @@ void frontend_run() {
                 if (v != last) LOG("[peek] %08x = %08x\n", a, v);
                 last = v;
             }
+            watch_poll();  // (RECOMP_WATCH / WATCH: the writes logged this frame)
             // RECOMP_MEMDUMP="f1,f2,...": guest memory snapshots (mem_<frame>_<address>.bin) for finding game state
             static const char *memdump = getenv("RECOMP_MEMDUMP");
             if (memdump && (std::string(",") + memdump + ",").find("," + std::to_string(frame_count) + ",") != std::string::npos)

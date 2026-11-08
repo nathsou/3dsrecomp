@@ -78,6 +78,7 @@ std::atomic<u32> want_scale{0};
 bool active = false, tried = false;
 bool log_timing = false, eager_writeback = false, dump_shaders = false, sync_shaders = false, verify_keys = false;
 bool warned_shadow = false, warned_proctex = false, warned_fetch = false;
+VkDeviceSize storage_align = 256;  // minStorageBufferOffsetAlignment
 
 #define VK_CHECK(x)                                                                                                    \
     do {                                                                                                               \
@@ -936,6 +937,9 @@ LoadAction sync_rt(GRT &r) {
     return la;
 }
 
+struct PendingXfer;
+void drain_touching(u32 paddr, u32 size, const GRT *keep, const PendingXfer *skip);
+
 bool guest_kept(GRT &r) {
     if (hash_mem(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
     static int logged;
@@ -951,6 +955,7 @@ bool guest_kept(GRT &r) {
 
 // write a colour target's GPU contents back to guest memory (box-filtered to 1x)
 void write_back_color(GRT &r) {
+    drain_touching(r.addr, rt_bytes(r), nullptr, nullptr);  // (earlier write-backs of this memory land first)
     if (!guest_kept(r)) return;
     ensure_buffer(stage_color, rt_bytes(r));
     VkCommandBuffer cb = new_cb();
@@ -966,6 +971,7 @@ void write_back_color(GRT &r) {
 
 // write a depth target's GPU contents back to guest memory (top-left sample of each pixel)
 void write_back_depth(GRT &r) {
+    drain_touching(r.addr, rt_bytes(r), nullptr, nullptr);
     if (!guest_kept(r)) return;
     const u32 W = r.w * S, H = r.h * S;
     ensure_buffer(stage_depth, (size_t)W * H * 4, Mem::Device);
@@ -1724,6 +1730,10 @@ struct PendingXfer {
     GRT *rt = nullptr;
     bool rt_writeback = true;
     u32 in_paddr = 0, out_paddr = 0, in_dims = 0, out_dims = 0, flags = 0, out_size = 0;
+    // a depth target's write-back alone (defer_depth_writeback): no transfer output; the colour targets restored
+    // from its bytes on the GPU meanwhile take the hash of guest memory once it lands
+    bool depth_wb = false;
+    std::vector<GRT *> restored;
 };
 std::deque<std::unique_ptr<PendingXfer>> pending;
 std::vector<BufP> xbuf_free;     // GX thread only
@@ -1750,13 +1760,19 @@ void rts_overwritten(u32 paddr, u32 size) {
 }
 
 void finalize(PendingXfer &op) {
-    wait_value(op.tl, "display transfer", op.out_paddr);
+    wait_value(op.tl, op.depth_wb ? "depth write-back" : "display transfer", op.depth_wb ? op.rt->addr : op.out_paddr);
     GRT &r = *op.rt;
     const u32 nb = rt_bytes(r);
     if (op.rt_writeback && guest_kept(r)) {
         op.gbytes->invalidate();
         r.hash = copy_hash(pptr(r.addr), op.gbytes->p, nb);
         r.checked = g_frame.load(std::memory_order_relaxed);
+        for (GRT *g : op.restored)  // (made from these bytes before they were in guest memory)
+            if (g->synced) g->hash = hash_mem(pptr(g->addr), rt_bytes(*g));
+    }
+    if (op.depth_wb) {  // (colour targets restored from its bytes may still be in a command buffer being recorded)
+        retire([b = std::move(op.gbytes)] {});
+        return;
     }
     op.obytes->invalidate();
     const u64 out_hash = copy_hash(pptr(op.out_paddr), op.obytes->p, op.out_size);
@@ -1786,16 +1802,76 @@ void drain_all() {
 }
 // keep: a target whose own pending write-back may stay pending (it is about to be drawn into: its GPU copy stays
 // newer than what the write-back puts in guest memory, and its next write-back replaces that)
+// (a depth write-back is never kept: its target is no longer newer than what it puts in guest memory)
 bool op_touches(const PendingXfer &op, u32 paddr, u32 size, const GRT *keep = nullptr) {
-    return overlaps(op.out_paddr, op.out_size, paddr, size) ||
-           (op.rt_writeback && op.rt != keep && overlaps(op.rt->addr, rt_bytes(*op.rt), paddr, size));
+    return (op.out_size && overlaps(op.out_paddr, op.out_size, paddr, size)) ||
+           (op.rt_writeback && (op.rt != keep || op.depth_wb) && overlaps(op.rt->addr, rt_bytes(*op.rt), paddr, size));
 }
-void drain_touching(u32 paddr, u32 size, const GRT *keep = nullptr) {
+// skip: a pending depth write-back the caller reads on the GPU instead (kept pending unless a later op that touches
+// the range lands, they land in order)
+void drain_touching(u32 paddr, u32 size, const GRT *keep = nullptr, const PendingXfer *skip = nullptr) {
     for (size_t i = pending.size(); i-- > 0;)
-        if (op_touches(*pending[i], paddr, size, keep)) {
+        if (pending[i].get() != skip && op_touches(*pending[i], paddr, size, keep)) {
             drain(i);
             return;
         }
+}
+// the newest pending depth write-back whose bytes hold all of r's guest memory
+PendingXfer *depth_source(const GRT &r) {
+    for (size_t i = pending.size(); i-- > 0;) {
+        PendingXfer &op = *pending[i];
+        if (op.depth_wb && op.rt_writeback && r.addr >= op.rt->addr && r.addr + rt_bytes(r) <= op.rt->addr + rt_bytes(*op.rt) &&
+            (r.addr - op.rt->addr) % storage_align == 0)
+            return &op;
+        if (op_touches(op, r.addr, rt_bytes(r))) return nullptr;  // (a later op writes that memory: from guest memory)
+    }
+    return nullptr;
+}
+
+// A depth target drawn into since its last write-back, whose memory a colour target is about to use (games reuse
+// the depth buffer's memory for post-processing, Kid Icarus: Uprising every frame): its write-back goes on the GPU
+// and lands in guest memory when the GPU is done, or as soon as something needs that memory, instead of waiting for
+// the GPU there; the colour targets restored meanwhile decode its bytes on the GPU (restore_from).
+PendingXfer *defer_depth_writeback(GRT &r) {
+    const u32 W = r.w * S, H = r.h * S, nb = rt_bytes(r);
+    ensure_buffer(stage_depth, (size_t)W * H * 4, Mem::Device);
+    ensure_buffer(stage_stencil, (size_t)W * H, Mem::Device);
+    auto op = std::make_unique<PendingXfer>();
+    op->depth_wb = true;
+    op->rt = &r;
+    op->in_paddr = r.addr;
+    op->gbytes = take_buffer(xbuf_free, nb);
+    memcpy(op->gbytes->p, pptr(r.addr), nb);  // (bytes a format has no depth or stencil for stay as they are)
+    op->gbytes->flush();
+    VkCommandBuffer cb = new_cb();
+    barrier(cb);
+    const VkBufferImageCopy cd = buf_copy(0, W, H, VK_IMAGE_ASPECT_DEPTH_BIT);
+    vkCmdCopyImageToBuffer(cb, r.tex->img, VK_IMAGE_LAYOUT_GENERAL, stage_depth->b, 1, &cd);
+    const VkBufferImageCopy cs = buf_copy(0, W, H, VK_IMAGE_ASPECT_STENCIL_BIT);
+    vkCmdCopyImageToBuffer(cb, r.tex->img, VK_IMAGE_LAYOUT_GENERAL, stage_stencil->b, 1, &cs);
+    barrier(cb);
+    const u32 prm[4] = {r.w, r.h, S, r.fmt};
+    dispatch(cb, K_ENC_DEPTH, {kb(0, *stage_depth), kb(1, *stage_stencil), kb(2, *op->gbytes)}, prm, nullptr, r.w, r.h);
+    op->tl = submit();
+    r.gpu_newer = false;
+    pending.push_back(std::move(op));
+    return pending.back().get();
+}
+
+// a colour target's GPU copy made from a pending depth write-back's bytes (what guest memory will hold)
+void restore_from(GRT &c, PendingXfer &op) {
+    const u32 off = c.addr - op.rt->addr;
+    c.synced = true;
+    c.hash = hash_mem(pptr(c.addr), rt_bytes(c));  // (guest memory before the write-back lands: finalize updates it)
+    c.checked = g_frame.load(std::memory_order_relaxed);
+    c.gpu_newer = false;
+    c.ms_valid = false;
+    c.version++;
+    op.restored.push_back(&c);
+    VkCommandBuffer cb = rec();
+    barrier(cb);
+    const u32 prm[4] = {c.w, c.h, S, cbuf_to_pixfmt(c.fmt)};
+    dispatch(cb, K_DEC, {kb(0, *op.gbytes, off, rt_bytes(c)), ki(5, *c.tex)}, prm, nullptr, c.w * S, c.h * S);
 }
 
 // ---------------------------------------------------------------- GPU copies of guest images
@@ -2298,6 +2374,7 @@ bool vk_init() {
     const char *sc = getenv("GPU_SCALE");
     scale_fixed = sc && atoi(sc) > 0;
     S = scale_fixed ? (u32)std::clamp(atoi(sc), 1, 4) : 2;
+    storage_align = std::max<VkDeviceSize>(props.limits.minStorageBufferOffsetAlignment, 4);
     const char *ms = getenv("GPU_MSAA");
     MS = ms ? (u32)std::clamp(atoi(ms), 1, 8) : kDefaultMSAA;
     const VkSampleCountFlags counts = props.limits.framebufferColorSampleCounts & props.limits.framebufferDepthSampleCounts &
@@ -2489,16 +2566,23 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
     const u32 H = hc == hd ? hc : rt.h;
     GRT &col = target_for(rt.color_addr, rt.w, H, rt.color_fmt, false);
     GRT *dep = has_dep ? &target_for(rt.depth_addr, rt.w, H, rt.depth_fmt, true) : nullptr;
-    // (a game that draws a frame into the target it just transferred to the screen does not wait for that transfer)
-    drain_touching(col.addr, rt_bytes(col), &col);
-    if (dep) drain_touching(dep->addr, rt_bytes(*dep), dep);
+    // (a game that draws a frame into the target it just transferred to the screen does not wait for that transfer;
+    // a pending depth write-back holding the colour target's memory is read on the GPU, below)
+    PendingXfer *dsrc = eager_writeback ? nullptr : depth_source(col);
+    drain_touching(col.addr, rt_bytes(col), &col, dsrc);
+    if (dep) drain_touching(dep->addr, rt_bytes(*dep), dep, nullptr);
+    if (dsrc) dsrc = depth_source(col);  // (gone if the depth target's own drain landed it)
     for (auto &o : rts) {
         if (o.get() == &col || o.get() == dep) continue;
         const bool ov_c = overlaps(o->addr, rt_bytes(*o), col.addr, rt_bytes(col));
         const bool ov_d = dep && overlaps(o->addr, rt_bytes(*o), dep->addr, rt_bytes(*dep));
         if (!ov_c && !ov_d) continue;
         if (o->gpu_newer) {
-            if (o->depth) write_back_depth(*o);
+            if (o->depth && ov_c && !ov_d && !eager_writeback && col.addr >= o->addr &&
+                col.addr + rt_bytes(col) <= o->addr + rt_bytes(*o) && (col.addr - o->addr) % storage_align == 0 &&
+                guest_kept(*o))
+                dsrc = defer_depth_writeback(*o);
+            else if (o->depth) write_back_depth(*o);
             else write_back_color(*o);
         }
         o->synced = false;
@@ -2513,7 +2597,12 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
             vk_guest_read(t.surf_addr, t.w * t.h * pixel_bytes(cbuf_to_pixfmt(t.surf_fmt)));
             surf_decoded[surf_key(t)] = texcache_get(t.surf_addr, t.w, t.h, t.surf_fmt, 1);
         }
-    LoadAction cla = sync_rt(col);
+    LoadAction cla;
+    if (dsrc && std::find(dsrc->restored.begin(), dsrc->restored.end(), &col) == dsrc->restored.end()) {
+        restore_from(col, *dsrc);
+    } else {
+        cla = sync_rt(col);
+    }
     if (col.clear_next) {
         col.clear_next = false;
         cla.clear = true;

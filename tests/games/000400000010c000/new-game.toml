@@ -1,0 +1,17 @@
+game = "kirbytd"
+description = "Kirby: Triple Deluxe: save creation, title, file select, the intro, walking in the first level"
+frames = 9500
+input = [
+  "1096:A:6,1260:A:6,1424:A:6,1588:A:6,1752:A:6,1916:A:6,2684:T@55/100:8,2900:A:6,3114:A:6,3330:A:6",
+  "4290:A:6,4504:A:6,4768:A:6,5038:A:6,5997:START:6,6131:A:6,6265:START:6,6401:A:6,6535:START:6",
+  "6673:A:6,6807:START:6,6942:A:6,7076:START:6,7211:A:6,7345:START:6,7480:A:6,7614:START:6,7748:A:6",
+  "7882:START:6,8016:A:6,8150:CRIGHT:120,9185:START:6,9289:CRIGHT:150,9443:B:10,9457:CRIGHT:60",
+]
+
+[[checkpoint]]
+frame = 1200
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 9500
+screens = ["top", "bottom"]

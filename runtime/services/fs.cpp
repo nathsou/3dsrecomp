@@ -431,6 +431,7 @@ struct FileSession : Service {
             ipc.set(2, (u32)n);
             ipc.set(3, (len << 4) | 0xA);
             ipc.set(4, src);
+            if (!romfs && n > 0) fs_delay(ipc, 300000 + (u64)n * 50);  // (a save write: 0.3 ms + 20 MB/s, as on an SD card)
             break;
         }
         case 0x0804:  // GetSize
@@ -805,6 +806,15 @@ struct FsUser : Service {
             fs_delay(ipc, 50000000);
             break;
         }
+        case 0x0875:  // SetSaveDataSecureValue(value u64, slot, title unique id, title variation)
+            ipc.ok();
+            break;
+        case 0x0876:  // GetSaveDataSecureValue(slot, title unique id, title variation) -> exists, is gamecard, value
+            ipc.ok(5);
+            ipc.set(2, 0);
+            ipc.set(3, 0);
+            ipc.set64(4, 0);
+            break;
         case 0x0845: {  // GetFormatInfo(archive id, path type, size, desc, ptr)
             std::string d = archive_dir(ipc[1], read_path(ipc[2], ipc[3], ipc[5]));
             if (d.empty() || !fsys::exists(d)) {

@@ -1,24 +1,69 @@
 #!/bin/sh
-# Make a macOS app bundle: tools/bundle_macos.sh <name> <gamedir> [App Name]
-# The bundle contains the executable and the game files it needs (exheader.bin, code.bin, romfs.bin if any).
+# Make a macOS app bundle:
+#   tools/bundle_macos.sh <name> <gamedir> [App Name]
+#     one game: the executable and the game files it needs (exheader.bin, code.bin, romfs.bin if any) in
+#     Contents/Resources/game
+#   tools/bundle_macos.sh --games <name>... [--name "App Name"]
+#     a multi-game build (cmake -DGAMES=... or -DGAMES=all): the `recomp` executable with its game list, each game's
+#     files in Contents/Resources/games/<name>/ (from data/<name>) and its code in Contents/Frameworks/<name>.dylib
 # Homebrew reading sdmc:/ finds it in ~/Library/Application Support/3dsrecomp/sdmc.
 set -e
-N=$1; D=$2; APP=${3:-$N}; B=${BUILD:-build}  # BUILD: the cmake build folder
-[ -n "$N" ] && [ -f "$D/info.json" ] || { echo "usage: $0 <name> <gamedir> [App Name]"; exit 1; }
+B=${BUILD:-build}  # BUILD: the cmake build folder
+GAMES=
+if [ "$1" = --games ]; then
+  shift
+  N=recomp; APP="3DS Games"
+  while [ $# -gt 0 ]; do
+    if [ "$1" = --name ]; then APP=$2; shift 2; else GAMES="$GAMES $1"; shift; fi
+  done
+  [ -n "$GAMES" ] && [ -f "$B/$N" ] || { echo "usage: BUILD=<folder> $0 --games <name>... [--name \"App Name\"]"; exit 1; }
+  D=data/$(echo $GAMES | cut -d' ' -f1)  # (the icon's game)
+else
+  N=$1; D=$2; APP=$3
+  [ -n "$N" ] && [ -f "$D/info.json" ] || { echo "usage: $0 <name> <gamedir> [App Name]"; exit 1; }
+fi
+# the app's name: the game's own title (its SMDH's English short title), else "<name> app" (never <build>/<name>,
+# the executable itself)
+if [ -z "$APP" ]; then
+  APP=$(python3 -c "
+import sys
+try:
+    d = open('$D/exefs/icon.bin', 'rb').read()
+    t = d[8 + 0x200:8 + 0x280].decode('utf-16-le').split(chr(0))[0].strip()
+    print(''.join(c for c in t if c not in '/\\\\:'))
+except Exception:
+    pass" 2>/dev/null)
+  [ -n "$APP" ] && [ "$APP" != "$N" ] || APP="$N app"
+fi
 OUT="$B/$APP.app"
 rm -rf "$OUT"
-mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources/game"
+mkdir -p "$OUT/Contents/MacOS" "$OUT/Contents/Resources"
 cp "$B/$N" "$OUT/Contents/MacOS/$N"
-cp "$D/exheader.bin" "$D/code.bin" "$D/info.json" "$OUT/Contents/Resources/game/"
-[ -f "$D/romfs.bin" ] && cp "$D/romfs.bin" "$OUT/Contents/Resources/game/"
-[ -f "$D/exefs/icon.bin" ] && mkdir -p "$OUT/Contents/Resources/game/exefs" && for x in icon banner logo; do [ -f "$D/exefs/$x.bin" ] && cp "$D/exefs/$x.bin" "$OUT/Contents/Resources/game/exefs/"; done
-[ -d system_archives ] && cp -r system_archives "$OUT/Contents/Resources/game/"
-# shipped pipeline and vertex program lists and their precompiled shaders
-TID=$(python3 -c "import json;print(json.load(open('$D/info.json'))['program_id'])")
-[ -f "games/$TID/pipelines.bin" ] && cp "games/$TID/pipelines.bin" "$OUT/Contents/Resources/game/"
-[ -f "games/$TID/profile.txt" ] && cp "games/$TID/profile.txt" "$OUT/Contents/Resources/game/"
-[ -f "games/$TID/vsprograms.bin" ] && cp "games/$TID/vsprograms.bin" "$OUT/Contents/Resources/game/"
-[ -f "$B/shaders.metallib" ] && cp "$B/shaders.metallib" "$OUT/Contents/Resources/"
+# a game's files: copy_game <data dir> <destination> <its precompiled shaders>
+copy_game() {
+  mkdir -p "$2"
+  cp "$1/exheader.bin" "$1/code.bin" "$1/info.json" "$2/"
+  [ -f "$1/romfs.bin" ] && cp "$1/romfs.bin" "$2/"
+  [ -f "$1/exefs/icon.bin" ] && mkdir -p "$2/exefs" && for x in icon banner logo; do [ -f "$1/exefs/$x.bin" ] && cp "$1/exefs/$x.bin" "$2/exefs/"; done
+  tid=$(python3 -c "import json;print(json.load(open('$1/info.json'))['program_id'])")
+  # shipped pipeline and vertex program lists, the profile
+  for f in pipelines.bin profile.txt vsprograms.bin; do [ -f "games/$tid/$f" ] && cp -L "games/$tid/$f" "$2/"; done
+  [ -f "$3" ] && cp "$3" "$4"
+  return 0
+}
+if [ -n "$GAMES" ]; then
+  mkdir -p "$OUT/Contents/Frameworks"
+  for g in $GAMES; do
+    [ -f "$B/$g.dylib" ] || { echo "no $B/$g.dylib (is $g in the build's GAMES?)"; exit 1; }
+    copy_game "data/$g" "$OUT/Contents/Resources/games/$g" "$B/shaders_$g.metallib" "$OUT/Contents/Resources/games/$g/shaders.metallib"
+    cp "$B/$g.dylib" "$OUT/Contents/Frameworks/"
+    codesign --force -s - "$OUT/Contents/Frameworks/$g.dylib" >/dev/null 2>&1 || true
+  done
+  [ -d system_archives ] && cp -r system_archives "$OUT/Contents/Resources/games/"
+else
+  copy_game "$D" "$OUT/Contents/Resources/game" "$B/shaders.metallib" "$OUT/Contents/Resources/shaders.metallib"
+  [ -d system_archives ] && cp -r system_archives "$OUT/Contents/Resources/game/"
+fi
 # app icon from the game's SMDH
 if [ -f "$D/exefs/icon.bin" ] && command -v magick >/dev/null; then
   T=$(mktemp -d)

@@ -1,0 +1,18 @@
+game = "starfox"
+description = "Star Fox 64 3D: save creation, the intro, the title menu, control settings, the training course"
+frames = 9150
+input = [
+  "1773:A:6,1937:A:6,2101:A:6,2265:A:6,2429:A:6,3256:START:6,3390:START:6,3524:START:6,3658:START:6",
+  "3792:START:6,3926:START:6,5019:T@160/117:8,5335:A:6,5499:A:6,5663:A:6,5827:A:6,5991:A:6,6155:A:6",
+  "6319:CUP:60,6383:A:60,6447:CLEFT:60,7591:T@160/120:8,7707:START:6,7921:A:6,8055:A:6,8189:A:6",
+  "8323:A:6,8457:A:6,8591:A:6,8725:A:6,8859:A:6,8993:A+CUP:90,9087:CLEFT:60,9151:A:30",
+]
+fps = { from = 8500, to = 9150, min = 29 }
+
+[[checkpoint]]
+frame = 1500
+screens = ["top"]
+
+[[checkpoint]]
+frame = 9150
+screens = ["top", "bottom"]

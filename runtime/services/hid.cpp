@@ -9,6 +9,8 @@ extern std::atomic<u32> g_live_host;         // (frontend.cpp): host inputs for 
 void frontend_live_text(const std::string &s);  // (frontend.cpp): typed as on the host's keyboard
 void frontend_live_key(const std::string &name);  // (frontend.cpp): a host key press (SDL key name)
 void frontend_live_mouse(float dx, float dy);       // (frontend.cpp): captured mouse motion (aiming)
+void watch_arm(u32 guest_addr, u32 bytes);  // (watch.cpp)
+
 namespace onescreen {
 u32 host_mask(const char *names);
 }
@@ -43,7 +45,8 @@ static void ensure_shm() {
 // run one after the other for that many VBlanks, each followed by a few released frames; the log says when each
 // starts. A line "DUMP" writes the state of every thread to the log at once, "MEMDUMP <tag>" snapshots guest memory
 // (mem_<tag>_<address>.bin, as RECOMP_MEMDUMP), "POKE8 <hex address> <hex value>" writes a byte at once,
-// "POKE32 <hex address> <hex value>" / "POKEF <hex address> <float>" write a word at once, "MOUSEREL <dx> <dy>" moves
+// "WATCH <hex address> [<bytes>]" logs every write to that memory from then on (as RECOMP_WATCH), "POKE32 <hex
+// address> <hex value>" / "POKEF <hex address> <float>" write a word at once, "MOUSEREL <dx> <dy>" moves
 // the captured mouse (aiming), "MEMDUMPNOW <tag>" and "WINSHOTNOW" snapshot memory or the window at once (while a
 // queued command holds its input),
 // "DRAG <x>/<y> <x1>/<y1> <frames>" touches and moves (bottom-screen pixels), "PAD <host inputs> <frames>" plays host inputs by position (one-screen play: "PAD zl 6", "PAD rs-up 30"),
@@ -162,6 +165,12 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
                     memcpy(&w, &f, 4);
                 }
                 w32(a, w);
+            }
+        }
+        else if (line.rfind("WATCH ", 0) == 0) {  // right away: "WATCH <address> [<bytes>]" logs every write (RECOMP_WATCH)
+            unsigned a = 0, n = 4;
+            if (sscanf(line.c_str() + 6, "%x %u", &a, &n) >= 1) {
+                ::watch_arm(a, n);
             }
         }
         else if (line.rfind("POKE8 ", 0) == 0) {  // right away: "POKE8 <address> <value>" writes a byte of guest memory

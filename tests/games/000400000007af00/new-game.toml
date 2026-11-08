@@ -1,0 +1,13 @@
+game = "nsmb2"
+description = "New Super Mario Bros. 2 (EUR): first-boot dialogs, title, file select, the opening"
+frames = 3600
+input = ["A:6 every 300 from 600 to 3600"]
+
+[[checkpoint]]
+frame = 2400
+screens = ["top", "bottom"]
+values = { scene = 5 }
+
+[[checkpoint]]
+frame = 3600
+screens = ["top"]
