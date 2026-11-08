@@ -53,6 +53,11 @@ brew install llvm cmake ninja sdl3
 sudo pacman -S clang cmake ninja sdl3 vulkan-icd-loader vulkan-headers shaderc freetype2 harfbuzz fontconfig curl ffmpeg
 ```
 
+**In one step:** `python3 tools/port.py <dump> [<name>] [--app]` extracts the dump, recompiles it, builds it and,
+with `--app`, makes an app of it (each step skipped when already done; keys are looked for next to the dump, in the
+current folder and in Azahar's or Citra's `sysdata`). `--launcher` builds one program with a game list holding every
+recompiled game (`build-all/recomp`, `cmake -DGAMES=all`; with `--app`, an app of it). The steps it runs:
+
 1. **Extract** a decrypted `.cci`/`.3ds`/`.cxi` dump:
 
    ```sh
@@ -77,7 +82,11 @@ sudo pacman -S clang cmake ninja sdl3 vulkan-icd-loader vulkan-headers shaderc f
    ```
 
 4. **Play**: `./build/sm3dl data/sm3dl`, or make an app with `tools/bundle_macos.sh sm3dl data/sm3dl`
-   (Linux: `tools/bundle_linux.sh`, iOS: `tools/bundle_ios.sh`, see the scripts for options).
+   (Linux: `tools/bundle_linux.sh`, iOS: `tools/bundle_ios.sh`; `--games <name>...` for a multi-game build; see the
+   scripts for options).
+
+**Tests:** `python3 tools/gametest.py` plays every game you have through scripted runs and checks them
+(`tests/README.md`).
 
 Saves go to `save/<title id>/` (`~/Library/Application Support/3dsrecomp/` for app bundles,
 `~/.local/share/3dsrecomp/` on Linux). A real console's save goes in its `savedata/` folder; Checkpoint backups leave
@@ -133,7 +142,10 @@ out empty folders, and Mario Kart 7 resets a save whose empty `replay_` folder i
 
 Code the recompiler missed is recompiled on the fly when the source tree is present and recorded so that
 `tools/regen.sh` includes it next time. Many `RECOMP_*` and `GPU_*` environment variables exist for debugging and
-scripted testing (input scripts, screenshots, memory dumps, speed control); see `runtime/` for details.
+scripted testing (input scripts, screenshots, memory dumps, speed control); see `runtime/` for details. Two for
+finding why a game hangs: `RECOMP_WATCH=<address>[+<bytes>]` logs every write to that guest memory with the code that
+made it (Linux x86-64; a live script's `WATCH` arms it later), and `RECOMP_SCHEDLOG=all` logs every thread's waits
+and wake-ups.
 
 ## License
 

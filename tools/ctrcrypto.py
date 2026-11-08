@@ -17,6 +17,7 @@ AES comes from the system: macOS's CommonCrypto, elsewhere OpenSSL's libcrypto.
 import ctypes
 import ctypes.util
 import hashlib
+import os
 import struct
 import sys
 
@@ -85,6 +86,24 @@ def normal_key(key_x, key_y):
     def rol(v, r): return ((v << r) | (v >> (128 - r))) & M128
     x, y = int.from_bytes(key_x, 'big'), int.from_bytes(key_y, 'big')
     return rol((rol(x, 2) ^ y) + SCRAMBLER & M128, 87).to_bytes(16, 'big')
+
+
+def find_key_files(*dirs):
+    """boot9.bin, aes_keys.txt and seeddb.bin found in the given folders, the current one, or an emulator's sysdata
+    folder (Azahar's and Citra's, which keep them under these names): {name: path}."""
+    home = os.path.expanduser('~')
+    where = list(dirs) + [os.getcwd()]
+    for app in ('azahar-emu', 'citra-emu', 'lime3ds-emu'):  # Linux
+        where.append(os.path.join(os.environ.get('XDG_DATA_HOME', os.path.join(home, '.local', 'share')), app, 'sysdata'))
+    for app in ('Azahar', 'Citra', 'Lime3DS'):  # macOS
+        where.append(os.path.join(home, 'Library', 'Application Support', app, 'sysdata'))
+    found = {}
+    for d in where:
+        for name in ('boot9.bin', 'aes_keys.txt', 'seeddb.bin'):
+            p = os.path.join(d, name)
+            if name not in found and os.path.isfile(p):
+                found[name] = p
+    return found
 
 
 SEEDDB_HEADER, SEEDDB_ENTRY = 0x10, 0x20  # u32 count + padding; u64 title id, 16-byte seed, padding

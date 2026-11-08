@@ -9,7 +9,8 @@
 
 Encrypted dumps (an encrypted NCCH, a CIA with its ticket) are decrypted while they are read, with keys from
 your own console: --boot9 boot9.bin and, for a CIA's title key, --keys aes_keys.txt; titles that use seed crypto
-also need their seed, --seeddb seeddb.bin (see tools/ctrcrypto.py).
+also need their seed, --seeddb seeddb.bin (see tools/ctrcrypto.py). Files not given are looked for next to the dump,
+in the current folder and in Azahar's or Citra's sysdata folder (where they keep the same files).
 A .3dsx is relocated to 0x00100000 and gets a synthetic exheader, as if it were an application started by the
 system (see extract_3dsx).
 Usage: extract.py <dump> <outdir> [--no-unpack] [--argv0 sdmc:/3ds/<name>.3dsx] [--boot9 <file>] [--keys <file>]
@@ -248,7 +249,15 @@ def main():
     UNPACK = '--no-unpack' not in sys.argv
 
     def opt(name): return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else None
-    keys = ctrcrypto.Keys(opt('--boot9'), opt('--keys'), opt('--seeddb'), opt('--seed'))
+    found = ctrcrypto.find_key_files(os.path.dirname(os.path.abspath(src)))
+    def pick(flag, name):
+        v = opt(flag)
+        if v is None and name in found:
+            v = found[name]
+            print('using %s' % v, file=sys.stderr)
+        return v
+    keys = ctrcrypto.Keys(pick('--boot9', 'boot9.bin'), pick('--keys', 'aes_keys.txt'),
+                          pick('--seeddb', 'seeddb.bin') if not opt('--seed') else None, opt('--seed'))
     os.makedirs(outdir, exist_ok=True)
     with open(src, 'rb') as fh:
         if fh.read(4) == b'3DSX':
