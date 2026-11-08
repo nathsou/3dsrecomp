@@ -290,6 +290,50 @@ void apt_notify(u32 signal) {
     apt.notif->signal();
 }
 
+// APT Wrap / Unwrap: data sealed for this console (saves, StreetPass), AES-CCM under a key of the console's on a 3DS.
+// The layout is a 3DS's (the nonce, moved from inside the data to the front, then the data and a 16-byte MAC), but
+// the data stays as it is and the MAC is a checksum of it: data wrapped here unwraps here, and data wrapped by a real
+// console fails to unwrap, as data from another console does on a 3DS.
+static void wrap(IPC &ipc, bool seal) {
+    const u32 out_size = ipc[1], in_size = ipc[2], nonce_off = ipc[3];
+    const u32 nonce_size = std::min<u32>(ipc[4] & ~3u, 12);
+    const u8 *in = (const u8 *)gptr(ipc[6]);
+    u8 *out = (u8 *)gptr(ipc[8]);
+    auto mac = [](const u8 *p, u32 n, u8 *m) {  // FNV-1a over the data, spread over 16 bytes
+        u64 h = 0xcbf29ce484222325ull;
+        for (u32 i = 0; i < n; i++) h = (h ^ p[i]) * 0x100000001b3ull;
+        for (int i = 0; i < 16; i++) m[i] = (u8)(h >> (8 * (i & 7))) ^ (u8)(0x5A + i);
+    };
+    u32 res = 0;
+    if (seal && out_size >= in_size + 16 && nonce_off + nonce_size <= in_size) {
+        std::vector<u8> plain(in, in + nonce_off);
+        plain.insert(plain.end(), in + nonce_off + nonce_size, in + in_size);
+        memcpy(out, in + nonce_off, nonce_size);
+        memcpy(out + nonce_size, plain.data(), plain.size());
+        mac(plain.data(), (u32)plain.size(), out + nonce_size + plain.size());
+    } else if (!seal && in_size >= nonce_size + 16 && out_size + 16 >= in_size) {
+        const u32 n = in_size - nonce_size - 16;
+        u8 m[16];
+        mac(in + nonce_size, n, m);
+        if (memcmp(m, in + nonce_size + n, 16) != 0 || nonce_off > n) {
+            res = 0xC8A12402;  // (the MAC does not match: sealed elsewhere)
+            memset(out, 0, out_size);
+        } else {
+            std::vector<u8> plain(in + nonce_size, in + nonce_size + n);
+            memcpy(out, plain.data(), nonce_off);
+            memcpy(out + nonce_off, in, nonce_size);
+            memcpy(out + nonce_off + nonce_size, plain.data() + nonce_off, n - nonce_off);
+        }
+    } else {
+        res = 0xE0E12C03;  // (sizes that do not fit)
+    }
+    ipc.result(res, 1, 4);
+    ipc.set(2, (in_size << 4) | 0xA);
+    ipc.set(3, ipc[6]);
+    ipc.set(4, (out_size << 4) | 0xC);
+    ipc.set(5, ipc[8]);
+}
+
 struct AptService : Service {
     using Service::Service;
     void handle(IPC &ipc) override {
@@ -409,6 +453,17 @@ struct AptService : Service {
             break;
         case 0x0044:  // GetSharedFont
             get_shared_font(ipc);
+            break;
+        case 0x0045: {  // GetWirelessRebootInfo(size) -> static buffer 0: none (not started by a download play)
+            const u32 n = std::min<u32>(ipc[1], 0x10);
+            memset(gptr(ipc.static_buffer(0)), 0, n);
+            ipc.ok(1, 2);
+            ipc.static_desc(2, 0, n);
+            break;
+        }
+        case 0x0046:  // Wrap(out size, in size, nonce offset, nonce size, in buffer, out buffer)
+        case 0x0047:  // Unwrap
+            wrap(ipc, ipc.cmd() == 0x0046);
             break;
         case 0x004B: {  // AppletUtility(cmd, in_size, out_size, in static buffer)
             u32 out_size = ipc[3];

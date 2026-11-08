@@ -30,6 +30,9 @@ static Country cfg_country() {
     }
 }
 
+u32 config_region() { return cfg_region(); }
+u32 config_country() { return cfg_country().code; }
+
 static void fill_block(u32 id, u32 dst, u32 size) {
     memset(gptr(dst), 0, size);
     auto put_utf16 = [&](u32 at, const char *s, u32 max) {

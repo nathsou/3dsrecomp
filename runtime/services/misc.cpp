@@ -87,6 +87,9 @@ struct Ac : Service {
     }
 };
 
+// frd:u / frd:a: friends, never logged in (no friends, no presence); the player's profile and Mii are the console's
+// (the standard Mii, as Mii Maker and the Mii selector have it). Command numbers and replies as on a 3DS (Azahar's
+// frd module).
 struct Frd : Service {
     using Service::Service;
     void handle(IPC &ipc) override {
@@ -96,38 +99,68 @@ struct Frd : Service {
             ipc.ok(2);
             ipc.set(2, 0);
             break;
-        case 0x0005: {  // GetMyPresence -> static buffer
+        case 0x0003:  // Login(event): never completes (offline)
+        case 0x0004:  // Logout
+        case 0x001D:  // UpdateGameModeDescription
+        case 0x001E:  // UpdateGameMode
+        case 0x0020:  // AttachToEventNotification
+        case 0x0021:  // SetNotificationMask
+        case 0x0023:  // GetLastResponseResult
+        case 0x0032:  // SetClientSdkVersion
+            ipc.ok();
+            break;
+        case 0x0005:  // GetMyFriendKey -> principal id, padding, local friend code
+            ipc.ok(5);
+            ipc.set(2, 0);
+            ipc.set(3, 0);
+            ipc.set64(4, 0);
+            break;
+        case 0x0006:  // GetMyPreference -> public mode, show game name, show played game
+            ipc.ok(4);
+            ipc.set(2, 0);
+            ipc.set(3, 0);
+            ipc.set(4, 0);
+            break;
+        case 0x0007: {  // GetMyProfile -> region, country, area, language, platform (8 bytes)
+            ipc.ok(3);
+            ipc.set(2, config_region() | config_country() << 8 | 1 << 16 | 1u << 24);  // region, country, area, language
+            ipc.set(3, 2);                                                               // platform: 3DS
+            break;
+        }
+        case 0x0008: {  // GetMyPresence -> static buffer 0 (0x12C bytes)
             u32 dst = ipc.static_buffer(0);
             memset(gptr(dst), 0, 0x12C);
             ipc.ok(1, 2);
             ipc.static_desc(2, 0, 0x12C);
             break;
         }
-        case 0x0006:  // GetMyFriendKey
-            ipc.ok(5);
-            ipc.set(2, 0);
-            ipc.set(3, 0);
-            ipc.set64(4, 0);
-            break;
-        case 0x0009:  // GetMyPreference
-            ipc.ok(4);
-            ipc.set(2, 0);
-            ipc.set(3, 0);
-            ipc.set(4, 0);
-            break;
-        case 0x000A:  // GetMyProfile
-            ipc.ok(3);
-            ipc.set(2, 0);
-            ipc.set(3, 0);
-            break;
-        case 0x000B: {  // GetMyScreenName
+        case 0x0009: {  // GetMyScreenName -> 11 UTF-16 characters, then a word
             ipc.ok(7);
-            memset(gptr(ipc.buf + 8), 0, 24);
-            const char *n = "Mario";
-            for (int i = 0; n[i]; i++) w16(ipc.buf + 8 + 2 * i, (u8)n[i]);
+            for (int i = 2; i < 8; i++) ipc.set(i, 0);
+            const std::vector<u8> mii = standard_mii();
+            for (int i = 0; i < 10; i++) w16(ipc.buf + 8 + 2 * i, (u16)(mii[0x1A + 2 * i] | mii[0x1B + 2 * i] << 8));
             break;
         }
-        case 0x0011:  // GetFriendKeyList
+        case 0x000A: {  // GetMyMii -> the checksummed Mii data (0x60 bytes)
+            ipc.ok(0x19);
+            std::vector<u8> m = standard_mii();
+            m.resize(0x60, 0);
+            const u16 crc = crc16_xmodem(m.data(), 0x5E);
+            m[0x5E] = (u8)(crc >> 8);
+            m[0x5F] = (u8)crc;
+            memcpy(gptr(ipc.buf + 8), m.data(), 0x60);
+            break;
+        }
+        case 0x000C:  // GetMyPlayingGame -> title id, version, padding
+        case 0x000D:  // GetMyFavoriteGame
+            ipc.ok(5);
+            for (int i = 2; i < 6; i++) ipc.set(i, 0);
+            break;
+        case 0x000F:  // GetMyComment -> 17 UTF-16 characters, then a word
+            ipc.ok(10);
+            for (int i = 2; i < 11; i++) ipc.set(i, 0);
+            break;
+        case 0x0011:  // GetFriendKeyList(unknown, count) -> count, static buffer
             ipc.ok(2, 2);
             ipc.set(2, 0);
             ipc.static_desc(3, 0, 0);
@@ -251,27 +284,99 @@ struct Cecd : Service {
     }
 };
 
+// boss:U (SpotPass): tasks are accepted and never run, and there is no downloaded data (Azahar's replies)
 struct Boss : Service {
     using Service::Service;
+    static constexpr u32 NS_DATA_NOT_FOUND = 0xC8A0F840;
+    void buffer_back(IPC &ipc, int pos, int size_word, int desc_word) {
+        ipc.set(pos, (ipc[size_word] << 4) | (ipc[desc_word] & 0xF));
+        ipc.set(pos + 1, ipc[desc_word + 1]);
+    }
     void handle(IPC &ipc) override {
         switch (ipc.cmd()) {
         case 0x0001:  // InitializeSession
         case 0x0002:  // SetStorageInfo
         case 0x0003:  // UnregisterStorage
+        case 0x0008:  // RegisterNewArrivalEvent(event)
+        case 0x0009:  // SetOptoutFlag
+        case 0x0015:  // SendPropertyHandle
+        case 0x0026:  // DeleteNsData
+        case 0x002B:  // SetNsDataNewFlag
             ipc.ok();
             break;
         case 0x0004:  // GetStorageInfo
+        case 0x0007:  // GetNewArrivalFlag
+        case 0x000A:  // GetOptoutFlag
+        case 0x002C:  // GetNsDataNewFlag
             ipc.ok(2);
             ipc.set(2, 0);
             break;
-        case 0x0006:  // GetOptoutFlag
-            ipc.ok(2);
-            ipc.set(2, 0);
+        case 0x000B:  // RegisterTask(size, u8, u8, buffer)
+        case 0x0018:  // UpdateTaskCount(size, u32, buffer)
+        case 0x0025:  // GetTaskInfo(size, u8, buffer)
+            ipc.ok(1, 2);
+            buffer_back(ipc, 2, 1, 4);
             break;
-        case 0x000D: {  // GetTaskIdList
+        case 0x000C:  // UnregisterTask(size, u8, buffer)
+            ipc.ok(1, 2);
+            buffer_back(ipc, 2, 1, 3);
+            break;
+        case 0x001C:  // StartTask(size, buffer)
+        case 0x001E:  // CancelTask(size, buffer)
+            ipc.ok(1, 2);
+            buffer_back(ipc, 2, 1, 2);
+            break;
+        case 0x000E:  // GetTaskIdList: no tasks
             ipc.ok();
             break;
+        case 0x0010: {  // GetNsDataIdList(filter, max entries, word index, start id, buffer) -> entries, last index
+            ipc.ok(3, 2);
+            ipc.set(2, 0);
+            ipc.set(3, 0);
+            ipc.set(4, (ipc[2] * 4) << 4 | (ipc[5] & 0xF));
+            ipc.set(5, ipc[6]);
+            break;
         }
+        case 0x0014:  // SendProperty(id, size, buffer)
+            ipc.ok(1, 2);
+            buffer_back(ipc, 2, 2, 3);
+            break;
+        case 0x0016: {  // ReceiveProperty(id, size, buffer) -> size: zeros
+            const u32 n = ipc[2];
+            memset(gptr(ipc[4]), 0, n);
+            ipc.ok(2, 2);
+            ipc.set(2, n);
+            buffer_back(ipc, 3, 2, 3);
+            break;
+        }
+        case 0x001B:  // GetTaskServiceStatus(size, buffer) -> status
+            ipc.ok(2, 2);
+            ipc.set(2, 0);
+            buffer_back(ipc, 3, 1, 2);
+            break;
+        case 0x0023:  // GetTaskStatus(size, u8, u8, buffer) -> status
+            ipc.ok(2, 2);
+            ipc.set(2, 0);
+            buffer_back(ipc, 3, 1, 4);
+            break;
+        case 0x0027:  // GetNsDataHeaderInfo(id, type, size, buffer): no such data
+            ipc.result(NS_DATA_NOT_FOUND, 1, 2);
+            buffer_back(ipc, 2, 3, 4);
+            break;
+        case 0x0028:  // ReadNsData(id, offset u64, size, buffer): no such data
+            ipc.result(NS_DATA_NOT_FOUND, 3, 2);
+            ipc.set(2, 0);
+            ipc.set(3, 0);
+            buffer_back(ipc, 4, 4, 5);
+            break;
+        case 0x002D:  // GetNsDataLastUpdate(id)
+            ipc.result(NS_DATA_NOT_FOUND);
+            break;
+        case 0x0030:  // GetStorageEntryInfo -> u32, u16
+            ipc.ok(3);
+            ipc.set(2, 0);
+            ipc.set(3, 0);
+            break;
         default:
             unimplemented(ipc);
         }
@@ -525,6 +630,15 @@ struct Generic : Service {
     void handle(IPC &ipc) override { unimplemented(ipc); }
 };
 
+// nim:aoc (add-on content downloads): initialised, nothing to download
+struct NimAoc : Service {
+    using Service::Service;
+    void handle(IPC &ipc) override {
+        if (ipc.cmd() == 0x0021) ipc.ok();  // Initialize
+        else unimplemented(ipc);
+    }
+};
+
 void register_misc() {
     register_service(std::make_shared<Ptm>("ptm:u"));
     register_service(std::make_shared<Ptm>("ptm:sysm"));
@@ -539,8 +653,9 @@ void register_misc() {
     register_service(std::make_shared<Ir>("ir:USER"));
     register_service(std::make_shared<Ir>("ir:u"));
     register_y2r();
+    register_service(std::make_shared<NimAoc>("nim:aoc"));
     for (const char *n : {"news:u", "cam:u", "soc:U", "ssl:C", "http:C", "nwm::UDS", "dlp:FKCL", "dlp:SRVR",
-                          "pxi:dev", "act:u", "am:app", "nim:aoc", "qtm:u", "csnd:SND"})
+                          "pxi:dev", "act:u", "am:app", "qtm:u", "csnd:SND"})
         register_service(std::make_shared<Generic>(n));
 }
 

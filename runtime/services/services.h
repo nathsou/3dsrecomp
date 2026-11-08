@@ -25,6 +25,8 @@ void apt_notify(u32 signal);
 constexpr size_t MII_DATA_SIZE = 0x5C;
 std::vector<u8> standard_mii();          // the Mii the Mii selector returns
 u16 crc16_xmodem(const u8 *p, size_t n);  // the checksum of Mii data and of Mii Maker's database
+u32 config_region();                      // the console's region (cfg: 0 JPN, 1 USA, 2 EUR, ...)
+u32 config_country();                     // and its country code
 
 // gsp
 struct FramebufferInfo {
