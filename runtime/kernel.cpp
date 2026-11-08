@@ -1011,9 +1011,28 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
 }
 
 void svc_dispatch(CPU *c, u32 imm) {
+    static const int svclog = getenv("RECOMP_SVCLOG") ? atoi(getenv("RECOMP_SVCLOG")) : -1;
+    if (imm == 0x28 && !rt_preempt_flag && svclog < 0) {
+        // GetSystemTick without the kernel lock (the clock has its own; deferred work, which every other SVC runs,
+        // raises rt_preempt_flag and takes the slow path). Games poll it in loops (Star Fox 64 3D's fiber scheduler
+        // while its fibers wait: ~80000 calls a second): a thread asking more than a million times a second is only
+        // spinning on the clock, so it gives its host core away for 30 us every 64 calls (on a 3DS that core is the
+        // game's; here it is someone else's).
+        const u64 tk = system_tick();
+        c->r[0] = (u32)tk;
+        c->r[1] = (u32)(tk >> 32);
+        thread_local u64 window_start;
+        thread_local u32 window_calls;
+        if (++window_calls == 64) {
+            const u64 now = real_ns();
+            if (now - window_start < 64000) usleep(30);
+            window_start = real_ns();
+            window_calls = 0;
+        }
+        return;
+    }
     Lock lk(kmutex);
     flush_deferred();
-    static int svclog = getenv("RECOMP_SVCLOG") ? atoi(getenv("RECOMP_SVCLOG")) : -1;
     if (svclog >= 0 && (svclog == 0 || current_thread()->id == (u32)svclog))
         LOG("[svc %u] %02x lr=%08x r0=%08x r1=%08x r2=%08x r3=%08x\n", current_thread()->id, imm, c->r[14], c->r[0],
             c->r[1], c->r[2], c->r[3]);
