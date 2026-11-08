@@ -902,16 +902,34 @@ class Emitter:
         # One file per 64 KiB of guest addresses (code_<address >> 16>.c): a function found later lands in its own
         # bucket's file instead of shifting every file after it, and files are written only when their contents
         # change, so a regeneration rebuilds only what it changed.
+        # A block holding more than 3 MB of C is cut into 4 KiB blocks (code_<address >> 16>_<4 KiB block>.c), and a
+        # 4 KiB block still over that into one file per function (Tomodachi Life: 600 functions of 600 KB each in
+        # 64 KiB): the cuts depend only on the addresses and sizes there, so the rest stays as it is.
+        LIMIT = 3_000_000
         files = []
-        buckets = {}
+        blocks = {}
         for k in keys:
-            buckets.setdefault(k >> 16, []).append(self.emit_function(k))
+            blocks.setdefault(k >> 16, []).append((k, self.emit_function(k)))
+        buckets = {}
+        for b, fns in blocks.items():
+            if sum(len(src) for _, src in fns) <= LIMIT:
+                buckets['%05x' % b] = [src for _, src in fns]
+                continue
+            sub = {}
+            for k, src in fns:
+                sub.setdefault((k >> 12) & 15, []).append((k, src))
+            for q, sfns in sub.items():
+                if sum(len(src) for _, src in sfns) <= LIMIT:
+                    buckets['%05x_%x' % (b, q)] = [src for _, src in sfns]
+                else:
+                    for k, src in sfns:
+                        buckets['%05x_%x_%03x' % (b, q, k & 0xFFF)] = [src]
         # Each file declares only the functions it calls (guest.h, which lists them all, changes whenever one is
         # found and is left to table.c and lazily recompiled code).
         known = set(fname(k) for k in keys)
         wanted = set()
         for b in sorted(buckets):
-            name = 'code_%05x.c' % b
+            name = 'code_%s.c' % b
             wanted.add(name)
             path = os.path.join(self.outdir, name)
             body = '\n\n'.join(buckets[b])
