@@ -1,0 +1,12 @@
+game = "sm3dl"
+description = "Super Mario 3D Land: first-boot dialogs, title, a new file, the opening"
+frames = 3300
+input = ["A:6 every 300 from 600 to 3300"]
+
+[[checkpoint]]
+frame = 2100
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 3300
+screens = ["top"]

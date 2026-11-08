@@ -147,6 +147,7 @@
 #include "profile.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <map>

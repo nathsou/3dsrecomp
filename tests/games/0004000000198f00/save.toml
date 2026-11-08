@@ -1,0 +1,14 @@
+game = "acnl"
+description = "Animal Crossing: New Leaf - Welcome amiibo (EUR) from a real town: Isabelle, then the town"
+frames = 6000
+save = "checkpoint"
+checkpoint_id = "0x00864"  # Welcome amiibo keeps the original game's save (its backups are filed under it)
+input = ["A:6 every 300 from 600 to 6000"]
+
+[[checkpoint]]
+frame = 3000
+screens = ["top"]
+
+[[checkpoint]]
+frame = 6000
+screens = ["top", "bottom"]

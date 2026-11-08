@@ -1,0 +1,13 @@
+game = "mm3d"
+description = "Majora's Mask 3D: title, file select, a new file, the opening text, the Lost Woods"
+frames = 4200
+swkbd = "Test"
+input = ["A:6 every 300 from 600 to 4200"]
+
+[[checkpoint]]
+frame = 700
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 4200
+screens = ["top"]

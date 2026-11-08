@@ -1,0 +1,9 @@
+game = "oot3d"
+description = "Ocarina of Time 3D from a real console's save: file select, adult Link in Ganon's Castle"
+frames = 2800
+save = "checkpoint"
+input = ["A:6 every 400 from 600 to 2800"]
+
+[[checkpoint]]
+frame = 2800
+screens = ["top", "bottom"]
