@@ -5,6 +5,12 @@ if(APPLE)
 endif()
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# ccache, when installed, keeps the generated code's objects between builds directories and regenerations
+find_program(CCACHE ccache)
+if(CCACHE AND NOT CMAKE_C_COMPILER_LAUNCHER)
+  set(CMAKE_C_COMPILER_LAUNCHER ${CCACHE})
+  set(CMAKE_CXX_COMPILER_LAUNCHER ${CCACHE})
+endif()
 set(GAME sm3dl CACHE STRING "generated/<GAME> to link")
 # GAMES="sm3dl;nsmb2;...": one app for several games instead (the executable `recomp`, which shows a game list,
 # and each game's code as a module <name>.dylib (.so on Linux) it loads; tools/bundle_ios.sh puts them together)

@@ -6,6 +6,7 @@ call chain whose host frames were unwound. Guest registers live in C locals insi
 across calls. Direct calls are C calls followed by a check that the callee returned where expected; tail branches
 and indirect jumps are `musttail` calls.
 """
+import io
 import os
 import re
 import struct
@@ -626,6 +627,20 @@ class Analyzer:
         return sorted(self.funcs)
 
 
+def write_if_changed(path, text):
+    """Writes text to path unless the file already holds exactly that (its date then stays, and so do the build's
+    objects)."""
+    try:
+        with open(path) as f:
+            if f.read() == text:
+                return False
+    except OSError:
+        pass
+    with open(path, 'w') as f:
+        f.write(text)
+    return True
+
+
 class Emitter:
     def __init__(self, an, outdir, per_file=400):
         self.an = an
@@ -884,63 +899,61 @@ class Emitter:
         if self.flag_opt:
             self.find_flag_returning(keys)
         os.makedirs(self.outdir, exist_ok=True)
-        for f in os.listdir(self.outdir):
-            if f.startswith('code_') and f.endswith('.c'):
-                os.remove(os.path.join(self.outdir, f))
+        # One file per 64 KiB of guest addresses (code_<address >> 16>.c): a function found later lands in its own
+        # bucket's file instead of shifting every file after it, and files are written only when their contents
+        # change, so a regeneration rebuilds only what it changed.
         files = []
-        chunk = []
-        n = 0
-        def flush():
-            nonlocal chunk, n
-            if not chunk:
-                return
-            path = os.path.join(self.outdir, 'code_%03d.c' % n)
-            with open(path, 'w') as f:
-                f.write('#include "guest.h"\n\n')
-                f.write('\n\n'.join(chunk))
-                f.write('\n')
-            files.append(path)
-            n += 1
-            chunk = []
-        size = 0
+        buckets = {}
         for k in keys:
-            src = self.emit_function(k)
-            chunk.append(src)
-            size += len(src)
-            if size > 1_500_000:
-                flush()
-                size = 0
-        flush()
-        with open(os.path.join(self.outdir, 'guest.h'), 'w') as f:
-            f.write('#pragma once\n#include "cpu.h"\n\n')
-            for k in keys:
-                f.write('void %s(CPU *c, u32 entry);\n' % fname(k))
+            buckets.setdefault(k >> 16, []).append(self.emit_function(k))
+        # Each file declares only the functions it calls (guest.h, which lists them all, changes whenever one is
+        # found and is left to table.c and lazily recompiled code).
+        known = set(fname(k) for k in keys)
+        wanted = set()
+        for b in sorted(buckets):
+            name = 'code_%05x.c' % b
+            wanted.add(name)
+            path = os.path.join(self.outdir, name)
+            body = '\n\n'.join(buckets[b])
+            used = sorted(set(re.findall(r'\b[ft]_[0-9a-f]{8}\b', body)) & known)
+            head = '#include "cpu.h"\n\n' + ''.join('void %s(CPU *c, u32 entry);\n' % n for n in used)
+            write_if_changed(path, head + '\n' + body + '\n')
+            files.append(path)
+        for f in os.listdir(self.outdir):
+            if f.startswith('code_') and f.endswith('.c') and f not in wanted:
+                os.remove(os.path.join(self.outdir, f))
+        f = io.StringIO()
+        f.write('#pragma once\n#include "cpu.h"\n\n')
+        for k in keys:
+            f.write('void %s(CPU *c, u32 entry);\n' % fname(k))
+        write_if_changed(os.path.join(self.outdir, 'guest.h'), f.getvalue())
         ents = sorted(set(self.entries))  # a resume site shared by several functions: the same pick every run
         seen = set()
-        with open(os.path.join(self.outdir, 'table.c'), 'w') as f:
-            f.write('#include "guest.h"\n\nconst GuestEntry guest_entries[] = {\n')
-            cnt = 0
-            for addr, fn, k in ents:
-                if addr in seen:
-                    continue
-                seen.add(addr)
-                f.write('  {0x%xu, %s, %d},\n' % (addr, fn, k))
-                cnt += 1
-            f.write('};\nconst u32 guest_entry_count = %d;\n' % cnt)
-            cros = self.an.img.cros
-            if cros:
-                # the slots the runtime's ldr:ro moves each CRO module's code to (tools/recomp/cro.py)
-                f.write('\nconst GuestCro guest_cros[] = {\n')
-                for m in cros.mods:
-                    f.write('  {"%s", 0x%xu, 0x%xu},\n' % (m.name, m.base, m.slot_size()))
-                f.write('};\nconst u32 guest_cro_count = %d;\n' % len(cros.mods))
-            # classes by name, for profiles that find addresses through RTTI (tools/recomp/rtti.py)
-            cls = sorted(rtti.classes(self.an.img).items())
-            if cls:
-                f.write('\nconst GuestClass guest_classes[] = {\n')
-                for name, vptr in cls:
-                    f.write('  {"%s", 0x%xu},\n' % (name, vptr))
-                f.write('};\nconst u32 guest_class_count = %d;\n' % len(cls))
+        f = io.StringIO()
+        f.write('#include "guest.h"\n\nconst GuestEntry guest_entries[] = {\n')
+        cnt = 0
+        for addr, fn, k in ents:
+            if addr in seen:
+                continue
+            seen.add(addr)
+            f.write('  {0x%xu, %s, %d},\n' % (addr, fn, k))
+            cnt += 1
+        f.write('};\nconst u32 guest_entry_count = %d;\n' % cnt)
+        cros = self.an.img.cros
+        if cros:
+            # the slots the runtime's ldr:ro moves each CRO module's code to (tools/recomp/cro.py)
+            f.write('\nconst GuestCro guest_cros[] = {\n')
+            for m in cros.mods:
+                f.write('  {"%s", 0x%xu, 0x%xu},\n' % (m.name, m.base, m.slot_size()))
+            f.write('};\nconst u32 guest_cro_count = %d;\n' % len(cros.mods))
+        # classes by name, for profiles that find addresses through RTTI (tools/recomp/rtti.py)
+        cls = sorted(rtti.classes(self.an.img).items())
+        if cls:
+            f.write('\nconst GuestClass guest_classes[] = {\n')
+            for name, vptr in cls:
+                f.write('  {"%s", 0x%xu},\n' % (name, vptr))
+            f.write('};\nconst u32 guest_class_count = %d;\n' % len(cls))
+        write_if_changed(os.path.join(self.outdir, 'table.c'), f.getvalue())
         files.append(os.path.join(self.outdir, 'table.c'))
         return files
 
