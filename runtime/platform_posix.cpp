@@ -159,6 +159,25 @@ int sample_thread_pcs(uint64_t handle, uint64_t *pcs, int max) {
     return n;
 }
 
+bool can_single_step() {
+#if defined(__x86_64__)
+    return true;
+#else
+    return false;
+#endif
+}
+
+void set_single_step(void *ucontext, bool on) {
+#if defined(__x86_64__)
+    auto *uc = (ucontext_t *)ucontext;
+    if (on) uc->uc_mcontext.gregs[REG_EFL] |= 0x100;  // TF
+    else uc->uc_mcontext.gregs[REG_EFL] &= ~0x100;
+#else
+    (void)ucontext;
+    (void)on;
+#endif
+}
+
 uint64_t fault_pc(void *ucontext) {
     const auto *uc = (const ucontext_t *)ucontext;
 #if defined(__x86_64__)

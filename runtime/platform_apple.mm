@@ -82,4 +82,8 @@ int sample_thread_pcs(uint64_t handle, uint64_t *pcs, int max) {
 
 uint64_t fault_pc(void *ucontext) { return ((ucontext_t *)ucontext)->uc_mcontext->__ss.__pc; }
 
+// (no trap flag on arm64: RECOMP_WATCH samples the page's faults instead)
+bool can_single_step() { return false; }
+void set_single_step(void *, bool) {}
+
 }  // namespace platform

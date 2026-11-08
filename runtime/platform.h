@@ -52,4 +52,8 @@ bool is_current_thread(uint64_t handle);
 int sample_thread_pcs(uint64_t handle, uint64_t *pcs, int max);
 // the program counter of a signal's ucontext_t (SIGSEGV handlers)
 uint64_t fault_pc(void *ucontext);
+// single-stepping the interrupted thread from a signal handler (the trap flag: SIGTRAP after one instruction), where
+// the host has it (RECOMP_WATCH's exact write log)
+bool can_single_step();
+void set_single_step(void *ucontext, bool on);
 }  // namespace platform
