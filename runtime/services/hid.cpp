@@ -8,6 +8,7 @@ extern std::atomic<int> g_winshot_request;  // (frontend.cpp)
 extern std::atomic<u32> g_live_host;         // (frontend.cpp): host inputs for one-screen play (onescreen.h)
 void frontend_live_text(const std::string &s);  // (frontend.cpp): typed as on the host's keyboard
 void frontend_live_key(const std::string &name);  // (frontend.cpp): a host key press (SDL key name)
+void frontend_live_mouse(float dx, float dy);       // (frontend.cpp): captured mouse motion (aiming)
 namespace onescreen {
 u32 host_mask(const char *names);
 }
@@ -42,6 +43,9 @@ static void ensure_shm() {
 // run one after the other for that many VBlanks, each followed by a few released frames; the log says when each
 // starts. A line "DUMP" writes the state of every thread to the log at once, "MEMDUMP <tag>" snapshots guest memory
 // (mem_<tag>_<address>.bin, as RECOMP_MEMDUMP), "POKE8 <hex address> <hex value>" writes a byte at once,
+// "POKE32 <hex address> <hex value>" / "POKEF <hex address> <float>" write a word at once, "MOUSEREL <dx> <dy>" moves
+// the captured mouse (aiming), "MEMDUMPNOW <tag>" and "WINSHOTNOW" snapshot memory or the window at once (while a
+// queued command holds its input),
 // "DRAG <x>/<y> <x1>/<y1> <frames>" touches and moves (bottom-screen pixels), "PAD <host inputs> <frames>" plays host inputs by position (one-screen play: "PAD zl 6", "PAD rs-up 30"),
 // "KEY <SDL key name>" presses a host key, "TEXT <text>" types on the game's own keyboard (the profile's keys), "WINSHOT" writes the whole window at the next frame (window_<frame>.ppm, as RECOMP_WINSHOT).
 namespace {
@@ -50,7 +54,8 @@ struct LiveCmd {
     int cx = 0, cy = 0, tx = -1, ty = -1, frames = 0;
     std::string memdump;  // "MEMDUMP <tag>": guest memory as mem_<tag>_<address>.bin when the command is reached
     u32 host = 0;         // "PAD <inputs> <frames>": host inputs by position (zl, back, dup, rs-up, ...)
-    int x1 = -1, y1 = -1;  // "DRAG <x>/<y> <x1>/<y1> <frames>": a touch moving from (tx, ty) to here
+    int x1 = -1, y1 = -1;  // "DRAG <x>/<y> <x1>/<y1> <frames> [<move>]": a touch moving from (tx, ty) to here
+    int move = 0;          // (in that many frames, then held there; 0: over the whole command)
     u64 start = 0;
 };
 struct Live {
@@ -68,7 +73,7 @@ LiveCmd parse_live(const std::string &line) {
     LiveCmd c;
     if (line.rfind("DRAG ", 0) == 0) {
         int n = 0;
-        sscanf(line.c_str() + 5, "%d/%d %d/%d %d", &c.tx, &c.ty, &c.x1, &c.y1, &n);
+        sscanf(line.c_str() + 5, "%d/%d %d/%d %d %d", &c.tx, &c.ty, &c.x1, &c.y1, &n, &c.move);
         c.frames = n > 0 ? n : 1;
         return c;
     }
@@ -141,6 +146,24 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         std::string line = live.partial.substr(0, live.partial.size() - 1);
         live.partial.clear();
         if (line == "DUMP") dump_threads();  // right away: the state of every thread in the log
+        else if (line.rfind("MEMDUMPNOW ", 0) == 0) dump_memory(("mem_" + line.substr(11)).c_str());  // right away
+        else if (line == "WINSHOTNOW") g_winshot_request = 1;  // right away: the window at the next frame
+        else if (line.rfind("MOUSEREL ", 0) == 0) {  // right away: mouse motion while aiming (window points)
+            float dx = 0, dy = 0;
+            if (sscanf(line.c_str() + 9, "%f %f", &dx, &dy) == 2) frontend_live_mouse(dx, dy);
+        }
+        else if (line.rfind("POKE32 ", 0) == 0 || line.rfind("POKEF ", 0) == 0) {  // right away: a word or a float
+            unsigned a = 0;
+            char v[64] = {};
+            if (sscanf(line.c_str() + line.find(' ') + 1, "%x %63s", &a, v) == 2) {
+                u32 w = (u32)strtoul(v, nullptr, 16);
+                if (line[4] == 'F') {
+                    const float f = strtof(v, nullptr);
+                    memcpy(&w, &f, 4);
+                }
+                w32(a, w);
+            }
+        }
         else if (line.rfind("POKE8 ", 0) == 0) {  // right away: "POKE8 <address> <value>" writes a byte of guest memory
             unsigned a = 0, v = 0;
             if (sscanf(line.c_str() + 6, "%x %x", &a, &v) == 2) w8(a, (u8)v);
@@ -181,7 +204,8 @@ void live_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16 &ty) {
         tx = (u16)live.cur.tx;
         ty = (u16)live.cur.ty;
         if (live.cur.x1 >= 0) {  // a drag: there linearly, the last frames held at the end
-            const float t = std::min(1.0f, (float)(g_frame - live.cur.start) / std::max(1, live.cur.frames - 6));
+            const int span = live.cur.move > 0 ? live.cur.move : live.cur.frames - 6;
+            const float t = std::min(1.0f, (float)(g_frame - live.cur.start) / std::max(1, span));
             tx = (u16)(live.cur.tx + (live.cur.x1 - live.cur.tx) * t);
             ty = (u16)(live.cur.ty + (live.cur.y1 - live.cur.ty) * t);
         }

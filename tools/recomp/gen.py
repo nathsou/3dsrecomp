@@ -260,7 +260,8 @@ class Analyzer:
     def thumb_table(self, i):
         """RVCT's Thumb switch on a table of byte (or halfword) offsets right after the jump:
             cmp rI, #n ; bhs default ; movs rX, rI ; add rX, pc ; ldrb rX, [rX, #k] ; adds rX, rX, rX ; add pc, rX
-        (the halfword form indexes with `lsls rX, rI, #1` and loads with ldrh)."""
+        (the halfword form indexes with `lsls rX, rI, #1` and loads with ldrh; the index can be in rX already, or the
+        table's address made with `adr` and indexed by the load)."""
         img = self.img
         a = i.addr
         hw = img.read16(a)
@@ -274,6 +275,9 @@ class Analyzer:
             return None
         if h[0] not in (0x1800 | rx << 6 | rx << 3 | rx, 0x0040 | rx << 3 | rx):  # adds rX, rX, rX / lsls rX, rX, #1
             return None
+        if (h[1] & 0xFE3F) == (0x5C00 | rx << 3 | rx) and (h[2] & 0xFF00) == (0xA000 | rx << 8):
+            # armcc's other form: `adr rX, table ; ldrb rX, [rX, rI] ; adds rX, rX, rX ; add pc, rX` (Star Fox 64 3D)
+            return self.thumb_table_targets(a, (h[1] >> 6) & 7, 6, ((a - 6 + 4) & ~3) + (h[2] & 0xFF) * 4, 1)
         if (h[1] & 0xF83F) == (0x7800 | rx << 3 | rx):
             size, k = 1, (h[1] >> 6) & 31
         elif (h[1] & 0xF83F) == (0x8800 | rx << 3 | rx):
@@ -283,20 +287,28 @@ class Analyzer:
         if h[2] != (0x4478 | rx):  # add rX, pc
             return None
         if size == 1 and (h[3] & 0xFFC7) == rx:  # movs rX, rI
-            ri = (h[3] >> 3) & 7
+            ri, seq = (h[3] >> 3) & 7, 8
         elif size == 2 and (h[3] & 0xFFC7) == (0x0040 | rx):  # lsls rX, rI, #1
-            ri = (h[3] >> 3) & 7
+            ri, seq = (h[3] >> 3) & 7, 8
+        elif size == 1:  # the index in rX already (`cmp rX, #n ; bhs default ; add rX, pc ; ...`: Star Fox 64 3D)
+            ri, seq = rx, 6
         else:
             return None
+        return self.thumb_table_targets(a, ri, seq, a - 2 + k, size)  # rX = idx + (address of `add rX, pc`) + 4
+
+    def thumb_table_targets(self, a, ri, seq, tbase, size):
+        """The targets of a Thumb switch jumping with `add pc, rX` at a, its `seq` bytes of table lookup before it,
+        indexed by rI into the table at tbase (of byte or halfword offsets / 2 from a + 4), its size from a
+        `cmp rI, #n` + `bhs` to the default case before the lookup."""
+        img = self.img
         n = None
-        for back in range(5, 14):
+        for back in range(seq // 2 + 1, seq // 2 + 10):
             p = img.read16(a - 2 * back)
             if p is None:
                 break
             if (p & 0xFF00) == (0x2800 | ri << 8):  # cmp rI, #n
-                q = img.read16(a - 2 * back + 2)
                 # the bhs/bcs to the default case (possibly a few instructions later)
-                for f in range(a - 2 * back + 2, a - 8, 2):
+                for f in range(a - 2 * back + 2, a - seq, 2):
                     q = img.read16(f)
                     if q is not None and (q & 0xFF00) == 0xD200:
                         n = p & 0xFF
@@ -304,7 +316,6 @@ class Analyzer:
                 break
         if not n:
             return None
-        tbase = a - 2 + k  # rX = idx + (address of `add rX, pc`) + 4
         targets = []
         for idx in range(n):
             if size == 1:

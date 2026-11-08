@@ -483,6 +483,7 @@ id<MTLBuffer> make_buffer(size_t n) {
 id<MTLCommandBuffer> cur_cb;
 std::vector<id<MTLBuffer>> cur_chunks;
 size_t chunk_off = 0;
+size_t chunk_last = SIZE_MAX;  // offset of the last slice taken from the current chunk (the only one arena_trim may shrink)
 std::mutex chunk_mtx;
 std::vector<id<MTLBuffer>> chunk_free;
 constexpr size_t kChunkBytes = 4u << 20, kMaxFreeChunks = 16;
@@ -535,12 +536,14 @@ Slice arena(size_t n) {
         chunk_off = 0;
     }
     Slice s{cur_chunks.back(), chunk_off, (u8 *)cur_chunks.back().contents + chunk_off};
+    chunk_last = chunk_off;
     chunk_off += n;
     return s;
 }
-// gives back the end of the last slice taken (only `used` bytes of it were needed)
+// gives back the end of the last slice taken (only `used` bytes of it were needed); a slice with others taken after
+// it keeps its size (they lie beyond its end)
 void arena_trim(const Slice &s, size_t used) {
-    if (!cur_chunks.empty() && s.buf == cur_chunks.back() && s.off <= chunk_off)
+    if (!cur_chunks.empty() && s.buf == cur_chunks.back() && s.off == chunk_last)
         chunk_off = std::min(chunk_off, s.off + ((used + 255) & ~(size_t)255));
 }
 

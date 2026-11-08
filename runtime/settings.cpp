@@ -48,6 +48,7 @@ void settings_load() {
     num("speed", s.speed);
     num("volume", s.volume);
     num("show_fps", s.show_fps);
+    num("aim_speed", s.aim_speed);
     num("clock_offset", s.clock_offset);
     num("auto_backup", s.auto_backup);
     num("forgive_unsaved", s.forgive_unsaved);
@@ -64,6 +65,7 @@ void settings_load() {
     s.layout = std::max(s.layout, 0);  // (the frontend clamps it to its layouts)
     s.speed = std::clamp(s.speed, 25, 400);
     s.volume = std::clamp(s.volume, 0, 100);
+    s.aim_speed = std::clamp(s.aim_speed, 25, 400);
     s.pip = std::clamp(s.pip, 0, 2);
     s.pip_corner = std::clamp(s.pip_corner, 0, 3);
     s.pip_size = std::clamp(s.pip_size, 15, 80);
@@ -85,7 +87,7 @@ void settings_save() {
       << "\nforgive_unsaved=" << s.forgive_unsaved
       << "\npip=" << s.pip << "\npip_corner=" << s.pip_corner << "\npip_x=" << s.pip_x << "\npip_y=" << s.pip_y
       << "\npip_size=" << s.pip_size << "\nauto_focus=" << s.auto_focus << "\nhud=" << s.hud
-      << "\ntex_filter=" << s.tex_filter << "\nitem_stacks=" << s.stack_items
+      << "\ntex_filter=" << s.tex_filter << "\nitem_stacks=" << s.stack_items << "\naim_speed=" << s.aim_speed
       << "\n";
 }
 

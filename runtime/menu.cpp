@@ -363,6 +363,10 @@ std::vector<Row> rows(Page p) {
                          s.volume = std::clamp(s.volume + d * 10, 0, 100);
                          audio::set_volume(s.volume / 100.0f);
                      }});
+        if (profile::aim().cond != -2)
+            r.push_back({"Aim speed", std::to_string(s.aim_speed) + "%",
+                         "How fast the right stick and the mouse move the reticle and turn the camera.",
+                         [&s](int d) { cycle(s.aim_speed, {25, 50, 75, 100, 125, 150, 200, 300, 400}, d); }});
         break;
     }
     case CONFIRM:

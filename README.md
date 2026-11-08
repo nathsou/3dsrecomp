@@ -15,19 +15,25 @@ is not an emulator: the game runs as a native program, rendered with Metal or Vu
 | Game | Version | `-DGAME=` |
 |---|---|---|
 | Super Mario 3D Land | EUR | `sm3dl` |
-| New Super Mario Bros. 2 | USA | `nsmb2` |
+| New Super Mario Bros. 2 | USA, EUR | `nsmb2` |
 | Mario Kart 7 | EUR | `mk7` |
 | The Legend of Zelda: Ocarina of Time 3D | EUR | `oot3d` |
 | The Legend of Zelda: Majora's Mask 3D | EUR (eShop) | `mm3d` |
 | Metroid: Samus Returns | USA | `metroid` |
 | Animal Crossing: New Leaf – Welcome amiibo | USA, EUR (eShop) | `acnl` |
-| Tomodachi Life | USA | `tomodachi` |
+| Tomodachi Life | USA, EUR | `tomodachi` |
 | Hey! Pikmin | EUR | `pikmin` |
 | Picross 3D: Round 2 | EUR (eShop) | `picross` |
 | Pullblox | EUR (eShop) | `pullblox` |
+| Kid Icarus: Uprising | EUR | `kiu` |
+| Star Fox 64 3D | EUR | `starfox` |
+| The Legend of Zelda: A Link Between Worlds | EUR | `albw` |
+| Kirby: Triple Deluxe | EUR | `kirbytd` |
 
 All of them run at full speed with music and sound. Online play, StreetPass, SpotPass, amiibo, QR codes and the
 camera are not supported. Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline.
+
+Kid Icarus: Uprising's aiming, done with the stylus on a 3DS, also works with the right stick or the mouse.
 
 Some games (Tomodachi Life, NSMB2, Mario Kart 7, Pullblox) need the Mii data or shared font system archives.
 Open-source replacements can be imported from an Azahar source checkout:
@@ -74,7 +80,8 @@ sudo pacman -S clang cmake ninja sdl3 vulkan-icd-loader vulkan-headers shaderc f
    (Linux: `tools/bundle_linux.sh`, iOS: `tools/bundle_ios.sh`, see the scripts for options).
 
 Saves go to `save/<title id>/` (`~/Library/Application Support/3dsrecomp/` for app bundles,
-`~/.local/share/3dsrecomp/` on Linux).
+`~/.local/share/3dsrecomp/` on Linux). A real console's save goes in its `savedata/` folder; Checkpoint backups leave
+out empty folders, and Mario Kart 7 resets a save whose empty `replay_` folder is missing.
 
 ## Controls
 
