@@ -32,6 +32,12 @@ u32 heap_size, linear_used;
 // what it allocated. Games size their heap from what is left of the 64 MiB (Picross 3D: Round 2 takes all of it,
 // and needs every page the program does not use).
 static u32 pages(u32 size) { return (size + 0xFFF) & ~0xFFFu; }
+// a kernel object's name for the logs: its kind and the guest code that made it (the creating call's return address)
+static std::string made_at(const char *kind, const CPU *c) {
+    char name[32];
+    snprintf(name, sizeof name, "%s@%08x", kind, c->r[14]);
+    return name;
+}
 static u32 memory_used() {
     return pages(g_game.text_size) + pages(g_game.ro_size) + pages(g_game.data_size + g_game.bss_size) +
            pages(g_game.stack_size) + heap_size + linear_used;
@@ -701,7 +707,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x13: {  // CreateMutex(initial=r1)
         auto m = std::make_shared<Mutex>();
-        m->name = "mutex@" + std::to_string(c->r[14]);
+        m->name = made_at("mutex", c);
         if (c->r[1]) m->acquire(t);
         c->r[1] = add_handle(m);
         c->r[0] = RES_OK;
@@ -716,7 +722,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x15: {  // CreateSemaphore(initial=r1, max=r2)
         auto s = std::make_shared<Semaphore>();
-        s->name = "sema@" + std::to_string(c->r[14]);
+        s->name = made_at("sema", c);
         s->count = (s32)c->r[1];
         s->max = (s32)c->r[2];
         c->r[1] = add_handle(s);
@@ -737,9 +743,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x17: {  // CreateEvent(reset=r1)
         auto e = make_event((ResetType)c->r[1], "guest");
-        char nm[32];
-        snprintf(nm, sizeof nm, "event@%08x", c->r[14]);
-        e->name = nm;
+        e->name = made_at("event", c);
         c->r[1] = add_handle(e);
         c->r[0] = RES_OK;
         break;
@@ -765,7 +769,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x1A: {  // CreateTimer(reset=r1)
         auto tm = std::make_shared<Timer>();
-        tm->name = "timer@" + std::to_string(c->r[14]);
+        tm->name = made_at("timer", c);
         tm->reset = (ResetType)c->r[1];
         c->r[1] = add_handle(tm);
         c->r[0] = RES_OK;
