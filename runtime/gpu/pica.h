@@ -597,6 +597,8 @@ void vtx_finish_jobs();
 void raster_prepare_vertex(const DrawState &ds, const OutVertex &v, SV &sv, u32 &outcode);
 void raster_triangle_sv(const DrawState *ds, const SV &a, const SV &b, const SV &c);
 void raster_flush();
+void raster_end_list();
+void raster_flush_touching(u32 addr, u32 size);
 void raster_init();
 bool raster_blend_selftest();  // vectorized vs scalar blending (unit tests)
 

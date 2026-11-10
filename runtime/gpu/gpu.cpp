@@ -579,7 +579,7 @@ void process_command_list(u32 paddr, u32 size_bytes) {
     static const double hitch_ms = getenv("GPU_HITCH_MS") ? atof(getenv("GPU_HITCH_MS")) : 0;
     const double t0 = g_stats || hitch_ms ? now_ms() : 0;
     cmd_run(paddr, size_bytes);
-    raster_flush();
+    raster_end_list();
     hw_end_list();
     if (hitch_ms) {
         // command lists that took long enough to delay a frame (GPU_HITCH_MS=<threshold>)
