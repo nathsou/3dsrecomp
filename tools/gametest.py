@@ -224,7 +224,9 @@ def run_test(spec, args, games):
     frames = int(spec['frames'])
     shot_frames = sorted({int(c['frame']) for c in checkpoints})
     env = dict(os.environ)
-    env.update({'SDL_VIDEO_DRIVER': 'offscreen', 'SDL_AUDIO_DRIVER': 'dummy', 'RECOMP_FRAMES': str(frames)})
+    # (SDL's offscreen driver wants OpenGL for its windows, which macOS does not give it: the dummy driver there)
+    video = 'dummy' if sys.platform == 'darwin' else 'offscreen'
+    env.update({'SDL_VIDEO_DRIVER': video, 'SDL_AUDIO_DRIVER': 'dummy', 'RECOMP_FRAMES': str(frames)})
     for k in list(env):
         if k.startswith(('RECOMP_', 'GPU_')) and k not in ('RECOMP_FRAMES',):
             del env[k]  # (the caller's debugging variables would change the run)
