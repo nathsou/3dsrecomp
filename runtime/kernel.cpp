@@ -120,11 +120,14 @@ void set_clock_speed(u32 pct) {
 }
 
 void add_timeout(u64 deadline, std::function<void()> fn) {
+    // (the thread waits for the earliest deadline: a later one changes nothing for it)
+    const bool earliest = tq.q.empty() || deadline < tq.q.begin()->first;
     tq.q.emplace(deadline, std::move(fn));
-    tq.cv.notify_one();
+    if (earliest) tq.cv.notify_one();
 }
 
 static void timeout_thread() {
+    platform::set_thread_name("timeouts");
     Lock lk(kmutex);
     for (;;) {
         if (tq.q.empty()) {
@@ -545,7 +548,7 @@ static u32 svc_control_memory(CPU *c) {
             heap_size += size;
         }
         memset(gptr(a), 0, size);
-        add_region(a, size, perm, linear ? 5 : 5);
+        add_region(a, size, perm, 5);
         c->r[1] = a;
         return RES_OK;
     }
@@ -996,7 +999,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             u64 v = 0;
             bool limit = imm == 0x39;
             switch (name) {
-            case 0: v = limit ? 0x18 : 0x18; break;                                   // priority
+            case 0: v = 0x18; break;                                // priority
             case 1: v = limit ? 0x04000000 : memory_used(); break;  // commit
             case 2: v = limit ? 32 : threads.size(); break;
             case 3: v = limit ? 32 : 8; break;

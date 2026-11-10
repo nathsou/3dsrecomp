@@ -268,7 +268,8 @@ void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty, s16 sx,
     hid.ev_pad0->signal();
     hid.ev_pad1->signal();
     // accelerometer: at rest, face up (y = -1g in the 3DS's frame)
-    if (hid.accel_on && !getenv("RECOMP_NO_ACCEL")) {
+    static const bool no_accel = getenv("RECOMP_NO_ACCEL") != nullptr;
+    if (hid.accel_on && !no_accel) {
         u32 aidx = (r32(b + 0x118) + 1) % 8;
         if (aidx == 0) {
             w64(b + 0x110, r64(b + 0x108));

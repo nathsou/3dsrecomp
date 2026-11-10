@@ -151,20 +151,28 @@ u32 function_start(u32 addr) {  // (entries are sorted; a function's own start h
     return lo > 0 ? guest_entries[lo - 1].addr & ~1u : 0;
 }
 
-#define DCACHE 8192
-static thread_local struct { u32 addr; const GuestEntry *e; } dcache[DCACHE];
+// The entries of the addresses last dispatched to, by address (one table for all threads: a slot is one pointer,
+// and an entry says which address it is for). Hooked addresses are never in it, so rt_dispatch's fast path need not
+// look at the hooks.
+constexpr u32 kDispatchCacheSize = 1 << 16;
+static std::atomic<const GuestEntry *> dcache[kDispatchCacheSize];
+static std::atomic<const GuestEntry *> &dcache_slot(u32 addr) { return dcache[(addr >> 1) & (kDispatchCacheSize - 1)]; }
 
 static const GuestEntry *lazy_lookup(u32 addr);
+static bool hooked(u32 addr);
 
 static const GuestEntry *lookup_cached(u32 addr) {
-    auto &slot = dcache[(addr >> 2) & (DCACHE - 1)];
-    if (slot.e && slot.addr == addr) return slot.e;
+    auto &slot = dcache_slot(addr);
+    const GuestEntry *e = slot.load(std::memory_order_relaxed);
+    if (e && e->addr == addr) return e;
     static u32 pretend_missing = getenv("RECOMP_TEST_LAZY") ? (u32)strtoul(getenv("RECOMP_TEST_LAZY"), nullptr, 16) : 0;
-    const GuestEntry *e = addr == pretend_missing ? nullptr : dispatch_lookup(addr);
+    e = addr == pretend_missing ? nullptr : dispatch_lookup(addr);
     if (!e && !(addr & 1) && addr != pretend_missing) e = dispatch_lookup(addr | 1);  // a Thumb target reached without bit 0
     if (!e) e = lazy_lookup(addr);
-    slot.addr = addr;
-    slot.e = e;
+    if (e) {
+        slot = e;
+        if (hooked(addr)) slot = nullptr;  // (after the store: a hook added meanwhile clears the slot itself, see there)
+    }
     return e;
 }
 
@@ -252,11 +260,18 @@ static struct {
 static std::atomic<int> hook_count;
 constexpr u32 CALL_RETURN = 0xFFFF0004u;  // where rt_guest_call's function returns to
 
+static bool hooked(u32 addr) {
+    for (int i = 0, n = hook_count; i < n; i++)
+        if (hooks[i].addr == addr) return true;
+    return false;
+}
+
 void rt_add_dispatch_hook(u32 addr, void (*hook)(CPU *c)) {
     const int n = hook_count;
     if (n == kHooks) FATAL("more than %d dispatch hooks\n", kHooks);
     hooks[n] = {addr, hook};
     hook_count = n + 1;  // (published once the entry is in)
+    dcache_slot(addr) = nullptr;  // dispatches to it take the slow path from now on
 }
 
 u32 rt_guest_call(CPU *c, u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
@@ -274,12 +289,11 @@ u32 rt_guest_call(CPU *c, u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
     return r;
 }
 
-// everything but a cached target without tracing or hooks (rt_dispatch's fast path)
+// everything but a cached target without tracing (rt_dispatch's fast path)
 __attribute__((noinline, cold)) static void dispatch_slow(CPU *c) {
     trace(c, "dispatch");
-    if (const int n = hook_count.load(std::memory_order_acquire); __builtin_expect(n, 0))
-        for (int i = 0; i < n; i++)
-            if (c->pc == hooks[i].addr) hooks[i].fn(c);
+    for (int i = 0, n = hook_count; i < n; i++)
+        if (c->pc == hooks[i].addr) hooks[i].fn(c);
     if (__builtin_expect(c->pc == CALL_RETURN, 0)) return;  // (an indirect return from rt_guest_call's function)
     const GuestEntry *e = lookup_cached(c->pc);
     if (__builtin_expect(!e, 0)) {
@@ -289,13 +303,13 @@ __attribute__((noinline, cold)) static void dispatch_slow(CPU *c) {
     e->fn(c, e->entry);
 }
 
-// Indirect branches and returns of the recompiled code: the target's function from this thread's cache, entered
-// with a tail call (no frame of its own: CALL_RETURN and EXIT_MAGIC are never cached, so they take the slow path)
+// Indirect branches and returns of the recompiled code: the target's function from the cache, entered with a tail
+// call (no frame of its own: CALL_RETURN, EXIT_MAGIC and hooked addresses are never cached, so they take the slow
+// path)
 extern "C" void rt_dispatch(CPU *c, u32) {
     const u32 pc = c->pc;
-    const auto &slot = dcache[(pc >> 2) & (DCACHE - 1)];
-    const GuestEntry *e = slot.e;
-    if (__builtin_expect(e && slot.addr == pc && trace_left == 0 && !hook_count.load(std::memory_order_relaxed), 1)) {
+    const GuestEntry *e = dcache_slot(pc).load(std::memory_order_relaxed);
+    if (__builtin_expect(e && e->addr == pc && trace_left == 0, 1)) {
 #if defined(__clang__)
         [[clang::musttail]]
 #endif

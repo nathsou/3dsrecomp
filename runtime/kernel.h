@@ -111,13 +111,11 @@ struct Thread : WaitObject {
     u32 tls = 0;
     u32 entry = 0;
     std::condition_variable cv;
-    std::thread host;
     u64 host_id = 0;  // the host thread (platform::thread_handle: thread dumps sample its stack for the guest call chain)
     u64 ready_seq = 0;
     // waiting
     std::vector<std::shared_ptr<WaitObject>> wait_objs;
     bool wait_all = false;
-    bool wait_out_index = false;
     u32 wait_result = 0;
     s32 wait_index = 0;
     u64 wait_gen = 0;
@@ -184,8 +182,8 @@ std::shared_ptr<Event> make_event(ResetType rt, const char *name);
 void svc_dispatch(CPU *c, u32 imm);
 void dump_threads();
 void dump_memory(const char *prefix);  // RECOMP_MEMDUMP
-bool guest_readable(u32 addr, u32 size);
-bool guest_busy();  // a guest thread is running (not all waiting)  // mapped and readable (host-side reads of game state)
+bool guest_readable(u32 addr, u32 size);  // mapped and readable (host-side reads of game state)
+bool guest_busy();  // a guest thread is running (not all waiting)
 
 struct BootInfo {
     u32 entry;
@@ -193,7 +191,6 @@ struct BootInfo {
     s32 priority;
     u64 program_id;
 };
-[[noreturn]] void boot(const BootInfo &bi);  // starts the main guest thread; returns on the host main thread
 void start(const BootInfo &bi);
 
 extern u32 heap_size, linear_used;
