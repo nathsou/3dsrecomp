@@ -459,6 +459,7 @@ bool tried = false;
 // saturated (gpu::busy), and RECOMP_STATS logs it every 2 s from metal_poll.
 bool log_timing = false;
 std::atomic<float> busy_frac{0};
+constexpr float kEagerCommitBusy = 0.4f;  // (metal_end_list)
 std::atomic<u64> vs_dispatches{0}, vs_verts{0}, vs_passes{0}, flushes{0};  // vertex kernel work, for the stats line
 std::atomic<u64> cbs_made{0};                                                // command buffers, for the stats line
 std::mutex busy_mtx;
@@ -491,6 +492,8 @@ std::mutex chunk_mtx;
 std::vector<id<MTLBuffer>> chunk_free;
 constexpr size_t kChunkBytes = 4u << 20, kMaxFreeChunks = 16;
 
+// The open command buffer: a command list's passes, then what follows them (a transfer, a write-back) go into it in
+// order; commit_list_cb sends it.
 id<MTLCommandBuffer> list_cb() {
     if (!cur_cb) cur_cb = new_cb_raw();
     return cur_cb;
@@ -508,12 +511,6 @@ void commit_list_cb() {
     [cur_cb commit];
     cur_cb = nil;
 }
-// a command buffer for work that must come after everything encoded so far
-id<MTLCommandBuffer> new_cb() {
-    commit_list_cb();
-    return new_cb_raw();
-}
-
 struct Slice {
     id<MTLBuffer> buf;
     size_t off;
@@ -810,12 +807,12 @@ bool guest_kept(GRT &r) {
 void write_back_color(GRT &r) {
     if (!guest_kept(r)) return;
     ensure_buffer(stage_color, rt_bytes(r));
-    id<MTLCommandBuffer> cb = new_cb();
+    id<MTLCommandBuffer> cb = list_cb();
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
     label(ce, "write-back %08x %ux%u", r.addr, r.w, r.h);
     encode_guest_color(ce, r, stage_color);
     [ce endEncoding];
-    [cb commit];
+    commit_list_cb();
     wait_cb(cb, "colour write-back", r.addr);  // also waits for all earlier work on the queue
     r.hash = copy_hash(pptr(r.addr), (const u8 *)stage_color.contents, rt_bytes(r));
     r.checked = g_frame.load(std::memory_order_relaxed);
@@ -829,7 +826,7 @@ void write_back_depth(GRT &r) {
     const u32 W = r.w * S, H = r.h * S;
     ensure_buffer(stage_depth, (size_t)W * H * 4);
     ensure_buffer(stage_stencil, (size_t)W * H);
-    id<MTLCommandBuffer> cb = new_cb();
+    id<MTLCommandBuffer> cb = list_cb();
     id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
     [be copyFromTexture:r.tex sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0, 0, 0)
              sourceSize:MTLSizeMake(W, H, 1) toBuffer:stage_depth destinationOffset:0
@@ -854,7 +851,7 @@ void write_back_depth(GRT &r) {
     [ce setBytes:prm length:16 atIndex:3];
     dispatch2d(ce, r.w, r.h);
     [ce endEncoding];
-    [cb commit];
+    commit_list_cb();
     wait_cb(cb, "depth write-back", r.addr);
     r.hash = copy_hash(p, (const u8 *)stage_dbytes.contents, rt_bytes(r));
     r.gpu_newer = false;
@@ -2621,6 +2618,10 @@ void metal_poll() {
 
 void metal_end_list() {
     if (!active) return;
+    // While the GPU has time to spare the list's command buffer stays open: the transfer or write-back that shows
+    // its result follows within the frame, goes into the same buffer and commits it, and each command buffer less is
+    // a submission to the kernel less. A busy GPU gets the list at once, to draw it while the next one is encoded.
+    if (busy_frac.load(std::memory_order_relaxed) < kEagerCommitBusy) return;
     @autoreleasepool {
         commit_list_cb();
     }
@@ -2781,7 +2782,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     auto op = std::make_unique<PendingXfer>();
     const u32 TW = (out_dims & 0xffff) * S, rows = (out_dims >> 16) * S;
     @autoreleasepool {
-        op->cb = new_cb();
+        op->cb = list_cb();
         if (src->clear_next) clear_now(*src, op->cb);
         op->gbytes = take_buffer(xbuf_free, rt_bytes(*src));
         op->obytes = take_buffer(xbuf_free, out_size);
@@ -2803,7 +2804,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
         dispatch2d(ce, out_w, out_h);
         encode_rot(ce, *src, op->disp, rows, TW, flags, row0);
         [ce endEncoding];
-        [op->cb commit];
+        commit_list_cb();
     }
     src->gpu_newer = false;  // the pending transfer writes it back
     src->own = false;
@@ -2946,12 +2947,12 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
         buf = take_buffer(disp_free, (size_t)TW * rows * 4);
     }
     @autoreleasepool {
-        id<MTLCommandBuffer> cb = new_cb();
+        id<MTLCommandBuffer> cb = list_cb();
         if (src->clear_next) clear_now(*src, cb);
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         encode_rot(ce, *src, buf, rows, TW, flags, row0);
         [ce endEncoding];
-        [cb commit];
+        commit_list_cb();
         wait_cb(cb, "display image", out_paddr);
     }
     const u32 hs = ((flags >> 24) & 3) ? 1 : 0, vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
