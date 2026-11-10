@@ -1,5 +1,5 @@
 """ARMv6 Thumb (Thumb-1 plus BLX) decoder lowering to the same C as arm.py."""
-from .ins import Ins, OP, B, CALL, ICALL, JMP, SVC, UDF
+from .ins import Ins, B, CALL, ICALL, JMP, SVC, UDF
 from .arm import hx, sx, shift_imm, dp_core, W
 
 
@@ -38,7 +38,6 @@ def _decode(i, hw, hw2, ctx):
                 L.append('cf = %s;' % c)
             L.append('u32 res = b; nf = res >> 31; zf = res == 0; %s' % W(i, rd, 'res'))
             i.code.append('{ ' + ' '.join(L) + ' }')
-            i.setflags = True
             i.note = ['lsls', 'lsrs', 'asrs'][op]
             return
         rn = (hw >> 6) & 7
@@ -46,7 +45,6 @@ def _decode(i, hw, hw2, ctx):
         b = 'u32 b = %s;' % (hx(rn) if (hw >> 10) & 1 else r(rn))
         body, _ = dp_core(2 if (hw >> 9) & 1 else 4, 1, 'a', 'b', None)
         i.code.append('{ %s %s %s %s }' % (a, b, ' '.join(body), W(i, rd, 'res')))
-        i.setflags = True
         i.note = 'adds/subs'
         return
     if top == 1:
@@ -62,13 +60,11 @@ def _decode(i, hw, hw2, ctx):
             i.code.append('{ u32 a = %s; u32 b = %s; %s %s }' % (r(rd), hx(imm), ' '.join(body),
                                                                 W(i, rd, 'res') if wr else '(void)res;'))
             i.note = ['', 'cmp', 'adds', 'subs'][op]
-        i.setflags = True
         return
     if hw >> 10 == 0x10:
         op = (hw >> 6) & 15
         rm, rd = (hw >> 3) & 7, hw & 7
         a, b = r(rd), r(rm)
-        i.setflags = True
         if op in (2, 3, 4, 7):
             sh = {2: 'lsl', 3: 'lsr', 4: 'asr', 7: 'ror'}[op]
             i.code.append('{ u32 sco = cf; u32 res = %s_rc(%s, %s & 0xff, &sco); cf = sco; %s %s }' % (
@@ -104,7 +100,6 @@ def _decode(i, hw, hw2, ctx):
         elif op == 1:
             body, _ = dp_core(10, 1, 'a', 'b', None)
             i.code.append('{ u32 a = %s; u32 b = %s; %s (void)res; }' % (pcval(i) if rd == 15 else r(rd), src, ' '.join(body)))
-            i.setflags = True
             i.note = 'cmp hi'
         elif op == 2:
             if rd == 15:
@@ -292,7 +287,6 @@ def _decode(i, hw, hw2, ctx):
         hi = sx(hw & 0x7FF, 11) << 12
         if hw2 >> 11 == 31:
             i.size = 4
-            i.pair = True
             i.kind = CALL
             i.target = ((i.addr + 4 + hi + ((hw2 & 0x7FF) << 1)) & 0xFFFFFFFF) | 1
             i.link = i.addr + 4
@@ -301,7 +295,6 @@ def _decode(i, hw, hw2, ctx):
             return
         if hw2 >> 11 == 29:
             i.size = 4
-            i.pair = True
             i.kind = CALL
             i.target = (i.addr + 4 + hi + ((hw2 & 0x7FF) << 1)) & 0xFFFFFFFC
             i.link = i.addr + 4

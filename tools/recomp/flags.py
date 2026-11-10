@@ -6,7 +6,7 @@ whose callers test flags right after the call (RVCT's __aeabi_cfcmple and friend
 """
 import re
 
-from .ins import B, CALL, ICALL, JMP, SVC, UDF
+from .ins import B, CALL, ICALL, JMP, UDF
 
 FLAGS = ('nf', 'zf', 'cf', 'vf')
 ALL = frozenset(FLAGS)

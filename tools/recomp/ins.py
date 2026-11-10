@@ -20,7 +20,7 @@ _VREG_RE = re.compile(r'\bS(\d+)\b')
 
 class Ins:
     __slots__ = ('addr', 'size', 'thumb', 'word', 'cond', 'kind', 'code', 'target', 'link', 'ret',
-                 'imm', 'jt', 'reads_pc_lit', 'note', 'setflags', 'readflags', 'pair')
+                 'imm', 'jt', 'reads_pc_lit', 'note')
 
     def __init__(self, addr, size, thumb, word):
         self.addr = addr
@@ -37,9 +37,6 @@ class Ins:
         self.jt = None          # jump table: list of target addresses (filled by the analyser)
         self.reads_pc_lit = None  # (addr) of a literal this instruction loads (LDR rX, [pc, #imm])
         self.note = ''
-        self.setflags = False
-        self.readflags = False
-        self.pair = False       # Thumb BL/BLX pair: the instruction is 4 bytes
 
     @property
     def cond_c(self):

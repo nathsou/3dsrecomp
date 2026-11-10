@@ -3,19 +3,19 @@
 Each guest function becomes `void f_XXXXXXXX(CPU *c, u32 entry)`. entry 0 starts at the function's address;
 entry k > 0 resumes at the k-th return site (the instruction after a call) so the dispatcher can continue a guest
 call chain whose host frames were unwound. Guest registers live in C locals inside a function and in the CPU struct
-across calls. Direct calls are C calls followed by a check that the callee returned where expected; tail branches
-and indirect jumps are `musttail` calls.
+across calls: before a call the locals assigned since they were last loaded are stored to it, and all are loaded back
+after it. Direct calls are C calls followed by a check that the callee returned where expected; tail branches and
+indirect jumps are `musttail` calls.
 """
 import io
 import os
 import re
 import struct
-import sys
 from collections import defaultdict
 
 from . import arm
 from . import thumb
-from .ins import B, CALL, ICALL, JMP, SVC, UDF, OP, COND_C
+from .ins import B, CALL, ICALL, JMP, SVC, UDF, OP
 from . import flags
 from . import rtti
 
@@ -32,7 +32,6 @@ class Analyzer:
         self.log = log
         self.funcs = {}          # key (addr | thumb) -> True
         self.rejected = set()
-        self.notes = defaultdict(int)
         self.rel_tables = set()
         self.pc_rel_ptrs = set()
         self.base_tables = set()  # tables of offsets from their own start to code (hand-written call tables)
@@ -510,7 +509,7 @@ class Analyzer:
         i = self.decode(a, th)
         if i is None or i.kind == UDF or i.cond != 14:
             return False
-        insts, ok = self.explore(key, limit=20000)
+        _, ok = self.explore(key, limit=20000)
         return ok
 
     def discover(self):
@@ -641,11 +640,66 @@ def write_if_changed(path, text):
     return True
 
 
+# the locals (guest registers, VFP registers, flags) an instruction's C assigns
+_WRITES = re.compile(r'\b(r\d+|S\d+|nf|zf|cf|vf|qf|ge|fpsr) = |\bDSET\((S\d+), (S\d+),|&(qf|ge)\b')
+
+
+def written(code):
+    return {g for m in _WRITES.finditer(' '.join(code)) for g in m.groups() if g}
+
+
+def cpu_field(v):
+    """Where the CPU struct keeps a local."""
+    if v[0] == 'r':
+        return 'c->r[%s]' % v[1:]
+    if v[0] == 'S':
+        return 'c->s[%s]' % v[1:]
+    return 'c->fpscr' if v == 'fpsr' else 'c->' + v
+
+
+def local_order(v):
+    return ('rnzcvqgfS'.index(v[0]), int(v[1:]) if v[1:].isdigit() else 0)
+
+
+def unsaved(insts, th, start, funcs, code):
+    """The locals that may differ from the CPU struct: {addr: set} once the instruction's own code has run (what its
+    store to the struct must write), and {addr: set} as it falls through to the next one. Locals are loaded from the
+    struct on entry and after every call (SI), so only what was assigned since then is to be stored: the struct's
+    other fields already hold the locals' values. code(addr): the C emitted for the instruction."""
+    wr = {a: written(code(a)) for a in insts}
+    succ = {}
+    for a, i in insts.items():
+        s = []
+        if i.kind == B and ((i.target | th) not in funcs or i.target == start):
+            s.append(i.target)
+        if i.kind == JMP and i.jt:
+            s += [t & ~1 for t in i.jt if (t & 1) == th and (t & ~1) in insts]
+        if i.falls_through and (a + i.size) in insts:
+            s.append(a + i.size)
+        succ[a] = s
+    before = {a: set() for a in insts}
+    after = {}
+
+    def flow(a):
+        i = insts[a]
+        if i.kind in (CALL, ICALL, SVC, UDF):  # (reloaded after it: all saved, unless its condition skipped it)
+            return set() if i.cond == 14 else before[a]
+        return before[a] | wr[a]
+    work = sorted(insts, reverse=True)  # (in address order: most code runs forward)
+    while work:
+        a = work.pop()
+        after[a] = flow(a)
+        for b in succ[a]:
+            if not after[a] <= before[b]:
+                before[b] |= after[a]
+                work.append(b)
+    return {a: before[a] | wr[a] for a in insts}, {a: flow(a) for a in insts}
+
+
 class Emitter:
-    def __init__(self, an, outdir, per_file=400):
+    def __init__(self, an, outdir):
         self.an = an
         self.outdir = outdir
-        self.per_file = per_file
         self.entries = []  # (key, fname, entry index)
         self.stats = defaultdict(int)
         self.undefined = []
@@ -653,16 +707,40 @@ class Emitter:
         self.flag_returning = set()
         self.flag_reading_entries = set()
         self.override = {}
+        self.verify_stores = False  # --verify-stores
+        self.explored = {}          # explore()
+        self.live = {}              # a function's flag liveness, where find_flag_returning computed it
+        self.locals = []            # of the function being emitted
+        self.unsaved = {}           # ... see unsaved()
+
+    def explore(self, key):
+        """A function's instructions (discovery is over: they no longer change)."""
+        insts = self.explored.get(key)
+        if insts is None:
+            insts = self.explored[key] = self.an.explore(key)[0]
+        return insts
+
+    def save(self, names):
+        """C storing these locals to the CPU struct."""
+        s = ' '.join('%s = %s;' % (cpu_field(v), v) for v in sorted(names, key=local_order))
+        if self.verify_stores:  # the locals left out must be in the struct already
+            rest = [v for v in self.locals if v not in names]
+            if rest:
+                s += ' if (%s) __builtin_trap();' % ' || '.join('%s != %s' % (
+                    ('F2U(%s)' % v, 'F2U(%s)' % cpu_field(v)) if v[0] == 'S' else (v, cpu_field(v))) for v in rest)
+        return s
 
     def emit_function(self, key):
         an = self.an
         th = key & 1
         start = key & ~1
-        insts, _ = an.explore(key)
+        insts = self.explore(key)
         addrs = sorted(insts)
         self.override = {}
         if self.flag_opt:
-            lo = flags.liveness(insts, th, start, an.funcs, key in self.flag_returning, self.flag_reading_entries)
+            lo = self.live.get(key)
+            if lo is None:
+                lo = flags.liveness(insts, th, start, an.funcs, key in self.flag_returning, self.flag_reading_entries)
             for a, i in insts.items():
                 c = flags.strip_dead(i, lo[a])
                 if c is not None:
@@ -683,8 +761,6 @@ class Emitter:
                 if nxt in insts:
                     if i.kind != SVC:
                         resume.append(nxt)
-            if i.falls_through:
-                labels.add(a + i.size) if False else None
         resume = sorted(set(resume))
         labels |= set(resume)
         regs = set()
@@ -708,23 +784,10 @@ class Emitter:
         vregs = sorted(vregs)
         fn = fname(key)
         out = []
-        so = ['c->r[%d] = r%d;' % (r, r) for r in regs]
-        si = ['r%d = c->r[%d];' % (r, r) for r in regs]
-        if uses_flags:
-            so.append('c->nf = nf; c->zf = zf; c->cf = cf; c->vf = vf;')
-            si.append('nf = c->nf; zf = c->zf; cf = c->cf; vf = c->vf;')
-        if uses_q:
-            so.append('c->qf = qf;')
-            si.append('qf = c->qf;')
-        if uses_ge:
-            so.append('c->ge = ge;')
-            si.append('ge = c->ge;')
-        if uses_fpsr:
-            so.append('c->fpscr = fpsr;')
-            si.append('fpsr = c->fpscr;')
-        for v in vregs:
-            so.append('c->s[%d] = S%d;' % (v, v))
-            si.append('S%d = c->s[%d];' % (v, v))
+        self.locals = ['r%d' % r for r in regs] + (['nf', 'zf', 'cf', 'vf'] if uses_flags else []) + \
+            (['qf'] if uses_q else []) + (['ge'] if uses_ge else []) + (['fpsr'] if uses_fpsr else []) + \
+            ['S%d' % v for v in vregs]
+        self.unsaved, unsaved_after = unsaved(insts, th, start, an.funcs, lambda a: self.override.get(a, insts[a].code))
         out.append('void %s(CPU *c, u32 entry) {' % fn)
         decl = []
         if regs:
@@ -741,8 +804,7 @@ class Emitter:
             decl.append('float ' + ', '.join('S%d = c->s[%d]' % (v, v) for v in vregs) + ';')
         decl.append('u32 tpc = 0; u8 *const M = MEMBASE; (void)M; (void)tpc;')
         out += ['  ' + d for d in decl]
-        out.append('#define SO() do { %s } while (0)' % ' '.join(so))
-        out.append('#define SI() do { %s } while (0)' % ' '.join(si))
+        out.append('#define SI() do { %s } while (0)' % ' '.join('%s = %s;' % (v, cpu_field(v)) for v in self.locals))
         if resume:
             out.append('  switch (entry) {')
             for k, a in enumerate(resume, 1):
@@ -753,7 +815,7 @@ class Emitter:
         if addrs and addrs[0] != start:
             out.append('  goto L_%x;' % start)
         prev_falls = None
-        for idx, a in enumerate(addrs):
+        for a in addrs:
             i = insts[a]
             if prev_falls is not None and prev_falls != a:
                 out.append('  goto L_%x;' % prev_falls)
@@ -767,11 +829,12 @@ class Emitter:
                     prev_falls = nxt
                 else:
                     # a tail call into the following function
-                    out.append('  SO(); __attribute__((musttail)) return %s(c, 0);' % fname(nxt | th))
+                    out.append('  %s __attribute__((musttail)) return %s(c, 0);' % (self.save(unsaved_after[a]) or ';',
+                                                                                     fname(nxt | th)))
                     self.stats['fallthrough_tail'] += 1
         if prev_falls is not None:
             out.append('  goto L_%x;' % prev_falls)
-        out.append('#undef SO\n#undef SI\n}')
+        out.append('#undef SI\n}')
         self.stats['functions'] += 1
         self.stats['instructions'] += len(insts)
         return '\n'.join(out)
@@ -779,6 +842,7 @@ class Emitter:
     def emit_ins(self, i, key, insts):
         th = key & 1
         an = self.an
+        so = self.save(self.unsaved[i.addr]) if i.kind != OP else ''
         body = []
         body += self.override.get(i.addr, i.code)
         if i.kind == OP:
@@ -786,40 +850,40 @@ class Emitter:
         elif i.kind == B:
             t = i.target
             if (t | th) in an.funcs and t != (key & ~1):
-                body.append('SO(); __attribute__((musttail)) return %s(c, 0);' % fname(t | th))
+                body.append('%s __attribute__((musttail)) return %s(c, 0);' % (so or ';', fname(t | th)))
             elif t <= i.addr:
                 # a loop: give way if an interrupt readied a higher-priority thread (a busy wait for that
                 # thread would otherwise never end; the 3DS kernel preempts)
-                body.append('if (__builtin_expect(rt_preempt_flag, 0)) { SO(); c->pc = 0x%xu; rt_preempt(c); SI(); } '
-                            'goto L_%x;' % (t | th, t))
+                body.append('if (__builtin_expect(rt_preempt_flag, 0)) { %s c->pc = 0x%xu; rt_preempt(c); SI(); } '
+                            'goto L_%x;' % (so, t | th, t))
                 self.stats['loop_checks'] += 1
             else:
                 body.append('goto L_%x;' % t)
         elif i.kind == CALL and i.target not in an.funcs:
             # a call to something discovery rejected (outside the code, or code reached only from data that
             # was decoded as instructions): go through the dispatcher, which reports it if it is ever reached
-            body.append('SO(); c->pc = 0x%xu; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
-                i.target, i.link | th))
+            body.append('%s c->pc = 0x%xu; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
+                so, i.target, i.link | th))
         elif i.kind == CALL:
-            body.append('SO(); %s(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
-                fname(i.target), i.link | th))
+            body.append('%s %s(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
+                so, fname(i.target), i.link | th))
         elif i.kind == ICALL:
-            body.append('SO(); c->pc = tpc; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
-                i.link | th))
+            body.append('%s c->pc = tpc; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
+                so, i.link | th))
         elif i.kind == JMP:
             if i.jt:
                 cases = ' '.join('case 0x%xu: goto L_%x;' % (t, t & ~1) for t in sorted(set(i.jt)) if (t & 1) == th)
                 body.append('switch (tpc) { %s default: break; }' % cases)
                 self.stats['jump_tables'] += 1
             if i.ret:
-                body.append('c->pc = tpc; SO(); return;')
+                body.append('c->pc = tpc; %s return;' % so)
             else:
-                body.append('c->pc = tpc; SO(); __attribute__((musttail)) return rt_dispatch(c, 0);')
+                body.append('c->pc = tpc; %s __attribute__((musttail)) return rt_dispatch(c, 0);' % so)
                 self.stats['indirect_jumps'] += 1
         elif i.kind == SVC:
-            body.append('SO(); c->pc = 0x%xu; rt_svc(c, 0x%x); SI();' % (i.addr + i.size, i.imm))
+            body.append('%s c->pc = 0x%xu; rt_svc(c, 0x%x); SI();' % (so, i.addr + i.size, i.imm))
         elif i.kind == UDF:
-            body.append('SO(); rt_undefined(c, 0x%xu, 0x%xu); SI();' % (i.addr | th, i.word))
+            body.append('%s rt_undefined(c, 0x%xu, 0x%xu); SI();' % (so, i.addr | th, i.word))
             self.undefined.append((i.addr, i.word, i.note))
         s = ' '.join(body)
         cc = i.cond_c
@@ -834,7 +898,7 @@ class Emitter:
         tails = {}
         for k in keys:
             th = k & 1
-            insts, _ = an.explore(k)
+            insts = self.explore(k)
             for i in insts.values():
                 if i.kind == CALL:
                     seq = []
@@ -869,7 +933,7 @@ class Emitter:
         work = []
         for k in keys:
             th = k & 1
-            insts, _ = an.explore(k)
+            insts = self.explore(k)
             for a, i in insts.items():
                 if i.kind == B and (i.target | th) in an.funcs and i.target != (k & ~1):
                     into[i.target | th].add(k)
@@ -880,11 +944,12 @@ class Emitter:
         while work:
             k = work.pop()
             queued.discard(k)
-            insts, _ = an.explore(k)
+            insts = self.explore(k)
             first = insts.get(k & ~1)
             if first is None:
                 continue
-            lo = flags.liveness(insts, k & 1, k & ~1, an.funcs, k in fr, fre)
+            # (a function is queued again whenever an entry it goes on to reads more flags: its last pass is final)
+            lo = self.live[k] = flags.liveness(insts, k & 1, k & ~1, an.funcs, k in fr, fre)
             li = frozenset(flags.live_in(first, lo[k & ~1])) | fre.get(k, frozenset())
             if li and li != fre.get(k):
                 fre[k] = li
@@ -985,6 +1050,8 @@ def main():
     ap.add_argument('--extra', action='append', default=[], help='file listing extra function addresses')
     ap.add_argument('--lazy', help='only emit the function at this address (and new functions it calls)')
     ap.add_argument('--lazy-out', help='C file for --lazy')
+    ap.add_argument('--verify-stores', action='store_true',
+                    help='debugging: trap where a local left out of a store to the CPU struct differs from it')
     args = ap.parse_args()
     if args.lazy:
         return lazy(args)
@@ -998,6 +1065,7 @@ def main():
                     an.extra.add(int(line, 16))
     keys = an.discover()
     em = Emitter(an, args.outdir)
+    em.verify_stores = args.verify_stores
     files = em.run(keys)
     with open(os.path.join(args.outdir, 'funcs.txt'), 'w') as f:
         for k in keys:
