@@ -285,6 +285,7 @@ struct GspGpu : Service {
                 std::lock_guard<std::mutex> lk(gsp.qm);
                 gsp.queue.push_back(c);
             }
+            frontend_wake();
             ipc.ok();
             break;
         }

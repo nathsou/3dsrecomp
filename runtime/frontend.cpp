@@ -1540,13 +1540,15 @@ static void swap_screens() {
 
 // GX commands run on their own thread so a slow frame never delays VBlank or presentation
 
+// (everything queued for the GX thread wakes it: the timeout is only a safety net)
+constexpr milliseconds kGxIdlePoll{100};
 static void gpu_thread() {
     platform::set_thread_name("gx");
     platform::set_thread_interactive();
     for (;;) {
         {
             std::unique_lock<std::mutex> lk(gpu_m);
-            gpu_cv.wait_for(lk, milliseconds(2), [] { return gpu_wake; });
+            gpu_cv.wait_for(lk, kGxIdlePoll, [] { return gpu_wake; });
             gpu_wake = false;
         }
         kernel::gsp_process_gx();
