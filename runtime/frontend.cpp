@@ -1112,6 +1112,7 @@ static void present() {
     SDL_Texture *t_top = upload_screen(renderer, 0, hi_top, tex_top, top);
     SDL_Texture *t_bottom = window2 ? upload_screen(renderer2, 1, hi_bottom2, tex_bottom2, bottom)
                                     : upload_screen(renderer, 1, hi_bottom, tex_bottom, bottom);
+    gpu::present_images_done();
     {
         const double ms = std::chrono::duration<double, std::milli>(steady_clock::now() - t).count();
         ui_times.get += ms;

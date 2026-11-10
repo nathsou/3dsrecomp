@@ -42,6 +42,9 @@ struct PresentDevice {
 bool present_device(PresentDevice *pd);
 u64 present_image_create(int w, int h);
 void present_image_destroy(u64 image);
+// after the frame's copy_to calls, before the renderer draws the present images: the copies are done (the Metal
+// backend sends them together)
+void present_images_done();
 void present_hold(bool on);
 void set_trust_invalidations(bool trust);
 // Metal internal resolution scale (1-4; 0 without Metal); auto: GPU_SCALE not given (see gpu/gpu.h)

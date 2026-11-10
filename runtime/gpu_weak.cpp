@@ -13,6 +13,7 @@ __attribute__((weak)) void set_present_extensions(const std::vector<std::string>
 __attribute__((weak)) bool present_device(PresentDevice *) { return false; }
 __attribute__((weak)) u64 present_image_create(int, int) { return 0; }
 __attribute__((weak)) void present_image_destroy(u64) {}
+__attribute__((weak)) void present_images_done() {}
 __attribute__((weak)) void present_hold(bool) {}
 __attribute__((weak)) void set_trust_invalidations(bool) {}
 __attribute__((weak)) void set_clear_after_top_transfer(bool) {}

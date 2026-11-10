@@ -51,6 +51,7 @@ bool metal_gpu_made(u32 paddr, u32 size);
 void metal_note_gpu_output(u32 paddr, u32 size);
 void metal_set_texture_filter(int mode);
 u64 metal_present_image_create(int w, int h);
+void metal_present_images_done();
 void metal_present_image_destroy(u64 image);
 
 namespace {
@@ -3028,6 +3029,10 @@ struct PresentImage {
 };
 std::mutex present_mtx;
 std::unordered_map<u64, PresentImage> present_images;
+// (UI thread) the copies of this frame's images, sent by metal_present_images_done; their display buffers, kept from
+// being reused until then
+id<MTLCommandBuffer> present_cb;
+std::vector<id<MTLBuffer>> present_bufs;
 // copies the view of a display image (rows of dw pixels) into a present image of its size
 bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
     id<MTLTexture> tex;
@@ -3039,8 +3044,8 @@ bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
     }
     if (tex.width != v.w || tex.height != v.h) return false;
     @autoreleasepool {
-        id<MTLCommandBuffer> cb = [queue commandBuffer];
-        id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        if (!present_cb) present_cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> be = [present_cb blitCommandEncoder];
         [be copyFromBuffer:buf
                    sourceOffset:((size_t)v.y0 * dw + v.x0) * 4
               sourceBytesPerRow:(size_t)dw * 4
@@ -3051,9 +3056,10 @@ bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
                destinationLevel:0
               destinationOrigin:MTLOriginMake(0, 0, 0)];
         [be endEncoding];
-        [cb commit];
-        [cb waitUntilCompleted];  // (the renderer draws it from its own queue)
     }
+    present_bufs.push_back(buf);
+    std::lock_guard<std::mutex> lk(disp_mtx);
+    disp_reading.push_back(buf);
     return true;
 }
 // calls fn with the view of a display image (buf: its pixels, rows of dw), in place
@@ -3140,6 +3146,18 @@ u64 metal_present_image_create(int w, int h) {
     present_images[(u64)pb] = {pb, tex};
     return (u64)pb;
 }
+void metal_present_images_done() {
+    if (!present_cb) return;
+    @autoreleasepool {
+        [present_cb commit];
+        [present_cb waitUntilCompleted];  // (the renderer draws them from its own queue)
+        present_cb = nil;
+    }
+    std::lock_guard<std::mutex> lk(disp_mtx);
+    for (id<MTLBuffer> buf : present_bufs)
+        disp_reading.erase(std::find(disp_reading.begin(), disp_reading.end(), buf));
+    present_bufs.clear();
+}
 void metal_present_image_destroy(u64 image) {
     std::lock_guard<std::mutex> lk(present_mtx);
     auto it = present_images.find(image);
@@ -3191,6 +3209,7 @@ const HwBackend *metal_backend() {
         .set_key_black_bottom = metal_set_key_black_bottom,
         .present_image_create = metal_present_image_create,
         .present_image_destroy = metal_present_image_destroy,
+        .present_images_done = metal_present_images_done,
         .emit_shaders = metal_emit_shaders,
     };
     return &b;

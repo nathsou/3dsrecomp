@@ -548,6 +548,7 @@ struct HwBackend {
     u64 (*present_image_create)(int w, int h);
     void (*present_image_destroy)(u64 image);
     void (*present_hold)(bool on);
+    void (*present_images_done)();  // (null: copy_to is complete when it returns)
 };
 // set_present_extensions' list (for the backend's init)
 const std::vector<std::string> &present_extensions();

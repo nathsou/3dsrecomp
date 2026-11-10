@@ -59,6 +59,9 @@ u64 present_image_create(int w, int h) { return g_hw && g_hw->present_image_crea
 void present_image_destroy(u64 image) {
     if (g_hw && g_hw->present_image_destroy && image) g_hw->present_image_destroy(image);
 }
+void present_images_done() {
+    if (g_hw && g_hw->present_images_done) g_hw->present_images_done();
+}
 void present_hold(bool on) {
     if (g_hw && g_hw->present_hold) g_hw->present_hold(on);
 }
