@@ -513,12 +513,12 @@ static void wait_on(Thread *t, std::vector<std::shared_ptr<WaitObject>> objs, bo
         LOG("[sched] thread %u waits on %s%s (lr %08x)\n", t->id, what.c_str(),
             timeout >= 0 ? (" for " + std::to_string(timeout / 1000) + " us").c_str() : "", c ? c->r[14] : 0);
     }
-    t->wait_objs = objs;
+    t->wait_objs = std::move(objs);
     t->wait_all = all;
     t->status = TStatus::WaitSync;
     t->wait_result = RES_TIMEOUT;
     t->wait_index = -1;
-    for (auto &o : objs) o->add_waiter(t);
+    for (auto &o : t->wait_objs) o->add_waiter(t);
     if (timeout >= 0) {
         u64 gen = t->wait_gen;
         add_timeout(now_ns() + (u64)timeout, [t, gen] {
@@ -906,7 +906,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             break;
         }
         if (ns > 100000000) VLOG("[svc] thread %u waits on %d objects (%s) for %lld ms (lr %08x)\n", t->id, n, objs[0]->name.c_str(), (long long)(ns / 1000000), c->r[14]);
-        wait_on(t, objs, all, ns, lk, c, true);
+        wait_on(t, std::move(objs), all, ns, lk, c, true);
         break;
     }
     case 0x27: {  // DuplicateHandle(r1)
@@ -1002,7 +1002,9 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             switch (name) {
             case 0: v = 0x18; break;                                // priority
             case 1: v = limit ? 0x04000000 : memory_used(); break;  // commit
-            case 2: v = limit ? 32 : threads.size(); break;
+            case 2:  // threads (those that have not exited)
+                v = limit ? 32 : std::count_if(threads.begin(), threads.end(), [](const auto &th) { return th->status != TStatus::Dead; });
+                break;
             case 3: v = limit ? 32 : 8; break;
             case 4: v = limit ? 32 : 8; break;
             case 5: v = limit ? 32 : 8; break;

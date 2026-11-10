@@ -226,7 +226,10 @@ void hid_update(u32 buttons, s16 cx, s16 cy, bool touch, u16 tx, u16 ty, s16 sx,
     live_input(buttons, cx, cy, touch, tx, ty);
     Lock lk(kmutex);
     ir_poll(buttons, sx, sy);
-    if (!hid.shm) return;
+    if (!hid.shm) {
+        schedule_async();  // (the IR service may have signalled its event)
+        return;
+    }
     u32 b = hid.shm->backing;
     u64 now = system_tick();
     // circle pad as directional buttons too
