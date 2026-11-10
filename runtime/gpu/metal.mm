@@ -511,6 +511,7 @@ void commit_list_cb() {
     [cur_cb commit];
     cur_cb = nil;
 }
+
 struct Slice {
     id<MTLBuffer> buf;
     size_t off;
