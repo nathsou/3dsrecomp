@@ -640,12 +640,21 @@ def write_if_changed(path, text):
     return True
 
 
-# the locals (guest registers, VFP registers, flags) an instruction's C assigns
+# A function's locals, in the order they are declared, loaded and stored: guest registers, flags, VFP registers.
+# Sets of them are bit masks (bit i: LOCALS[i]).
+LOCALS = ['r%d' % i for i in range(16)] + ['nf', 'zf', 'cf', 'vf', 'qf', 'ge', 'fpsr'] + ['S%d' % i for i in range(32)]
+_BIT = {v: 1 << i for i, v in enumerate(LOCALS)}
 _WRITES = re.compile(r'\b(r\d+|S\d+|nf|zf|cf|vf|qf|ge|fpsr) = |\bDSET\((S\d+), (S\d+),|&(qf|ge)\b')
 
 
 def written(code):
-    return {g for m in _WRITES.finditer(' '.join(code)) for g in m.groups() if g}
+    """The locals an instruction's C assigns."""
+    mask = 0
+    for m in _WRITES.finditer(' '.join(code)):
+        for g in m.groups():
+            if g:
+                mask |= _BIT[g]
+    return mask
 
 
 def cpu_field(v):
@@ -657,13 +666,9 @@ def cpu_field(v):
     return 'c->fpscr' if v == 'fpsr' else 'c->' + v
 
 
-def local_order(v):
-    return ('rnzcvqgfS'.index(v[0]), int(v[1:]) if v[1:].isdigit() else 0)
-
-
 def unsaved(insts, th, start, funcs, code):
-    """The locals that may differ from the CPU struct: {addr: set} once the instruction's own code has run (what its
-    store to the struct must write), and {addr: set} as it falls through to the next one. Locals are loaded from the
+    """The locals that may differ from the CPU struct: {addr: mask} once the instruction's own code has run (what its
+    store to the struct must write), and {addr: mask} as it falls through to the next one. Locals are loaded from the
     struct on entry and after every call (SI), so only what was assigned since then is to be stored: the struct's
     other fields already hold the locals' values. code(addr): the C emitted for the instruction."""
     wr = {a: written(code(a)) for a in insts}
@@ -677,21 +682,20 @@ def unsaved(insts, th, start, funcs, code):
         if i.falls_through and (a + i.size) in insts:
             s.append(a + i.size)
         succ[a] = s
-    before = {a: set() for a in insts}
-    after = {}
+    before = dict.fromkeys(insts, 0)
 
     def flow(a):
         i = insts[a]
         if i.kind in (CALL, ICALL, SVC, UDF):  # (reloaded after it: all saved, unless its condition skipped it)
-            return set() if i.cond == 14 else before[a]
+            return 0 if i.cond == 14 else before[a]
         return before[a] | wr[a]
     work = sorted(insts, reverse=True)  # (in address order: most code runs forward)
     while work:
         a = work.pop()
-        after[a] = flow(a)
+        after = flow(a)
         for b in succ[a]:
-            if not after[a] <= before[b]:
-                before[b] |= after[a]
+            if after & ~before[b]:
+                before[b] |= after
                 work.append(b)
     return {a: before[a] | wr[a] for a in insts}, {a: flow(a) for a in insts}
 
@@ -720,14 +724,14 @@ class Emitter:
             insts = self.explored[key] = self.an.explore(key)[0]
         return insts
 
-    def save(self, names):
-        """C storing these locals to the CPU struct."""
-        s = ' '.join('%s = %s;' % (cpu_field(v), v) for v in sorted(names, key=local_order))
-        if self.verify_stores:  # the locals left out must be in the struct already
-            rest = [v for v in self.locals if v not in names]
-            if rest:
-                s += ' if (%s) __builtin_trap();' % ' || '.join('%s != %s' % (
-                    ('F2U(%s)' % v, 'F2U(%s)' % cpu_field(v)) if v[0] == 'S' else (v, cpu_field(v))) for v in rest)
+    def save(self, mask):
+        """C storing these locals (a mask) to the CPU struct."""
+        names = [v for v in self.locals if mask & _BIT[v]]
+        s = ' '.join('%s = %s;' % (cpu_field(v), v) for v in names)
+        if self.verify_stores and len(names) < len(self.locals):  # the locals left out must be in the struct already
+            s += ' if (%s) __builtin_trap();' % ' || '.join('%s != %s' % (
+                ('F2U(%s)' % v, 'F2U(%s)' % cpu_field(v)) if v[0] == 'S' else (v, cpu_field(v)))
+                for v in self.locals if not mask & _BIT[v])
         return s
 
     def emit_function(self, key):
