@@ -48,6 +48,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
 void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags);
 bool metal_gpu_made(u32 paddr, u32 size);
 void metal_note_gpu_output(u32 paddr, u32 size);
+void metal_set_texture_filter(int mode);
 
 namespace {
 
