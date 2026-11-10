@@ -600,8 +600,6 @@ void raster_flush();
 void raster_init();
 bool raster_blend_selftest();  // vectorized vs scalar blending (unit tests)
 
-void build_draw_state(DrawState &ds);
-
 // fragment pipeline helpers (fragment.cpp)
 u32 sample_texture(const TexUnitState &tu, float u, float v, float w, float lod);
 u32 sample_proctex(const ProcTexState &pt, float u, float v);

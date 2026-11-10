@@ -131,7 +131,8 @@ out empty folders, and Mario Kart 7 resets a save whose empty `replay_` folder i
   functions and jump tables, and emits one C function per guest function. Guest registers become C locals;
   unexpected returns and indirect jumps go through a dispatcher. Games that keep their code in CRO modules
   (relocatable code loaded at run time, e.g. Animal Crossing) have each module recompiled at a fixed address.
-  `tools/test_cpu.py` differentially tests the generated code against Unicorn.
+  `tools/test_cpu.py` differentially tests the generated code against Unicorn; `gen.py --verify-stores` makes the
+  generated code check the registers it leaves out when it saves them around calls.
 - `runtime/` replaces the 3DS:
   - `core.cpp`: a 4 GiB host reservation mirrors the guest address space.
   - `kernel.cpp`: threads, synchronization, memory and the SVC interface, with the 3DS's priority scheduling.

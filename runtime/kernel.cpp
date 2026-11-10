@@ -573,7 +573,7 @@ static u32 svc_control_memory(CPU *c) {
         return RES_OK;
     }
     LOG("[svc] ControlMemory: unknown op %x\n", op);
-    return 0xE0E01BEE;
+    return RES_INVALID_COMBINATION;
 }
 
 static u32 svc_query_memory(CPU *c) {
@@ -956,13 +956,10 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
         auto svc = find_port(name);
         if (!svc) {
             LOG("[svc] ConnectToPort(%s): no such port\n", name.c_str());
-            c->r[0] = 0xD88007FA;
+            c->r[0] = RES_NOT_FOUND;
             break;
         }
-        auto s = std::make_shared<Session>();
-        s->service = svc;
-        s->name = name;
-        c->r[1] = add_handle(s);
+        c->r[1] = add_handle(make_session(svc, name));
         c->r[0] = RES_OK;
         break;
     }

@@ -4,8 +4,8 @@
   tools/gametest.py [options] [title id or test name ...]
 
 Each test is a TOML file in tests/games/<title id>/ (see tests/README.md for the format). A test starts the game
-headless (SDL's offscreen video and dummy audio) with scripted input, optionally from a save of your own console,
-and checks:
+headless (SDL's offscreen video, its dummy one on macOS, and dummy audio) with scripted input, optionally from a save
+of your own console, and checks:
 
   - the run ends normally, with no fatal error and no code the recompiler missed (lazily recompiled code);
   - every "unimplemented command" the services log is one the test lists (`known_unimplemented`), so a game that

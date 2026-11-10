@@ -344,7 +344,7 @@ static void blend_factor_tables(DrawState &ds, u32 k, u32 f) {
     ds.bf_inv[k] = inv;
 }
 
-void build_draw_state(DrawState &ds) {
+static void build_draw_state(DrawState &ds) {
     const u32 *regs = g.regs;
     update_luts();
     ds.vp_hw = f24(regs[R::VP_W] & 0xffffff);

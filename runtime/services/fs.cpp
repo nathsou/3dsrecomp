@@ -465,11 +465,7 @@ struct FileSession : Service {
             unimplemented(ipc);
         }
     }
-    static ObjPtr get_object_for(std::shared_ptr<Service> s) {
-        auto ses = std::make_shared<Session>();
-        ses->service = s;
-        return ses;
-    }
+    static ObjPtr get_object_for(std::shared_ptr<Service> s) { return make_session(std::move(s)); }
 };
 
 struct DirSession : Service {
@@ -651,9 +647,7 @@ struct FsUser : Service {
             }
             VLOG("[fs] open %s\n", path.c_str());
         }
-        auto ses = std::make_shared<Session>();
-        ses->service = fs;
-        *out = ses;
+        *out = make_session(fs);
         return 0;
     }
 
@@ -788,10 +782,8 @@ struct FsUser : Service {
             if (!fsys::is_directory(path)) { ipc.result(ERR_PATH_NOT_FOUND, 1, 2); ipc.handles(2, {nullptr}, true); break; }
             auto ds = std::make_shared<DirSession>();
             for (auto &e : fsys::directory_iterator(path)) ds->entries.push_back(e);
-            auto ses = std::make_shared<Session>();
-            ses->service = ds;
             ipc.ok(1, 2);
-            ipc.handles(2, {ses}, true);
+            ipc.handles(2, {make_session(ds)}, true);
             break;
         }
         case 0x080F:    // FormatThisUserSaveData

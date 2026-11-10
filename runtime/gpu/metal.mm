@@ -599,15 +599,18 @@ std::atomic<bool> key_black_bottom{false};  // set_key_black_bottom
 
 std::vector<std::unique_ptr<GRT>> rts;
 
+bool overlaps(u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; }
+
+// a target's bytes per pixel in guest memory
+u32 rt_bpp(const GRT &r) { return r.depth ? (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4) : pixel_bytes(cbuf_to_pixfmt(r.fmt)); }
 u32 rt_bytes(const GRT &r) {
-    if (r.depth) return r.w * r.h * (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4);
-    return r.w * r.h * pixel_bytes(cbuf_to_pixfmt(r.fmt));
+    return r.w * r.h * rt_bpp(r);
 }
 
 // (set_clear_after_top_transfer) the colour targets in the same memory as r: cleared before their next draw
 void clear_overlapping(GRT &r) {
     for (auto &o : rts)
-        if (!o->depth && o->addr < r.addr + rt_bytes(r) && r.addr < o->addr + rt_bytes(*o)) o->clear_next = o->own = true;
+        if (!o->depth && overlaps(o->addr, rt_bytes(*o), r.addr, rt_bytes(r))) o->clear_next = o->own = true;
 }
 
 GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
@@ -722,7 +725,7 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
     r.hash = hv;
     r.gpu_newer = false;
     // a target filled with one value (typically a memory fill clearing it): bytes repeat every pixel
-    const u32 rbpp = r.depth ? (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4) : pixel_bytes(cbuf_to_pixfmt(r.fmt));
+    const u32 rbpp = rt_bpp(r);
     if (rt_bytes(r) > rbpp && memcmp(p, p + rbpp, rt_bytes(r) - rbpp) == 0) {
         la.clear = true;
         if (!r.depth) {
@@ -900,12 +903,11 @@ struct GpuOut {
 };
 std::deque<GpuOut> gpu_outs;
 bool gpu_made(u32 addr, u32 size) {
-    auto ov = [](u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; };
     for (auto &r : rts)
-        if (ov(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_mem(pptr(r->addr), rt_bytes(*r)) == r->hash))
+        if (overlaps(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_mem(pptr(r->addr), rt_bytes(*r)) == r->hash))
             return true;
     for (const GpuOut &g : gpu_outs)
-        if (ov(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
+        if (overlaps(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
     return false;
 }
 void note_gpu_out(u32 addr, u32 size) {
@@ -1705,8 +1707,6 @@ u64 disp_version = 0;
 
 bool eager_writeback = false;
 bool warned_shadow = false, warned_proctex = false;
-
-bool overlaps(u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; }
 
 // ---------------------------------------------------------------- deferred display transfers
 // A display transfer from a target with GPU work in flight is not waited for: one command buffer encodes the target

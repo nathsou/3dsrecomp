@@ -48,11 +48,11 @@ std::shared_ptr<Service> find_port(const std::string &name) {
     return it == ports.end() ? nullptr : it->second;
 }
 
-Handle new_session(std::shared_ptr<Service> s) {
+std::shared_ptr<Session> make_session(std::shared_ptr<Service> s, const std::string &name) {
     auto ses = std::make_shared<Session>();
-    ses->service = s;
-    ses->name = s->name;
-    return add_handle(ses);
+    ses->service = std::move(s);
+    ses->name = name;
+    return ses;
 }
 
 u32 service_request(std::shared_ptr<Session> s, Thread *t, Lock &lk) {
@@ -90,11 +90,8 @@ struct Srv : Service {
                 svc = make_stub(name);
             }
             VLOG("[srv] GetServiceHandle(%s)\n", name.c_str());
-            auto ses = std::make_shared<Session>();
-            ses->service = svc;
-            ses->name = name;
             ipc.ok(1, 2);
-            ipc.handles(2, {ses}, true);
+            ipc.handles(2, {make_session(svc, name)}, true);
             break;
         }
         case 0x0009:  // Subscribe

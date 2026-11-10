@@ -52,7 +52,7 @@ std::shared_ptr<Service> find_port(const std::string &name);
 u32 service_request(std::shared_ptr<Session> s, Thread *t, Lock &lk);
 void init_services();
 
-// Session handle to a host service object (for services that hand out sub-sessions, e.g. fs files)
-Handle new_session(std::shared_ptr<Service> s);
+// A session with a host service object (also for services that hand out sub-sessions, e.g. fs files)
+std::shared_ptr<Session> make_session(std::shared_ptr<Service> s, const std::string &name = "");
 
 }  // namespace kernel
