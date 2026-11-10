@@ -511,14 +511,13 @@ void handle_special(u32 id, u32 value) {
 inline void write_reg(u32 id, u32 value, u32 mask) {
     if (id >= 0x300) return;
     const u32 m = expand_mask[mask];
-    g.regs[id] = (g.regs[id] & ~m) | (value & m);
-    if (special[id]) {
-        // data streams don't affect the draw state
-        if (!(id >= R::FIXATTR_DATA && id < R::FIXATTR_DATA + 3)) g.regs_version++;
-        handle_special(id, value);
-    } else {
-        g.regs_version++;
-    }
+    const u32 old = g.regs[id];
+    const u32 now = (old & ~m) | (value & m);
+    g.regs[id] = now;
+    // A new draw state (raster.cpp's draw_state) only when one of the registers it reads changed, or a table it
+    // snapshots was written (the LUT data registers): draws that differ in their vertices alone share a state.
+    if (id < R::DRAW_STATE_END && (now != old || special[id])) g.regs_version++;
+    if (special[id]) handle_special(id, value);
 }
 }  // namespace
 
@@ -552,8 +551,7 @@ static bool inited = false;
 void init() {
     if (inited) return;
     inited = true;
-    // g has static storage: everything starts zeroed
-    memset(g.regs, 0, sizeof(g.regs));
+    // (g has static storage: everything starts zeroed)
     g.regs[R::IRQ_AUTOSTOP] = 1;
     g.regs[R::IRQ_MASK] = 0xFFFFFFF0;
     g.regs[R::IRQ_CMP] = 0x12345678;

@@ -316,7 +316,7 @@ static u32 sample_2d(const TexUnitState &tu, const TexEntry *e, float u, float v
     if (!tu.need_lod || lod <= 0.0f) {
         s32 l = tu.min_level < nlv ? tu.min_level : nlv - 1;
         if (l < 0) l = 0;
-        return sample_level(tu, e->lv[l], u, v, tu.need_lod ? tu.mag_linear : tu.mag_linear);
+        return sample_level(tu, e->lv[l], u, v, tu.mag_linear);
     }
     float lmin = (float)tu.min_level, lmax = (float)std::min(tu.max_level, nlv - 1);
     if (lmax < lmin) lmax = lmin;

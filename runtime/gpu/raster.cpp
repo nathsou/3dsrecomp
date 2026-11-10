@@ -121,15 +121,14 @@ static void update_luts() {
         std::shared_ptr<LightLuts> L(new LightLuts);  // (not zeroed: every value is written)
         for (u32 t = 0; t < 24; t++) {
             if (old && !(g.light_lut_dirty >> t & 1)) {
-                memcpy(L->val[t], old->val[t], sizeof L->val[t]);
-                memcpy(L->diff[t], old->diff[t], sizeof L->diff[t]);
+                memcpy(L->vd[t], old->vd[t], sizeof L->vd[t]);
                 continue;
             }
             for (u32 i = 0; i < 256; i++) {
                 u32 raw = g.light_lut[t][i];
-                L->val[t][i] = (raw & 0xfff) / 4095.0f;
+                L->vd[t][i][0] = (raw & 0xfff) / 4095.0f;
                 float d = ((raw >> 12) & 0x7ff) / 2047.0f;
-                L->diff[t][i] = (raw >> 23) & 1 ? -d : d;
+                L->vd[t][i][1] = (raw >> 23) & 1 ? -d : d;
             }
         }
         g.light_luts = L;
@@ -139,8 +138,8 @@ static void update_luts() {
         auto F = std::make_shared<FogLut>();
         for (u32 i = 0; i < 128; i++) {
             u32 raw = g.fog_lut[i];
-            F->val[i] = ((raw >> 13) & 0x7ff) / 2047.0f;
-            F->diff[i] = sbits(raw, 0, 13) / 2047.0f;
+            F->vd[i][0] = ((raw >> 13) & 0x7ff) / 2047.0f;
+            F->vd[i][1] = sbits(raw, 0, 13) / 2047.0f;
         }
         g.fog_luts = F;
         g.fog_lut_dirty = false;
@@ -239,6 +238,8 @@ static bool overlaps_rt(u32 addr, u32 size) {
     return rt_touches(batch.rt, addr, size);
 }
 
+static bool state_reusable;  // build_draw_state: the state may serve the next draw too (draw_state)
+
 static void setup_texunit(DrawState &ds, u32 i) {
     const u32 *regs = g.regs;
     static const u32 base[3] = {R::TEX0, R::TEX1, R::TEX2};
@@ -290,10 +291,17 @@ static void setup_texunit(DrawState &ds, u32 i) {
     }
     u32 total = 0;
     for (u32 l = 0; l < levels; l++) total += texture_level_bytes(tu.w >> l, tu.h >> l, fmt);
-    for (u32 f = 0; f < nfaces; f++)
+    for (u32 f = 0; f < nfaces; f++) {
         if (overlaps_rt(faddr[f], total)) raster_flush();
+        // a draw sampling its own target sees the draws before it: each needs the flush above, so its state is
+        // built again for every draw
+        if (rt_touches(ds.rt, faddr[f], total)) state_reusable = false;
+    }
     if (use_hw)
-        for (u32 f = 0; f < nfaces; f++) batch.tex.emplace_back(faddr[f], total);
+        for (u32 f = 0; f < nfaces; f++) {
+            const std::pair<u32, u32> range{faddr[f], total};
+            if (std::find(batch.tex.begin(), batch.tex.end(), range) == batch.tex.end()) batch.tex.push_back(range);
+        }
     if (use_hw && nfaces == 1 && levels == 1 && (tu.type == 0 || tu.type == 3) && hw_surface_for(addr, tu.w, tu.h, fmt)) {
         tu.surf = true;  // render-to-texture: sampled where the GPU holds it
         tu.surf_addr = addr;
@@ -628,6 +636,7 @@ DrawState *draw_state() {
         for (auto &b : batch.bins) b.clear();
     }
     auto ds = std::make_unique<DrawState>();
+    state_reusable = true;
     build_draw_state(*ds);  // may flush (render-to-texture); states vector survives as needed
     // the texture setup may have flushed the batch: make sure our RT is still registered
     if (!batch.has_rt) {
@@ -635,12 +644,10 @@ DrawState *draw_state() {
         batch.has_rt = true;
     }
     g.ds = ds.get();
-    g.ds_version = g.regs_version;
+    g.ds_version = state_reusable ? g.regs_version : 0;
     batch.states.push_back(std::move(ds));
     return g.ds;
 }
-
-void raster_begin_draw(const DrawState *) {}
 
 // ---------------------------------------------------------------- clipping & setup
 namespace {
@@ -1294,7 +1301,7 @@ inline void finish_fragment(const DrawState &ds, TileState &ts, const Pending &f
         float fl = floorf(fi);
         fl = fl < 0 ? 0 : fl > 127 ? 127 : fl;
         const u32 ii = (u32)fl;
-        float ff = F.val[ii] + F.diff[ii] * (fi - fl);
+        float ff = F.vd[ii][0] + F.vd[ii][1] * (fi - fl);
         ff = ff < 0 ? 0 : ff > 1 ? 1 : ff;
         u32 o = c & 0xff000000u;
         for (u32 ch = 0; ch < 3; ch++) {

@@ -269,12 +269,9 @@ void gs_submit_vertex(const V4 *in) {
 std::vector<ShaderUnit> units;
 std::vector<u64> unit_draw;
 u64 draw_counter = 0;
-std::vector<u32> idx_list, uniq, slot_of;
+std::vector<u32> idx_list, slot_of;
 std::vector<u32> stamp;
 u32 stamp_cur = 0;
-std::vector<OutVertex> outv;
-std::vector<SV> outsv;
-std::vector<u32> outcode;
 
 ShaderUnit &unit_for(u32 tid) {
     if (unit_draw[tid] != draw_counter) {
@@ -517,7 +514,6 @@ void vtx_finish_jobs() {
 // ---------------------------------------------------------------- Metal vertex shading
 namespace {
 bool gpu_vs = false;  // vertex programs run as Metal compute kernels (GPU_CPU_VS=1: on the CPU)
-u64 st_gpu_draws = 0, st_cpu_draws = 0;
 
 // Shades a draw's vertices with the program's compute kernel: copies the vertex arrays it reads and
 // appends the draw to the Metal batch. False if the kernel is not ready (the CPU shades the draw).
@@ -548,10 +544,8 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
             slots[i] = slot_of[v];
         }
     } else {
-        for (u32 i = 0; i < n; i++) {
-            mb.vids.push_back(idx_list[i]);
-            slots[i] = i;
-        }
+        mb.vids.insert(mb.vids.end(), idx_list.begin(), idx_list.begin() + n);
+        for (u32 i = 0; i < n; i++) slots[i] = i;
         minv = n ? idx_list[0] : 0;
         maxv = n ? idx_list[n - 1] : 0;
     }
@@ -639,7 +633,8 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
         }
     } else {
         const u32 nt = (n / 3) * 3;
-        for (u32 i = 0; i < nt; i++) mb.idx.push_back(ob + slots[i]);
+        mb.idx.resize(first + nt);
+        for (u32 i = 0; i < nt; i++) mb.idx[first + i] = ob + slots[i];
         for (u32 i = nt; i < n; i++) bi[index++] = slots[i];
     }
     mb.add_seg(cur_ds, first);
@@ -657,7 +652,6 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
         gather_outputs(u, outmask, buf);
         map_vertex(m, buf, pa.buf[k]);
     }
-    if (g_stats) st_gpu_draws++;
     return true;
 }
 }  // namespace

@@ -454,7 +454,7 @@ bool tried = false;
 
 // Time the GPU spends on our command buffers: the frontend's automatic resolution backs off when the GPU is
 // saturated (gpu::busy), and RECOMP_STATS logs it every 2 s from metal_poll.
-bool gpu_timing = true, log_timing = false;
+bool log_timing = false;
 std::atomic<float> busy_frac{0};
 std::atomic<u64> vs_dispatches{0}, vs_verts{0}, vs_passes{0}, flushes{0};  // vertex kernel work, for the stats line
 std::atomic<u64> cbs_made{0};                                                // command buffers, for the stats line
@@ -463,13 +463,12 @@ double gpu_busy = 0, busy_end = 0;  // union of the command buffers' GPU executi
 id<MTLCommandBuffer> new_cb_raw() {
     id<MTLCommandBuffer> cb = [queue commandBuffer];
     cbs_made.fetch_add(1, std::memory_order_relaxed);
-    if (gpu_timing)
-        [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
-            std::lock_guard<std::mutex> lk(busy_mtx);
-            const double b = std::max(c.GPUStartTime, busy_end);
-            if (c.GPUEndTime > b) gpu_busy += c.GPUEndTime - b;
-            busy_end = std::max(busy_end, c.GPUEndTime);
-        }];
+    [cb addCompletedHandler:^(id<MTLCommandBuffer> c) {
+        std::lock_guard<std::mutex> lk(busy_mtx);
+        const double b = std::max(c.GPUStartTime, busy_end);
+        if (c.GPUEndTime > b) gpu_busy += c.GPUEndTime - b;
+        busy_end = std::max(busy_end, c.GPUEndTime);
+    }];
     return cb;
 }
 
@@ -708,7 +707,7 @@ LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
     // CPU write the game does not flush out of its data cache would not reach a 3DS GPU before the frame's end either.
     const u64 frame = g_frame.load(std::memory_order_relaxed);
     if (r.synced && r.checked == frame) return la;
-    const u64 hv = hash_bytes(p, rt_bytes(r));
+    const u64 hv = hash_mem(p, rt_bytes(r));
     r.checked = frame;
     if (r.synced && hv == r.hash) return la;
     if (r.own) {  // (cleared after a transfer to the top screen: the top screen's write-back is not its picture)
@@ -789,7 +788,7 @@ void wait_cb(id<MTLCommandBuffer> cb, const char *why, u32 addr) {
 // game that freed a target and reused its memory (heap objects, other buffers) has written it since, and on the
 // 3DS those later CPU writes land on top of what the GPU drew: the guest's bytes win, the GPU copy is dropped.
 bool guest_kept(GRT &r) {
-    if (hash_bytes(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
+    if (hash_mem(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
     static int logged;
     if (logged < 8 || g_stats) {
         logged++;
@@ -812,8 +811,7 @@ void write_back_color(GRT &r) {
     [ce endEncoding];
     [cb commit];
     wait_cb(cb, "colour write-back", r.addr);  // also waits for all earlier work on the queue
-    memcpy(pptr(r.addr), stage_color.contents, rt_bytes(r));
-    r.hash = hash_bytes(pptr(r.addr), rt_bytes(r));
+    r.hash = copy_hash(pptr(r.addr), (const u8 *)stage_color.contents, rt_bytes(r));
     r.checked = g_frame.load(std::memory_order_relaxed);
     r.synced = true;
     r.gpu_newer = false;
@@ -852,9 +850,8 @@ void write_back_depth(GRT &r) {
     [ce endEncoding];
     [cb commit];
     wait_cb(cb, "depth write-back", r.addr);
-    memcpy(p, stage_dbytes.contents, rt_bytes(r));
+    r.hash = copy_hash(p, (const u8 *)stage_dbytes.contents, rt_bytes(r));
     r.gpu_newer = false;
-    r.hash = hash_bytes(p, rt_bytes(r));
     r.checked = g_frame.load(std::memory_order_relaxed);
     r.synced = true;
 }
@@ -880,7 +877,9 @@ struct MTex {
     id<MTLTexture> src, mid;   // level 0 as decoded; the sharp filter's 2x image (at 4x)
     std::vector<u32> prev;     // level 0 as decoded (CPU copy, compared with the new contents)
 };
-std::unordered_map<std::string, MTex> tex_cache;
+std::unordered_map<u64, MTex> tex_cache;
+// (sizes are below 2048, formats and level counts below 16)
+u64 tex_key(const TexEntry &e) { return (u64)e.addr << 32 | e.w << 20 | e.h << 8 | e.fmt << 4 | e.levels; }
 std::atomic<int> want_filter{0};  // set_texture_filter (any thread), applied by the GX thread at the next flush
 int tf_mode = 0;
 u64 flush_no = 0;
@@ -900,10 +899,10 @@ std::deque<GpuOut> gpu_outs;
 bool gpu_made(u32 addr, u32 size) {
     auto ov = [](u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; };
     for (auto &r : rts)
-        if (ov(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_bytes(pptr(r->addr), rt_bytes(*r)) == r->hash))
+        if (ov(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_mem(pptr(r->addr), rt_bytes(*r)) == r->hash))
             return true;
     for (const GpuOut &g : gpu_outs)
-        if (ov(g.addr, g.size, addr, size) && hash_bytes(pptr(g.addr), g.size) == g.hash) return true;
+        if (ov(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
     return false;
 }
 void note_gpu_out(u32 addr, u32 size) {
@@ -913,7 +912,7 @@ void note_gpu_out(u32 addr, u32 size) {
             gpu_outs.erase(it);
             break;
         }
-    gpu_outs.push_back({addr, size, hash_bytes(pptr(addr), size)});
+    gpu_outs.push_back({addr, size, hash_mem(pptr(addr), size)});
     if (gpu_outs.size() > 64) gpu_outs.pop_front();
 }
 
@@ -1003,9 +1002,7 @@ u32 changed_tiles(std::vector<u32> &prev, const std::vector<u32> &cur, u32 w, u3
 id<MTLTexture> get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 *ul = nullptr) {
     if (ul) *ul = 0;
     if (!e || e->lv.empty() || e->lv[0].data.empty()) return nil;
-    char key[64];
-    snprintf(key, sizeof key, "%08x:%u:%u:%u:%u", e->addr, e->w, e->h, e->fmt, e->levels);
-    MTex &m = tex_cache[key];
+    MTex &m = tex_cache[tex_key(*e)];
     const int want = up ? tf_mode : 0;
     if (m.tex && m.hash == e->hash && m.req == want) {
         m.last_use = flush_no;
@@ -1754,8 +1751,7 @@ void finalize(PendingXfer &op) {
     GRT &r = *op.rt;
     const u32 nb = rt_bytes(r);
     if (op.rt_writeback && guest_kept(r)) {
-        memcpy(pptr(r.addr), op.gbytes.contents, nb);
-        r.hash = hash_bytes(pptr(r.addr), nb);
+        r.hash = copy_hash(pptr(r.addr), (const u8 *)op.gbytes.contents, nb);
         r.checked = g_frame.load(std::memory_order_relaxed);
     }
     memcpy(pptr(op.out_paddr), op.obytes.contents, op.out_size);
@@ -1768,7 +1764,7 @@ void finalize(PendingXfer &op) {
     auto it = displays.find(op.out_paddr);
     if (it != displays.end() && it->second.cb == op.cb) {
         DisplayImage &d = it->second;
-        d.out_hash = hash_bytes(pptr(d.out_addr), d.out_size);
+        d.out_hash = hash_mem(pptr(d.out_addr), d.out_size);
         d.cb = nil;  // the image stays in op.disp
     } else if (recyclable(op.disp)) {
         disp_free.push_back(op.disp);  // replaced meanwhile
@@ -2061,8 +2057,6 @@ bool metal_init() {
     return true;
 }
 
-bool metal_active() { return active; }
-
 // <outdir> <pipeline lists...>: one .metal file per fragment shader (fs_<hash of its source>) plus vs.metal,
 // for building shaders.metallib ahead of time. Unchanged files are left alone and stale ones removed, so
 // only new shaders get recompiled.
@@ -2246,25 +2240,40 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             // one dispatch per kernel: its draws' vertices one after the other, with their parameter blocks
             // in a buffer and each thread's draw in tj (draws are often only a few vertices, and a dispatch
             // per draw costs far more GPU time than the shading). The draws write disjoint ranges of gbuf.
+            // Each group's parameter blocks, vertex ids and draw-of-vertex table are written straight into the
+            // arena: counted first, then filled.
             struct Group {
                 id<MTLComputePipelineState> ps;
-                std::vector<VsParamsG> params;
-                std::vector<u32> vids, tj;
+                u32 njobs = 0, nverts = 0;  // counted, then how many are written
+                Slice vb, pb, tb;
             };
             std::vector<Group> groups;
-            for (const GpuVsJob &j : mb.jobs) {
+            auto group_of = [&](const GpuVsJob &j) -> Group & {
                 id<MTLComputePipelineState> ps = ((const VsKern *)j.kernel)->ps;
-                Group *g = nullptr;
                 for (Group &x : groups)
-                    if (x.ps == ps) g = &x;
-                if (!g) {
-                    groups.push_back({ps, {}, {}, {}});
-                    g = &groups.back();
-                }
-                VsParamsG &P = g->params.emplace_back(j.p);
-                P.first = (u32)g->vids.size();
-                g->vids.insert(g->vids.end(), mb.vids.begin() + j.vids_off, mb.vids.begin() + j.vids_off + j.p.nverts);
-                g->tj.insert(g->tj.end(), j.p.nverts, (u32)g->params.size() - 1);
+                    if (x.ps == ps) return x;
+                return groups.emplace_back(Group{ps});
+            };
+            for (const GpuVsJob &j : mb.jobs) {
+                Group &g = group_of(j);
+                g.njobs++;
+                g.nverts += j.p.nverts;
+            }
+            for (Group &g : groups) {
+                g.vb = arena((size_t)g.nverts * 4);
+                g.pb = arena((size_t)g.njobs * sizeof(VsParamsG));
+                g.tb = arena((size_t)g.nverts * 4);
+                g.njobs = g.nverts = 0;
+            }
+            for (const GpuVsJob &j : mb.jobs) {
+                Group &g = group_of(j);
+                VsParamsG &P = ((VsParamsG *)g.pb.p)[g.njobs];
+                memcpy(&P, &j.p, sizeof P);
+                P.first = g.nverts;
+                if (j.p.nverts) memcpy(g.vb.p + (size_t)g.nverts * 4, mb.vids.data() + j.vids_off, (size_t)j.p.nverts * 4);
+                std::fill_n((u32 *)g.tb.p + g.nverts, j.p.nverts, g.njobs);
+                g.nverts += j.p.nverts;
+                g.njobs++;
             }
             id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
             label(ce, "vertex kernels %08x", rt.color_addr);
@@ -2274,16 +2283,13 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             vs_passes++;
             vs_verts += mb.vids.size();
             for (const Group &g : groups) {
-                if (g.vids.empty()) continue;
+                if (!g.nverts) continue;
                 [ce setComputePipelineState:g.ps];
-                const Slice vb = upload(g.vids.data(), g.vids.size() * 4);
-                const Slice pb = upload(g.params.data(), g.params.size() * sizeof(VsParamsG));
-                const Slice tb = upload(g.tj.data(), g.tj.size() * 4);
-                [ce setBuffer:vb.buf offset:vb.off atIndex:1];
-                [ce setBuffer:pb.buf offset:pb.off atIndex:2];
-                [ce setBuffer:tb.buf offset:tb.off atIndex:4];
+                [ce setBuffer:g.vb.buf offset:g.vb.off atIndex:1];
+                [ce setBuffer:g.pb.buf offset:g.pb.off atIndex:2];
+                [ce setBuffer:g.tb.buf offset:g.tb.off atIndex:4];
                 const NSUInteger tg = std::min<NSUInteger>(64, g.ps.maxTotalThreadsPerThreadgroup);
-                [ce dispatchThreads:MTLSizeMake(g.vids.size(), 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
+                [ce dispatchThreads:MTLSizeMake(g.nverts, 1, 1) threadsPerThreadgroup:MTLSizeMake(tg, 1, 1)];
             }
             [ce endEncoding];
         }
@@ -2367,18 +2373,23 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
 
         // per-draw uniforms and LUTs go into one shared buffer
         size_t uoff = 0;
-        std::vector<std::pair<const void *, size_t>> lut_offs;
         auto ualloc = [&](size_t n) {
             const size_t o = (uoff + 255) & ~(size_t)255;
             uoff = o + n;
             return o;
         };
-        // first pass: size
-        const size_t need = mb.segs.size() * (256 + sizeof(Uni) + 256 + 24 * 256 * 8 + 256 + 128 * 8);
+        // first pass: size (a uniform block for each draw, each distinct LUT snapshot once)
+        std::unordered_map<const void *, size_t> lut_map;  // a snapshot's place in the buffer
+        size_t need = mb.segs.size() * (256 + sizeof(Uni));
+        for (const MSeg &seg : mb.segs) {
+            const DrawState &ds = *seg.ds;
+            if (ds.lighting && lut_map.emplace(ds.light.luts.get(), 0).second) need += 256 + sizeof(LightLuts);
+            if (ds.fog && lut_map.emplace(ds.fog_lut.get(), 0).second) need += 256 + sizeof(FogLut);
+        }
+        lut_map.clear();
         const Slice us = arena(need);
         id<MTLBuffer> ubuf = us.buf;
         u8 *ub = us.p;
-        std::unordered_map<const void *, size_t> lut_map;
         bool wrote_color = false, wrote_depth = false;
         for (const MSeg &seg : mb.segs) {
             const DrawState &ds = *seg.ds;
@@ -2470,13 +2481,8 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                 auto it = lut_map.find(lk);
                 size_t lo;
                 if (it == lut_map.end()) {
-                    lo = ualloc(24 * 256 * 8);
-                    float *dst = (float *)(ub + lo);
-                    for (int t = 0; t < 24; t++)
-                        for (int e = 0; e < 256; e++) {
-                            dst[(t * 256 + e) * 2] = l.luts->val[t][e];
-                            dst[(t * 256 + e) * 2 + 1] = l.luts->diff[t][e];
-                        }
+                    lo = ualloc(sizeof(LightLuts));
+                    memcpy(ub + lo, l.luts->vd, sizeof(LightLuts));
                     lut_map[lk] = lo;
                 } else {
                     lo = it->second;
@@ -2488,12 +2494,8 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
                 auto it = lut_map.find(fk);
                 size_t fo;
                 if (it == lut_map.end()) {
-                    fo = ualloc(128 * 8);
-                    float *dst = (float *)(ub + fo);
-                    for (int e = 0; e < 128; e++) {
-                        dst[e * 2] = ds.fog_lut->val[e];
-                        dst[e * 2 + 1] = ds.fog_lut->diff[e];
-                    }
+                    fo = ualloc(sizeof(FogLut));
+                    memcpy(ub + fo, ds.fog_lut->vd, sizeof(FogLut));
                     lut_map[fk] = fo;
                 } else {
                     fo = it->second;
@@ -2572,7 +2574,7 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
 
 void metal_poll() {
     if (!active) return;
-    if (gpu_timing) {
+    {
         static double last = now_ms();
         const double t = now_ms();
         if (t - last >= 2000) {
@@ -2671,7 +2673,7 @@ void metal_guest_written(u32 paddr, u32 size, bool definite) {
     // guest bytes really changed.
     for (auto &r : rts)
         if (overlaps(r->addr, rt_bytes(*r), paddr, size)) {
-            if (definite || !r->synced || hash_bytes(pptr(r->addr), rt_bytes(*r)) != r->hash) r->synced = false;
+            if (definite || !r->synced || hash_mem(pptr(r->addr), rt_bytes(*r)) != r->hash) r->synced = false;
         }
     drop_displays(paddr, size, definite);
 }
@@ -2682,7 +2684,7 @@ void drop_displays(u32 paddr, u32 size, bool definite) {
     std::lock_guard<std::mutex> lk(disp_mtx);
     for (auto it = displays.begin(); it != displays.end();) {
         const DisplayImage &d = it->second;
-        if (overlaps(d.out_addr, d.out_size, paddr, size) && (definite || (!d.cb && hash_bytes(pptr(d.out_addr), d.out_size) != d.out_hash))) {
+        if (overlaps(d.out_addr, d.out_size, paddr, size) && (definite || (!d.cb && hash_mem(pptr(d.out_addr), d.out_size) != d.out_hash))) {
             if (g_stats)
                 LOG("gpu metal: display image %08x dropped (%s write %08x+%x)\n", d.out_addr, definite ? "GPU" : "CPU",
                     paddr, size);
@@ -2929,7 +2931,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
         if (g_stats) LOG("gpu metal: transfer %08x -> %08x: no matching render target, no display image\n", in_paddr, out_paddr);
         return;
     }
-    if (hash_bytes(pptr(src->addr), rt_bytes(*src)) != src->hash) {  // guest changed since
+    if (hash_mem(pptr(src->addr), rt_bytes(*src)) != src->hash) {  // guest changed since
         if (g_stats) LOG("gpu metal: transfer %08x -> %08x: target changed in guest memory, no display image\n", in_paddr, out_paddr);
         return;
     }
@@ -2953,7 +2955,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     const u32 out_size = (out_w0 >> hs) * (out_h0 >> vs) * pixel_bytes((flags >> 12) & 7);
     std::lock_guard<std::mutex> lk(disp_mtx);
     DisplayImage &d = new_display(out_paddr, out_size, out_dims, flags, rows, TW);
-    d.out_hash = hash_bytes(pptr(out_paddr), out_size);
+    d.out_hash = hash_mem(pptr(out_paddr), out_size);
     d.cb = nil;
     d.buf = buf;
     d.incomplete = src->skipped > 0;

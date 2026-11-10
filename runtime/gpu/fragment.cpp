@@ -60,7 +60,7 @@ inline V3T<T> normalized(V3T<T> a) {
 inline float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
 inline float lut_lookup(const LightLuts &L, u32 sampler, u32 idx, float delta) {
-    return L.val[sampler][idx] + L.diff[sampler][idx] * delta;
+    return L.vd[sampler][idx][0] + L.vd[sampler][idx][1] * delta;
 }
 
 // texel(unit, lane) -> packed RGBA
