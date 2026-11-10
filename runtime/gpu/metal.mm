@@ -5,6 +5,7 @@
 // (hash-checked, once per command list) before drawing, and written back (downsampled to 1x, PICA tiled format)
 // lazily, when a GPU operation reads them. Texture copies and tiled-to-tiled transfers of render targets, and
 // draws sampling the results, stay on the GPU. A command list's passes share one command buffer.
+#import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <mach-o/dyld.h>
@@ -49,6 +50,8 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
 bool metal_gpu_made(u32 paddr, u32 size);
 void metal_note_gpu_output(u32 paddr, u32 size);
 void metal_set_texture_filter(int mode);
+u64 metal_present_image_create(int w, int h);
+void metal_present_image_destroy(u64 image);
 
 namespace {
 
@@ -3015,13 +3018,51 @@ bool wait_for_view(u32 fb, u32 stride, u32 lines) {
     if (cb) [cb waitUntilCompleted];
     return true;
 }
-// calls fn with the view's pixels, in place (px: the image's pixels, rows of dw)
-void view_pixels(const u32 *px, u32 dw, u32 dh, const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
-    fn(ScreenImage{px + (size_t)v.y0 * dw + v.x0, (int)v.w, (int)v.h, (int)dw, {}});
+// Present images: textures on IOSurfaces (pixel buffers), which SDL's Metal renderer wraps and draws, so a screen's
+// image reaches the window without leaving the GPU. By their pixel buffer's address.
+struct PresentImage {
+    CVPixelBufferRef pb;
+    id<MTLTexture> tex;
+};
+std::mutex present_mtx;
+std::unordered_map<u64, PresentImage> present_images;
+// copies the view of a display image (rows of dw pixels) into a present image of its size
+bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
+    id<MTLTexture> tex;
+    {
+        std::lock_guard<std::mutex> lk(present_mtx);
+        auto it = present_images.find(image);
+        if (it == present_images.end()) return false;
+        tex = it->second.tex;
+    }
+    if (tex.width != v.w || tex.height != v.h) return false;
+    @autoreleasepool {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> be = [cb blitCommandEncoder];
+        [be copyFromBuffer:buf
+                   sourceOffset:((size_t)v.y0 * dw + v.x0) * 4
+              sourceBytesPerRow:(size_t)dw * 4
+            sourceBytesPerImage:(size_t)dw * 4 * v.h
+                     sourceSize:MTLSizeMake(v.w, v.h, 1)
+                      toTexture:tex
+               destinationSlice:0
+               destinationLevel:0
+              destinationOrigin:MTLOriginMake(0, 0, 0)];
+        [be endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];  // (the renderer draws it from its own queue)
+    }
+    return true;
+}
+// calls fn with the view of a display image (buf: its pixels, rows of dw), in place
+void view_pixels(id<MTLBuffer> buf, u32 dw, const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+    ScreenImage si{(const u32 *)buf.contents + (size_t)v.y0 * dw + v.x0, (int)v.w, (int)v.h, (int)dw, {}};
+    si.copy_to = [&](u64 image) { return copy_view(buf, dw, v, image); };
+    fn(si);
 }
 void with_view(const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
     if (v.d->cb) [v.d->cb waitUntilCompleted];
-    view_pixels((const u32 *)v.d->buf.contents, v.d->w, v.d->h, v, fn);
+    view_pixels(v.d->buf, v.d->w, v, fn);
 }
 }  // namespace
 
@@ -3047,7 +3088,7 @@ u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const
     // being reused meanwhile
     DisplayView v;
     id<MTLBuffer> buf;
-    u32 dw, dh;
+    u32 dw;
     {
         std::unique_lock<std::mutex> lk(disp_mtx);
         if (!find_view(fb_paddr, stride, lines, v)) return 0;
@@ -3064,10 +3105,9 @@ u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const
         if (v.d->cb) [v.d->cb waitUntilCompleted];  // (an image made since wait_for_view: rare)
         buf = v.d->buf;
         dw = v.d->w;
-        dh = v.d->h;
         disp_reading.push_back(buf);
     }
-    view_pixels((const u32 *)buf.contents, dw, dh, v, fn);
+    view_pixels(buf, dw, v, fn);
     std::lock_guard<std::mutex> lk(disp_mtx);
     for (size_t i = 0; i < disp_reading.size(); i++)
         if (disp_reading[i] == buf) {
@@ -3075,6 +3115,35 @@ u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const
             break;
         }
     return v.key;
+}
+
+u64 metal_present_image_create(int w, int h) {
+    if (!active || w <= 0 || h <= 0) return 0;
+    NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}, (id)kCVPixelBufferMetalCompatibilityKey : @YES};
+    CVPixelBufferRef pb = nullptr;
+    // (the surface's bytes are the display images' RGBA: SDL's texture of it and ours both say so)
+    if (CVPixelBufferCreate(kCFAllocatorDefault, (size_t)w, (size_t)h, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)attrs,
+                            &pb) != kCVReturnSuccess)
+        return 0;
+    MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                  width:(NSUInteger)w
+                                                                                 height:(NSUInteger)h
+                                                                              mipmapped:NO];
+    id<MTLTexture> tex = [dev newTextureWithDescriptor:td iosurface:CVPixelBufferGetIOSurface(pb) plane:0];
+    if (!tex) {
+        CVPixelBufferRelease(pb);
+        return 0;
+    }
+    std::lock_guard<std::mutex> lk(present_mtx);
+    present_images[(u64)pb] = {pb, tex};
+    return (u64)pb;
+}
+void metal_present_image_destroy(u64 image) {
+    std::lock_guard<std::mutex> lk(present_mtx);
+    auto it = present_images.find(image);
+    if (it == present_images.end()) return;
+    CVPixelBufferRelease(it->second.pb);
+    present_images.erase(it);
 }
 
 bool metal_get_display_image(int screen, const u32 **rgba, int *w, int *h) {
@@ -3118,6 +3187,8 @@ const HwBackend *metal_backend() {
         .texture_filter_name = metal_texture_filter_name,
         .set_clear_after_top_transfer = metal_set_clear_after_top_transfer,
         .set_key_black_bottom = metal_set_key_black_bottom,
+        .present_image_create = metal_present_image_create,
+        .present_image_destroy = metal_present_image_destroy,
         .emit_shaders = metal_emit_shaders,
     };
     return &b;

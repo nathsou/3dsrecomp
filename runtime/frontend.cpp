@@ -89,9 +89,9 @@ static int swapped_layout(int l) {
 static SDL_Window *window2;
 static SDL_Renderer *renderer2;
 
-// Renderers made on the GPU backend's own Vulkan device (gpu::present_device): the screens' images go to them on the
-// GPU (no read-back). Elsewhere (Metal, the software renderer, no Vulkan surface, GPU_PRESENT_CPU) SDL's default
-// renderer gets them through the CPU.
+// Renderers made on the GPU backend's own Vulkan device (gpu::present_device), and SDL's Metal renderer with the
+// Metal backend: the screens' images go to them on the GPU (no read-back). Elsewhere (the software renderer, no
+// Vulkan surface, GPU_PRESENT_CPU) SDL's default renderer gets them through the CPU.
 static gpu::PresentDevice present_dev;
 static bool present_on;
 struct DeviceRenderer {
@@ -102,6 +102,10 @@ static std::vector<DeviceRenderer> device_renderers;
 static bool on_device(SDL_Renderer *r) {
     for (const DeviceRenderer &d : device_renderers)
         if (d.r == r) return true;
+#ifdef __APPLE__
+    static const bool through_cpu = getenv("GPU_PRESENT_CPU") != nullptr;
+    if (!through_cpu && !strcmp(SDL_GetRendererName(r), "metal")) return true;  // (present images are IOSurfaces)
+#endif
     return false;
 }
 // before gpu::init: the instance extensions a Vulkan surface needs
@@ -585,6 +589,20 @@ static const u32 *bottom_stats(const u32 *img, int w, int h, int &pitch) {
     return img;
 }
 
+// A screen's new picture (rows `pitch` pixels apart) into its streaming texture, written where the renderer takes it
+// from: SDL_UpdateTexture goes through a staging texture, which costs the Metal renderer several ms for a
+// high-resolution picture.
+static void update_screen_tex(SDL_Texture *t, const u32 *px, int w, int h, int pitch) {
+    void *dst;
+    int dst_pitch;
+    if (!SDL_LockTexture(t, nullptr, &dst, &dst_pitch)) {
+        SDL_UpdateTexture(t, nullptr, px, pitch * 4);
+        return;
+    }
+    for (int y = 0; y < h; y++) memcpy((u8 *)dst + (size_t)y * dst_pitch, px + (size_t)y * pitch, (size_t)w * 4);
+    SDL_UnlockTexture(t);
+}
+
 // Uploads the screen image: the GPU backend's high-resolution one when it has it, else the guest framebuffer.
 // (the high-resolution image is uploaded only when it is a new one; to a renderer on the GPU's device, as a copy on
 // the GPU when it is shown as the backend made it)
@@ -606,7 +624,11 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, ScreenTex &hires,
                 SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_ACCESS_NUMBER, SDL_TEXTUREACCESS_STATIC);
                 SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_WIDTH_NUMBER, si.w);
                 SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_HEIGHT_NUMBER, si.h);
+#ifdef __APPLE__
+                SDL_SetPointerProperty(p, SDL_PROP_TEXTURE_CREATE_METAL_PIXELBUFFER_POINTER, (void *)(uintptr_t)hires.image);
+#else
                 SDL_SetNumberProperty(p, SDL_PROP_TEXTURE_CREATE_VULKAN_TEXTURE_NUMBER, (Sint64)hires.image);
+#endif
                 hires.tex = SDL_CreateTextureWithProperties(r, p);
                 SDL_DestroyProperties(p);
                 if (!hires.tex) {
@@ -620,7 +642,7 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, ScreenTex &hires,
             hires.w = si.w;
             hires.h = si.h;
         }
-        if (!hires.image || !si.copy_to(hires.image)) SDL_UpdateTexture(hires.tex, nullptr, img, pitch * 4);
+        if (!hires.image || !si.copy_to(hires.image)) update_screen_tex(hires.tex, img, si.w, si.h, pitch);
     });
     static u32 last_fb;
     if (screen == 0 && (ver ? ver != shown[0] : f.addr_left != last_fb)) game_frames++;  // a new image: the game's fps
@@ -630,7 +652,7 @@ static SDL_Texture *upload_screen(SDL_Renderer *r, int screen, ScreenTex &hires,
     convert_fb(f, width, buf);
     int pitch = width;
     const u32 *pic = screen == 1 ? bottom_stats(buf, width, 240, pitch) : buf;  // (opaque: no alpha in guest memory)
-    if (pic) SDL_UpdateTexture(native, nullptr, pic, pitch * 4);
+    if (pic) update_screen_tex(native, pic, width, 240, pitch);
     return native;
 }
 
