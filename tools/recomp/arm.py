@@ -4,7 +4,7 @@ Guest registers are C locals r0..r14, flags nf/zf/cf/vf (0/1), qf (sticky satura
 VFP single registers s0..s31 (float locals), FPSCR in fpsr. A write to r15 sets tpc and makes the
 instruction a jump. Memory goes through RD8/16/32/64 and WR8/16/32/64 (runtime/cpu.h).
 """
-from .ins import Ins, OP, B, CALL, ICALL, JMP, SVC, UDF
+from .ins import Ins, B, CALL, ICALL, JMP, SVC, UDF
 
 
 def ror(v, n):
@@ -77,11 +77,13 @@ def dp_core(op, S, a, b, carry_line):
     elif op in (2, 10):
         L.append('u32 res = a - b;')
         if S:
-            L.append('nf = res >> 31; zf = res == 0; cf = a >= b; vf = ((a ^ b) & (a ^ res)) >> 31;')
+            # (V as N ^ (a < b signed): a signed condition on the result, N != V and the like, then compiles to one
+            # compare and branch)
+            L.append('nf = res >> 31; zf = res == 0; cf = a >= b; vf = (u32)((s32)a < (s32)b) ^ (res >> 31);')
     elif op == 3:
         L.append('u32 res = b - a;')
         if S:
-            L.append('nf = res >> 31; zf = res == 0; cf = b >= a; vf = ((b ^ a) & (b ^ res)) >> 31;')
+            L.append('nf = res >> 31; zf = res == 0; cf = b >= a; vf = (u32)((s32)b < (s32)a) ^ (res >> 31);')
     elif op in (4, 11):
         L.append('u32 res = a + b;')
         if S:
@@ -164,8 +166,6 @@ def decode_dp(i, w):
     else:
         lines.append('(void)res;')
     i.code.append('{ ' + ' '.join(lines) + ' }')
-    i.setflags = bool(S)
-    i.readflags = op in (5, 6, 7) or 'cf' in ''.join(pre)
     i.note = '%s%s r%d, r%d, %s' % (DP_NAMES[op], 's' if S else '', rd, rn, opdesc)
     if i.kind == JMP and op == 13 and not (w >> 25) & 1 and (w & 0xFF0) == 0 and (w & 15) == 14:
         i.ret = True  # mov pc, lr
@@ -308,7 +308,6 @@ def decode_mul(i, w):
     rs = (w >> 8) & 15
     rm = w & 15
     m, s_, n = R(i, rm), R(i, rs), R(i, rn)
-    i.setflags = bool(S)
     if op == 0:
         L = ['u32 res = %s * %s;' % (m, s_)]
         if S:
@@ -362,7 +361,6 @@ def decode_misc(i, w):
                 i.code.append(W(i, rd, '0x10u'))  # SPSR: not in user mode
             else:
                 i.code.append(W(i, rd, '(nf << 31) | (zf << 30) | (cf << 29) | (vf << 28) | (qf << 27) | (ge << 16) | 0x10u'))
-            i.readflags = True
             i.note = 'mrs'
         else:  # MSR reg
             emit_msr(i, w, R(i, rm))
@@ -440,7 +438,6 @@ def emit_msr(i, w, val):
         L.append('ge = (v >> 16) & 15;')
     L.append('(void)v;')
     i.code.append('{ ' + ' '.join(L) + ' }')
-    i.setflags = True
     i.note = 'msr cpsr'
 
 
@@ -642,13 +639,11 @@ def decode_vfp_dp(i, w):
         get = Dget
         put = Dset
         ty = 'double'
-        sfx = ''
     else:
         d, n, m = sreg(Vd, Db), sreg(Vn, Nb), sreg(Vm, Mb)
         get = S
         put = lambda r, e: 'S%d = %s;' % (r, e)
         ty = 'float'
-        sfx = 'f'
     tag = '.f64' if dbl else '.f32'
     if opc1 != 0xB:
         a, b, dd = get(n), get(m), get(d)
@@ -754,7 +749,6 @@ def decode_vfp_xfer(i, w):
             if reg == 1:
                 if rt == 15:
                     i.code.append('nf = fpsr >> 31; zf = (fpsr >> 30) & 1; cf = (fpsr >> 29) & 1; vf = (fpsr >> 28) & 1;')
-                    i.setflags = True
                     i.note = 'vmrs apsr_nzcv, fpscr'
                 else:
                     i.code.append(W(i, rt, 'fpsr'))

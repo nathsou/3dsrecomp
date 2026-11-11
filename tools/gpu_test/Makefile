@@ -8,7 +8,7 @@ endif
 CXXFLAGS ?= -std=c++20 -O2 -g -Wall -Wno-unused-function -Wno-unused-variable -I$(ROOT)/runtime -I$(ROOT)/third_party -I. -DRECOMP_SOURCE_DIR=\"$(abspath $(ROOT))\"
 GPU_SRC := $(wildcard $(ROOT)/runtime/gpu/*.cpp)
 ifeq ($(shell uname),Darwin)
-LDFLAGS ?= -lpthread -framework Metal -framework Foundation
+LDFLAGS ?= -lpthread -framework Metal -framework Foundation -framework CoreVideo
 GPU_MM := $(wildcard $(ROOT)/runtime/gpu/*.mm)
 GPU_SRC := $(filter-out $(wildcard $(ROOT)/runtime/gpu/vulkan*.cpp $(ROOT)/runtime/gpu/vk_*.cpp),$(GPU_SRC))
 else

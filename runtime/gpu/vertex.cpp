@@ -269,12 +269,62 @@ void gs_submit_vertex(const V4 *in) {
 std::vector<ShaderUnit> units;
 std::vector<u64> unit_draw;
 u64 draw_counter = 0;
-std::vector<u32> idx_list, uniq, slot_of;
+std::vector<u32> idx_list, slot_of;
 std::vector<u32> stamp;
 u32 stamp_cur = 0;
-std::vector<OutVertex> outv;
-std::vector<SV> outsv;
-std::vector<u32> outcode;
+
+// The distinct vertices of a draw of n vertices (idx_list: their ids) are appended to `ids` in the order they are
+// first used, and idx_list[i] becomes vertex i's place among them.
+void distinct_vertices(bool indexed, u32 n, std::vector<u32> &ids) {
+    if (!indexed) {
+        ids.insert(ids.end(), idx_list.begin(), idx_list.begin() + n);
+        for (u32 i = 0; i < n; i++) idx_list[i] = i;
+        return;
+    }
+    const u32 first = (u32)ids.size();
+    if (++stamp_cur == 0) {
+        std::fill(stamp.begin(), stamp.end(), 0);
+        stamp_cur = 1;
+    }
+    for (u32 i = 0; i < n; i++) {
+        const u32 v = idx_list[i] & 0xffff;
+        if (stamp[v] != stamp_cur) {
+            stamp[v] = stamp_cur;
+            slot_of[v] = (u32)ids.size() - first;
+            ids.push_back(v);
+        }
+        idx_list[i] = slot_of[v];
+    }
+}
+
+// Primitive assembly of a draw whose idx_list holds its vertices' places (distinct_vertices): its triangles are
+// appended to `out` as places plus `base`. kept: the places of the vertices that stay in the assembler for a
+// following draw (-1: none).
+void assemble_places(u32 n, u32 base, std::vector<u32> &out, s32 kept[2]) {
+    PrimAssembler &pa = g.pa;
+    const bool chained = pa.topology == 1 || pa.topology == 2;  // strip, fan
+    u32 bi[2] = {0, 0}, index = 0;
+    bool ready = false;
+    if (chained) {
+        const bool strip = pa.topology == 1;
+        for (u32 i = 0; i < n; i++) {
+            const u32 v = idx_list[i];
+            if (ready) out.insert(out.end(), {base + bi[0], base + bi[1], base + v});
+            bi[index] = v;
+            ready |= index == 1;
+            index = strip ? !index : 1;
+        }
+    } else {
+        const u32 nt = (n / 3) * 3;
+        const size_t at = out.size();
+        out.resize(at + nt);
+        for (u32 i = 0; i < nt; i++) out[at + i] = base + idx_list[i];
+        for (u32 i = nt; i < n; i++) bi[index++] = idx_list[i];
+    }
+    pa.index = index;
+    pa.strip_ready = ready;
+    for (u32 k = 0; k < 2; k++) kept[k] = (chained && ready) || k < index ? (s32)bi[k] : -1;
+}
 
 ShaderUnit &unit_for(u32 tid) {
     if (unit_draw[tid] != draw_counter) {
@@ -463,6 +513,14 @@ void vtx_finish_jobs() {
         shade_range(*jobs[t.job], t.begin, t.end, tid);
     });
     double t1 = g_stats ? now_ms() : 0;
+    // the vertices the last draw left in the primitive assembler; the jobs are gone
+    auto jobs_done = [&] {
+        const DrawJob &last = *jobs[njobs - 1];
+        for (u32 k = 0; k < 2; k++)
+            if (last.pa_buf[k] >= 0) g.pa.buf[k] = last.outv[last.pa_buf[k]];
+        njobs = 0;
+        pending_indices = 0;
+    };
     if (hw_active()) {
         // the Metal backend clips and sets up triangles itself: hand it the shaded vertices
         MBatch &mb = raster_mbatch();
@@ -473,11 +531,7 @@ void vtx_finish_jobs() {
             for (u32 t : j.tris) mb.idx.push_back((base + t) | MIDX_CPU);
             mb.add_seg(j.ds, first);
         }
-        const DrawJob &last = *jobs[njobs - 1];
-        for (u32 k = 0; k < 2; k++)
-            if (last.pa_buf[k] >= 0) g.pa.buf[k] = last.outv[last.pa_buf[k]];
-        njobs = 0;
-        pending_indices = 0;
+        jobs_done();
         if (g_stats) g_t_shade += now_ms() - t0;
         return;
     }
@@ -500,12 +554,7 @@ void vtx_finish_jobs() {
     });
     // bin in submission order
     for (u32 i = 0; i < ntasks; i++) raster_append(setup_tasks[i].out);
-    // vertices left in the primitive assembler by the last draw
-    const DrawJob &last = *jobs[njobs - 1];
-    for (u32 k = 0; k < 2; k++)
-        if (last.pa_buf[k] >= 0) g.pa.buf[k] = last.outv[last.pa_buf[k]];
-    njobs = 0;
-    pending_indices = 0;
+    jobs_done();
     if (g_stats) {
         double t2 = now_ms();
         g_t_shade += t1 - t0;
@@ -517,7 +566,6 @@ void vtx_finish_jobs() {
 // ---------------------------------------------------------------- Metal vertex shading
 namespace {
 bool gpu_vs = false;  // vertex programs run as Metal compute kernels (GPU_CPU_VS=1: on the CPU)
-u64 st_gpu_draws = 0, st_cpu_draws = 0;
 
 // Shades a draw's vertices with the program's compute kernel: copies the vertex arrays it reads and
 // appends the draw to the Metal batch. False if the kernel is not ready (the CPU shades the draw).
@@ -527,36 +575,12 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
     vtx_finish_jobs();  // CPU-shaded draws queued before this one go first
     MBatch &mb = raster_mbatch();
     const u32 *regs = g.regs;
-    // unique vertices
     const u32 vids_off = (u32)mb.vids.size();
-    std::vector<u32> &slots = idx_list;
-    u32 minv = ~0u, maxv = 0;
-    if (indexed) {
-        if (++stamp_cur == 0) {
-            std::fill(stamp.begin(), stamp.end(), 0);
-            stamp_cur = 1;
-        }
-        for (u32 i = 0; i < n; i++) {
-            const u32 v = idx_list[i] & 0xffff;
-            if (stamp[v] != stamp_cur) {
-                stamp[v] = stamp_cur;
-                slot_of[v] = (u32)mb.vids.size() - vids_off;
-                mb.vids.push_back(v);
-                minv = std::min(minv, v);
-                maxv = std::max(maxv, v);
-            }
-            slots[i] = slot_of[v];
-        }
-    } else {
-        for (u32 i = 0; i < n; i++) {
-            mb.vids.push_back(idx_list[i]);
-            slots[i] = i;
-        }
-        minv = n ? idx_list[0] : 0;
-        maxv = n ? idx_list[n - 1] : 0;
-    }
+    distinct_vertices(indexed, n, mb.vids);
     const u32 nverts = (u32)mb.vids.size() - vids_off;
     if (!nverts) return true;
+    const auto [lo, hi] = std::minmax_element(mb.vids.begin() + vids_off, mb.vids.end());
+    const u32 minv = *lo, maxv = *hi;
     mb.jobs.emplace_back();
     GpuVsJob &job = mb.jobs.back();
     job.kernel = kernel;
@@ -623,41 +647,21 @@ bool gpu_draw(const Loader &L, const ShaderProgram *prog, u32 entry, u32 outmask
     P.out_base = mb.gpu_verts;
     P.first = 0;
     mb.gpu_verts += nverts;
-    // primitive assembly on slots
-    PrimAssembler &pa = g.pa;
-    const u32 first = (u32)mb.idx.size(), ob = P.out_base;
-    u32 bi[2] = {0, 0}, index = 0;
-    bool ready = false;
-    if (pa.topology == 1 || pa.topology == 2) {
-        const bool strip = pa.topology == 1;
-        for (u32 i = 0; i < n; i++) {
-            const u32 v = slots[i];
-            if (ready) mb.idx.insert(mb.idx.end(), {ob + bi[0], ob + bi[1], ob + v});
-            bi[index] = v;
-            ready |= index == 1;
-            index = strip ? !index : 1;
-        }
-    } else {
-        const u32 nt = (n / 3) * 3;
-        for (u32 i = 0; i < nt; i++) mb.idx.push_back(ob + slots[i]);
-        for (u32 i = nt; i < n; i++) bi[index++] = slots[i];
-    }
+    const u32 first = (u32)mb.idx.size();
+    s32 kept[2];
+    assemble_places(n, P.out_base, mb.idx, kept);
     mb.add_seg(cur_ds, first);
     // vertices carried over to a following draw: shade those on the CPU
-    pa.index = index;
-    pa.strip_ready = ready;
     for (u32 k = 0; k < 2; k++) {
-        const bool keep = (pa.topology == 1 || pa.topology == 2) ? (ready || k < index) : k < index;
-        if (!keep) continue;
+        if (kept[k] < 0) continue;
         ShaderUnit &u = unit_for(0);
         V4 in[16], buf[16];
-        load_vertex(L, mb.vids[vids_off + bi[k]], in);
+        load_vertex(L, mb.vids[vids_off + kept[k]], in);
         load_inputs(u, R::VS, in);
         shader_run(prog, u, g.vs, entry);
         gather_outputs(u, outmask, buf);
-        map_vertex(m, buf, pa.buf[k]);
+        map_vertex(m, buf, g.pa.buf[k]);
     }
-    if (g_stats) st_gpu_draws++;
     return true;
 }
 }  // namespace
@@ -768,57 +772,11 @@ void vtx_draw(bool indexed) {
     memcpy(j.b, g.vs.b, sizeof(j.b));
     memcpy(j.iu, g.vs.i, sizeof(j.iu));
     memcpy(j.defaults, g.default_attr, sizeof(j.defaults));
-    // unique vertices; idx_list[i] becomes the slot of vertex i
     j.uniq.clear();
-    std::vector<u32> &slots = idx_list;
-    if (indexed) {
-        if (++stamp_cur == 0) {
-            std::fill(stamp.begin(), stamp.end(), 0);
-            stamp_cur = 1;
-        }
-        for (u32 i = 0; i < n; i++) {
-            const u32 v = idx_list[i] & 0xffff;
-            if (stamp[v] != stamp_cur) {
-                stamp[v] = stamp_cur;
-                slot_of[v] = (u32)j.uniq.size();
-                j.uniq.push_back(v);
-            }
-            slots[i] = slot_of[v];
-        }
-    } else {
-        j.uniq.resize(n);
-        for (u32 i = 0; i < n; i++) {
-            j.uniq[i] = idx_list[i];
-            slots[i] = i;
-        }
-    }
-    // primitive assembly on slots
+    distinct_vertices(indexed, n, j.uniq);
+    // (the vertices carried over to following draws are filled in when the job is processed)
     j.tris.clear();
-    u32 bi[2] = {0, 0};
-    u32 index = 0;
-    bool ready = false;
-    if (pa.topology == 1 || pa.topology == 2) {
-        const bool strip = pa.topology == 1;
-        for (u32 i = 0; i < n; i++) {
-            const u32 v = slots[i];
-            if (ready) j.tris.insert(j.tris.end(), {bi[0], bi[1], v});
-            bi[index] = v;
-            ready |= index == 1;
-            index = strip ? !index : 1;
-        }
-    } else {
-        u32 i = 0;
-        j.tris.assign(slots.begin(), slots.begin() + (n / 3) * 3);
-        i = (n / 3) * 3;
-        for (; i < n; i++) bi[index++] = slots[i];
-    }
-    // vertices carried over to following draws (filled in when the job is processed)
-    pa.index = index;
-    pa.strip_ready = ready;
-    for (u32 k = 0; k < 2; k++) {
-        const bool keep = (pa.topology == 1 || pa.topology == 2) ? (ready || k < index) : k < index;
-        j.pa_buf[k] = keep ? (s32)bi[k] : -1;
-    }
+    assemble_places(n, 0, j.tris, j.pa_buf);
     pending_indices += n;
     if (njobs >= 1024 || pending_indices >= (1u << 18)) vtx_finish_jobs();
 }

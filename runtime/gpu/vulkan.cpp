@@ -2713,10 +2713,17 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         uoff = o + n;
         return o;
     };
-    const size_t need = mb.segs.size() * (256 + sizeof(Uni) + 256 + 24 * 256 * 8 + 256 + 128 * 8);
+    // first pass: size (a uniform block for each draw, each distinct LUT snapshot once)
+    std::unordered_map<const void *, size_t> lut_map;  // a snapshot's place in the buffer
+    size_t need = mb.segs.size() * (256 + sizeof(Uni));
+    for (const MSeg &seg : mb.segs) {
+        const DrawState &ds = *seg.ds;
+        if (ds.lighting && lut_map.emplace(ds.light.luts.get(), 0).second) need += 256 + sizeof(LightLuts);
+        if (ds.fog && lut_map.emplace(ds.fog_lut.get(), 0).second) need += 256 + sizeof(FogLut);
+    }
+    lut_map.clear();
     const Slice us = arena(need);
     u8 *ub = us.p;
-    std::unordered_map<const void *, size_t> lut_map;
     for (const MSeg &seg : mb.segs) {
         const DrawState &ds = *seg.ds;
         if (ds.skip || ds.shadow_mode || ds.gas) continue;
@@ -2796,13 +2803,8 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
             const void *lk = l.luts.get();
             auto it = lut_map.find(lk);
             if (it == lut_map.end()) {
-                pr.lo = ualloc(24 * 256 * 8);
-                float *dst = (float *)(ub + pr.lo);
-                for (int t = 0; t < 24; t++)
-                    for (int e = 0; e < 256; e++) {
-                        dst[(t * 256 + e) * 2] = l.luts->val[t][e];
-                        dst[(t * 256 + e) * 2 + 1] = l.luts->diff[t][e];
-                    }
+                pr.lo = ualloc(sizeof(LightLuts));
+                memcpy(ub + pr.lo, l.luts->vd, sizeof(LightLuts));
                 lut_map[lk] = pr.lo;
             } else {
                 pr.lo = it->second;
@@ -2813,12 +2815,8 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
             const void *fk = ds.fog_lut.get();
             auto it = lut_map.find(fk);
             if (it == lut_map.end()) {
-                pr.fo = ualloc(128 * 8);
-                float *dst = (float *)(ub + pr.fo);
-                for (int e = 0; e < 128; e++) {
-                    dst[e * 2] = ds.fog_lut->val[e];
-                    dst[e * 2 + 1] = ds.fog_lut->diff[e];
-                }
+                pr.fo = ualloc(sizeof(FogLut));
+                memcpy(ub + pr.fo, ds.fog_lut->vd, sizeof(FogLut));
                 lut_map[fk] = pr.fo;
             } else {
                 pr.fo = it->second;

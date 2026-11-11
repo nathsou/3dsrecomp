@@ -23,9 +23,7 @@ struct GspState {
     FramebufferInfo fb[2] = {};
     // GX queue (guarded by its own mutex: the GPU thread consumes it without the kernel lock)
     std::mutex qm;
-    std::condition_variable qcv;
     std::deque<std::array<u32, 8>> queue;
-    int busy = 0;
 };
 GspState gsp;
 std::mutex fb_mutex;
@@ -197,8 +195,7 @@ void gsp_process_gx() {
             u32 ctl1 = c[7] & 0xFFFF, ctl2 = c[7] >> 16;
             if (s1) gpu::memory_fill(va2pa(s1), va2pa(s1) + (e1 - s1), v1, ctl1);
             if (s2) gpu::memory_fill(va2pa(s2), va2pa(s2) + (e2 - s2), v2, ctl2);
-            if (s1 && s2) irqs.push_back(PSC0);
-            else if (s1) irqs.push_back(PSC0);
+            if (s1) irqs.push_back(PSC0);
             else if (s2) irqs.push_back(PSC1);
             break;
         }
@@ -219,6 +216,7 @@ void gsp_process_gx() {
         default:
             LOG("[gsp] unknown GX command %08x\n", c[0]);
         }
+        if (irqs.empty()) continue;  // (nothing to tell the game: the kernel is left alone)
         Lock lk(kmutex);
         if ((c[0] & 0xFF) == 0x04) {
             // Texture copies complete late: Super Mario 3D Land hangs after the title screen otherwise
@@ -227,10 +225,6 @@ void gsp_process_gx() {
             irqs.clear();
         }
         for (Irq i : irqs) signal_irq(i);
-        {
-            std::lock_guard<std::mutex> ql(gsp.qm);
-            gsp.busy--;
-        }
         schedule_async();
     }
 }
@@ -290,8 +284,8 @@ struct GspGpu : Service {
             {
                 std::lock_guard<std::mutex> lk(gsp.qm);
                 gsp.queue.push_back(c);
-                gsp.busy++;
             }
+            frontend_wake();
             ipc.ok();
             break;
         }
@@ -364,7 +358,6 @@ struct GspGpu : Service {
             {
                 std::lock_guard<std::mutex> lk(gsp.qm);
                 gsp.queue.push_back(c);
-                gsp.busy++;
             }
             if (g_verbose >= 2) LOG("[gsp] GX %08x %08x %08x %08x\n", c[0], c[1], c[2], c[3]);
         }

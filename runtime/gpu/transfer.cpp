@@ -23,14 +23,14 @@ static void fill_pattern(u8 *s, u32 len, const u8 *pattern, u32 n) {
 void memory_fill(u32 start, u32 end, u32 value, u32 control) {
     if (!(control & 1)) return;
     ensure_init();
-    raster_flush();
-    hw_poll();
     u8 *s = pptr(start), *e = pptr(end - 1);
     if (!s || !e || end <= start) {
         LOG("gpu: bad memory fill %08x-%08x\n", start, end);
         return;
     }
     const u32 len = end - start;
+    raster_flush_touching(start, len);
+    hw_poll();
     hw_guest_prewrite(start, len);
     const u8 pattern[4] = {(u8)value, (u8)(value >> 8), (u8)(value >> 16), (u8)(value >> 24)};  // little-endian
     fill_pattern(s, len, pattern, control & 0x100 ? 3 : control & 0x200 ? 4 : 2);  // 24, 32 or 16-bit
@@ -166,8 +166,6 @@ void transfer_convert(const u8 *src, u8 *dst, u32 in_dims, u32 out_dims, u32 fla
 
 void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags) {
     ensure_init();
-    raster_flush();
-    hw_poll();
     if (flags & 8) {
         LOG("gpu: display_transfer called with texture-copy flag, ignored\n");
         return;
@@ -184,6 +182,9 @@ void display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u3
     }
     const u32 ibpp = pixel_bytes(in_fmt), obpp = pixel_bytes(out_fmt);
     if (flip && crop) out_paddr += (in_w - out_w0) * (out_h0 - 1) * obpp;
+    raster_flush_touching(in_paddr, in_w * in_h * ibpp);
+    raster_flush_touching(out_paddr, out_w0 * out_h0 * obpp);
+    hw_poll();
     const u8 *src = pptr(in_paddr);
     u8 *dst = pptr(out_paddr);
     if (!src || !dst) {
@@ -209,8 +210,6 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
                   u32 flags) {
     (void)flags;
     ensure_init();
-    raster_flush();
-    hw_poll();
     const u8 *src = pptr(in_paddr);
     u8 *dst = pptr(out_paddr);
     if (!src || !dst) {
@@ -223,10 +222,14 @@ void texture_copy(u32 in_paddr, u32 out_paddr, u32 size, u32 in_width_gap, u32 o
     const u32 in_width = in_gap == 0 ? remaining : (in_width_gap & 0xffff) * 16;
     const u32 out_width = out_gap == 0 ? remaining : (out_width_gap & 0xffff) * 16;
     if (!in_width || !out_width) return;
+    const u32 in_total = size / in_width * (in_width + in_gap) + in_width;
     const u32 out_total = size / out_width * (out_width + out_gap) + out_width;
+    raster_flush_touching(in_paddr, in_total);
+    raster_flush_touching(out_paddr, out_total);
+    hw_poll();
     if (hw_texture_copy(in_paddr, out_paddr, remaining, in_width, in_gap, out_width, out_gap)) return;
-    hw_guest_read(in_paddr, size / in_width * (in_width + in_gap) + in_width);
-    const bool from_gpu = hw_gpu_made(in_paddr, size / in_width * (in_width + in_gap) + in_width);
+    hw_guest_read(in_paddr, in_total);
+    const bool from_gpu = hw_gpu_made(in_paddr, in_total);
     hw_guest_prewrite(out_paddr, out_total);
     u32 ri = in_width, ro = out_width;
     while (remaining) {

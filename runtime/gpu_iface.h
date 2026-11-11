@@ -18,9 +18,8 @@ bool save_state(const char *path);
 // (called from the UI thread at VBlank).
 bool get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 **rgba, int *w, int *h);
 // use_display_image: fn gets the image when it is not the one the UI has (have: the version it has; returns the
-// version shown, 0 for none): its pixels (pitch: pixels from one row to the next) and, with a backend presenting on
-// its own device (present_device), copy_to, which puts it into a present image on the GPU instead (true: done; the
-// renderer may draw it from then on)
+// version shown, 0 for none): its pixels (pitch: pixels from one row to the next) and, with a backend that has present
+// images, copy_to, which puts it into one on the GPU instead (true: done; the renderer may draw it from then on)
 struct ScreenImage {
     const u32 *px;
     int w, h, pitch;
@@ -31,7 +30,8 @@ u64 use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const std::
 // read-back of the screens' images. set_present_extensions: before init, the instance extensions the window system
 // needs; present_device: after it, where the renderer goes (false: not possible, the images go through the CPU).
 // present_image_create: a w x h VkImage (VK_FORMAT_R8G8B8A8_UNORM) the renderer can wrap (in
-// SHADER_READ_ONLY_OPTIMAL layout), destroyed with present_image_destroy once the renderer's texture of it is. Around
+// SHADER_READ_ONLY_OPTIMAL layout), destroyed with present_image_destroy once the renderer's texture of it is; with
+// the Metal backend, a CVPixelBufferRef (RGBA bytes) for SDL's Metal renderer, which needs no device of ours. Around
 // destroying a renderer made on the device, present_hold(true) / (false) keep the backend from submitting work (SDL
 // waits for the whole device then).
 void set_present_extensions(const std::vector<std::string> &exts);
@@ -42,6 +42,9 @@ struct PresentDevice {
 bool present_device(PresentDevice *pd);
 u64 present_image_create(int w, int h);
 void present_image_destroy(u64 image);
+// after the frame's copy_to calls, before the renderer draws the present images: the copies are done (the Metal
+// backend sends them together)
+void present_images_done();
 void present_hold(bool on);
 void set_trust_invalidations(bool trust);
 // Metal internal resolution scale (1-4; 0 without Metal); auto: GPU_SCALE not given (see gpu/gpu.h)

@@ -40,6 +40,7 @@ constexpr u32 LIGHT0 = 0x140, LIGHT_AMBIENT = 0x1c0, LIGHT_NUM = 0x1c2, LIGHT_CO
               LIGHT_CONFIG1 = 0x1c4, LUT_INDEX = 0x1c5, LIGHTING_DISABLE = 0x1c6,
               LUT_DATA = 0x1c8, LUT_ABS = 0x1d0, LUT_SELECT = 0x1d1, LUT_SCALE = 0x1d2,
               LIGHT_PERMUTATION = 0x1d9;
+constexpr u32 DRAW_STATE_END = 0x200;  // the draw state is made from the registers below this one only
 constexpr u32 ATTR_BASE = 0x200, ATTR_FMT_LO = 0x201, ATTR_FMT_HI = 0x202, ATTR_LOADER = 0x203,
               INDEX_ARRAY = 0x227, NUM_VERTICES = 0x228, GS_MISC = 0x229, VERTEX_OFFSET = 0x22a,
               DRAW = 0x22e, DRAW_INDEXED = 0x22f, FIXATTR_INDEX = 0x232, FIXATTR_DATA = 0x233,
@@ -218,12 +219,12 @@ struct DrawState;
 void tev_prepare(DrawState &ds);  // fills idx/inv and the number of active stages
 inline u32 div255(u32 x) { return (x + 1 + (x >> 8)) >> 8; }  // exact for x <= 65025
 
+// Each entry: its value and the difference to the next one (the layout the shaders read, uploaded as it is)
 struct LightLuts {
-    float val[24][256];
-    float diff[24][256];
+    float vd[24][256][2];
 };
 struct FogLut {
-    float val[128], diff[128];
+    float vd[128][2];
 };
 struct ProcTexLuts {
     float noise_v[128], noise_d[128];
@@ -547,6 +548,7 @@ struct HwBackend {
     u64 (*present_image_create)(int w, int h);
     void (*present_image_destroy)(u64 image);
     void (*present_hold)(bool on);
+    void (*present_images_done)();  // (null: copy_to is complete when it returns)
 };
 // set_present_extensions' list (for the backend's init)
 const std::vector<std::string> &present_extensions();
@@ -596,17 +598,12 @@ void vtx_finish_jobs();
 void raster_prepare_vertex(const DrawState &ds, const OutVertex &v, SV &sv, u32 &outcode);
 void raster_triangle_sv(const DrawState *ds, const SV &a, const SV &b, const SV &c);
 void raster_flush();
+void raster_end_list();
+void raster_flush_touching(u32 addr, u32 size);
 void raster_init();
 bool raster_blend_selftest();  // vectorized vs scalar blending (unit tests)
-void raster_begin_draw(const DrawState *ds);
-
-void build_draw_state(DrawState &ds);
 
 // fragment pipeline helpers (fragment.cpp)
-struct FragIn {
-    float attr[NUM_ATTR];
-    float lod_inputs[3][4];  // per texcoord set: du/dx, dv/dx, du/dy, dv/dy (unscaled)
-};
 u32 sample_texture(const TexUnitState &tu, float u, float v, float w, float lod);
 u32 sample_proctex(const ProcTexState &pt, float u, float v);
 void compute_lighting(const LightingState &ls, const float quat[4], const float view[3],

@@ -27,18 +27,23 @@ struct Batch {
     std::vector<std::unique_ptr<DrawState>> states;
     std::vector<u32> active_tiles;
     std::vector<std::pair<u32, u32>> tex;  // guest memory its draws sample (address, size)
+    bool uses_depth = false;               // a draw of it tests or writes depth or stencil
 } batch;
 
 // Metal: batches of other render targets still open. A game that alternates between targets (the two eyes of a
 // stereoscopic frame, drawn object by object) gets one pass per target instead of one per switch: draws into
 // targets that share no memory are independent, so each target's draws stay in order and the batches are drawn
-// together when something needs them (raster_flush: any transfer, fill, cache flush or end of command list), or
+// when something needs them (a transfer, fill or cache flush touching their memory: raster_flush_touching), or
 // when a target to draw into shares memory with another open one or with a texture an open batch samples.
+// A depth buffer no draw of a batch tests or writes is not part of its target for this (the backends leave it out
+// of the pass): games set one for post-processing passes that ignore it, the same one for both eyes, and Kid
+// Icarus: Uprising keeps its bloom targets inside the depth buffer's memory.
 struct Parked {
     RTConfig rt;
     MBatch mb;
     std::vector<std::unique_ptr<DrawState>> states;
     std::vector<std::pair<u32, u32>> tex;
+    bool uses_depth;
 };
 std::vector<Parked> parked;
 constexpr size_t kMaxParked = 8;
@@ -121,15 +126,14 @@ static void update_luts() {
         std::shared_ptr<LightLuts> L(new LightLuts);  // (not zeroed: every value is written)
         for (u32 t = 0; t < 24; t++) {
             if (old && !(g.light_lut_dirty >> t & 1)) {
-                memcpy(L->val[t], old->val[t], sizeof L->val[t]);
-                memcpy(L->diff[t], old->diff[t], sizeof L->diff[t]);
+                memcpy(L->vd[t], old->vd[t], sizeof L->vd[t]);
                 continue;
             }
             for (u32 i = 0; i < 256; i++) {
                 u32 raw = g.light_lut[t][i];
-                L->val[t][i] = (raw & 0xfff) / 4095.0f;
+                L->vd[t][i][0] = (raw & 0xfff) / 4095.0f;
                 float d = ((raw >> 12) & 0x7ff) / 2047.0f;
-                L->diff[t][i] = (raw >> 23) & 1 ? -d : d;
+                L->vd[t][i][1] = (raw >> 23) & 1 ? -d : d;
             }
         }
         g.light_luts = L;
@@ -139,8 +143,8 @@ static void update_luts() {
         auto F = std::make_shared<FogLut>();
         for (u32 i = 0; i < 128; i++) {
             u32 raw = g.fog_lut[i];
-            F->val[i] = ((raw >> 13) & 0x7ff) / 2047.0f;
-            F->diff[i] = sbits(raw, 0, 13) / 2047.0f;
+            F->vd[i][0] = ((raw >> 13) & 0x7ff) / 2047.0f;
+            F->vd[i][1] = sbits(raw, 0, 13) / 2047.0f;
         }
         g.fog_luts = F;
         g.fog_lut_dirty = false;
@@ -225,6 +229,11 @@ static bool rts_share_memory(const RTConfig &a, const RTConfig &b) {
     return (b.color_addr && rt_touches(a, b.color_addr, color_bytes_of(b))) ||
            (b.depth_addr && rt_touches(a, b.depth_addr, depth_bytes_of(b)));
 }
+// the target as its draws use it: without the depth buffer if none of them tests or writes it
+static RTConfig used(RTConfig rt, bool uses_depth) {
+    if (!uses_depth) rt.depth_addr = 0;
+    return rt;
+}
 static bool samples_rt(const std::vector<std::pair<u32, u32>> &tex, const RTConfig &rt) {
     for (const auto &[a, n] : tex)
         if (rt_touches(rt, a, n)) return true;
@@ -234,10 +243,15 @@ static bool samples_rt(const std::vector<std::pair<u32, u32>> &tex, const RTConf
 // an open batch draws into [addr, addr + size)
 static bool overlaps_rt(u32 addr, u32 size) {
     for (const Parked &p : parked)
-        if (rt_touches(p.rt, addr, size)) return true;
+        if (rt_touches(used(p.rt, p.uses_depth), addr, size)) return true;
     if (!batch.has_rt || !batch_nonempty()) return false;
-    return rt_touches(batch.rt, addr, size);
+    return rt_touches(used(batch.rt, batch.uses_depth), addr, size);
 }
+
+static bool state_reusable;  // build_draw_state: the state may serve the next draw too (draw_state)
+// build_draw_state: the guest memory the state's textures are in, for its batch's list (added once the state is
+// built: setting up a texture may flush the batches)
+static std::vector<std::pair<u32, u32>> state_tex;
 
 static void setup_texunit(DrawState &ds, u32 i) {
     const u32 *regs = g.regs;
@@ -290,10 +304,14 @@ static void setup_texunit(DrawState &ds, u32 i) {
     }
     u32 total = 0;
     for (u32 l = 0; l < levels; l++) total += texture_level_bytes(tu.w >> l, tu.h >> l, fmt);
-    for (u32 f = 0; f < nfaces; f++)
+    for (u32 f = 0; f < nfaces; f++) {
         if (overlaps_rt(faddr[f], total)) raster_flush();
+        // a draw sampling its own target sees the draws before it: each needs the flush above, so its state is
+        // built again for every draw
+        if (rt_touches(used(ds.rt, batch.uses_depth), faddr[f], total)) state_reusable = false;
+    }
     if (use_hw)
-        for (u32 f = 0; f < nfaces; f++) batch.tex.emplace_back(faddr[f], total);
+        for (u32 f = 0; f < nfaces; f++) state_tex.emplace_back(faddr[f], total);
     if (use_hw && nfaces == 1 && levels == 1 && (tu.type == 0 || tu.type == 3) && hw_surface_for(addr, tu.w, tu.h, fmt)) {
         tu.surf = true;  // render-to-texture: sampled where the GPU holds it
         tu.surf_addr = addr;
@@ -336,7 +354,20 @@ static void blend_factor_tables(DrawState &ds, u32 k, u32 f) {
     ds.bf_inv[k] = inv;
 }
 
-void build_draw_state(DrawState &ds) {
+// whether draws with the current registers test or write the target's depth or stencil
+struct DepthUse {
+    bool test, write, stencil;
+    bool any() const { return test || write || stencil; }
+};
+static DepthUse depth_use(const RTConfig &rt) {
+    if (rt.depth_addr == 0) return {};
+    const u32 *regs = g.regs;
+    const u32 dcm = regs[R::DEPTH_COLOR_MASK];
+    const bool writable = (regs[R::DEPTH_WRITE] & 3) != 0;
+    return {(dcm & 1) != 0, writable && ((dcm >> 12) & 1), (regs[R::STENCIL_TEST] & 1) && rt.depth_fmt == 3};
+}
+
+static void build_draw_state(DrawState &ds) {
     const u32 *regs = g.regs;
     update_luts();
     ds.vp_hw = f24(regs[R::VP_W] & 0xffffff);
@@ -383,7 +414,8 @@ void build_draw_state(DrawState &ds) {
     ds.alpha_ref = (at >> 8) & 255;
     if (ds.alpha_test && ds.alpha_func == 1) ds.alpha_test = false;
     const u32 st = regs[R::STENCIL_TEST], so = regs[R::STENCIL_OP];
-    ds.stencil = (st & 1) && ds.rt.depth_fmt == 3;
+    const DepthUse du = depth_use(ds.rt);
+    ds.stencil = du.stencil;
     ds.st_func = (st >> 4) & 7;
     ds.st_mask_w = (st >> 8) & 255;
     ds.st_ref = (st >> 16) & 255;
@@ -393,19 +425,14 @@ void build_draw_state(DrawState &ds) {
     ds.st_zpass = (so >> 8) & 7;
     const u32 dcm = regs[R::DEPTH_COLOR_MASK];
     const bool ds_write = (regs[R::DEPTH_WRITE] & 3) != 0;
-    ds.depth_test = dcm & 1;
+    ds.depth_test = du.test;
     ds.depth_func = (dcm >> 4) & 7;
-    ds.depth_write = ds_write && ((dcm >> 12) & 1);
+    ds.depth_write = du.write;
     if (!ds_write) ds.st_mask_w = 0;
     ds.color_mask = (((dcm >> 8) & 1) ? 0xffu : 0) | (((dcm >> 9) & 1) ? 0xff00u : 0) |
                     (((dcm >> 10) & 1) ? 0xff0000u : 0) | (((dcm >> 11) & 1) ? 0xff000000u : 0);
     ds.color_write = (regs[R::COLOR_WRITE] & 0xf) != 0 && ds.color_mask != 0;
     ds.depth_bits = ds.rt.depth_fmt == 0 ? 16 : 24;
-    if (ds.rt.depth_addr == 0) {
-        ds.depth_test = false;
-        ds.depth_write = false;
-        ds.stencil = false;
-    }
     ds.early_z = !ds.alpha_test && !ds.shadow_mode;
     ds.need_shade = ds.shadow_mode || ds.color_write || ds.alpha_test;
     ds.skip = ds.gas || (ds.alpha_test && ds.alpha_func == 0) ||
@@ -586,39 +613,60 @@ void build_draw_state(DrawState &ds) {
 
 // Metal: switching to another render target keeps the current batch open (parked) unless the new target shares
 // memory with an open batch's target or with a texture one samples; a parked batch of the new target resumes.
-static void switch_target(const RTConfig &rt) {
+static void switch_target(const RTConfig &rt, bool uses_depth) {
     vtx_finish_jobs();  // CPU-shaded draws still to add belong to the current target
-    bool conflict = batch_nonempty() && (rts_share_memory(rt, batch.rt) || samples_rt(batch.tex, rt));
+    const RTConfig to = used(rt, uses_depth);
+    bool conflict = batch_nonempty() && (rts_share_memory(to, used(batch.rt, batch.uses_depth)) || samples_rt(batch.tex, to));
     for (const Parked &p : parked)
-        if ((!(p.rt == rt) && rts_share_memory(rt, p.rt)) || samples_rt(p.tex, rt)) conflict = true;
+        if ((!(p.rt == rt) && rts_share_memory(to, used(p.rt, p.uses_depth))) || samples_rt(p.tex, to)) conflict = true;
     if (conflict || (batch_nonempty() && parked.size() >= kMaxParked)) {
         raster_flush();
     } else if (batch_nonempty()) {
-        parked.push_back({batch.rt, std::move(batch.mb), std::move(batch.states), std::move(batch.tex)});
+        parked.push_back({batch.rt, std::move(batch.mb), std::move(batch.states), std::move(batch.tex), batch.uses_depth});
         batch.mb.clear();
         batch.states.clear();
         batch.tex.clear();
     }
+    batch.uses_depth = false;
     for (size_t i = 0; i < parked.size(); i++)
         if (parked[i].rt == rt) {
             batch.mb = std::move(parked[i].mb);
             batch.states = std::move(parked[i].states);
             batch.tex = std::move(parked[i].tex);
+            batch.uses_depth = parked[i].uses_depth;
             parked.erase(parked.begin() + i);
             break;
         }
+}
+
+// The current batch's draws start using its depth buffer: not while another open batch draws into that memory or
+// an open batch (this one too) samples it.
+static void claim_depth(const RTConfig &rt) {
+    RTConfig depth;
+    depth.depth_addr = rt.depth_addr;
+    depth.depth_fmt = rt.depth_fmt;
+    depth.w = rt.w;
+    depth.h = rt.h;
+    bool conflict = samples_rt(batch.tex, depth);
+    for (const Parked &p : parked)
+        if (rts_share_memory(depth, used(p.rt, p.uses_depth)) || samples_rt(p.tex, depth)) conflict = true;
+    if (conflict) raster_flush();
 }
 
 DrawState *draw_state() {
     if (g.ds && g.ds_version == g.regs_version) return g.ds;
     RTConfig rt;
     rt_from_regs(rt);
+    const bool uses_depth = depth_use(rt).any();
     if (batch.has_rt && !(rt == batch.rt)) {
         if (use_hw)
-            switch_target(rt);
+            switch_target(rt, uses_depth);
         else if (batch_nonempty())
             raster_flush();
+    } else if (use_hw && uses_depth && !batch.uses_depth && batch.has_rt) {
+        claim_depth(rt);
     }
+    batch.uses_depth |= uses_depth;
     if (!batch.has_rt || !(rt == batch.rt)) {
         batch.rt = rt;
         batch.has_rt = true;
@@ -628,19 +676,22 @@ DrawState *draw_state() {
         for (auto &b : batch.bins) b.clear();
     }
     auto ds = std::make_unique<DrawState>();
+    state_reusable = true;
+    state_tex.clear();
     build_draw_state(*ds);  // may flush (render-to-texture); states vector survives as needed
     // the texture setup may have flushed the batch: make sure our RT is still registered
     if (!batch.has_rt) {
         batch.rt = rt;
         batch.has_rt = true;
     }
+    batch.uses_depth |= uses_depth;
+    for (const auto &range : state_tex)
+        if (std::find(batch.tex.begin(), batch.tex.end(), range) == batch.tex.end()) batch.tex.push_back(range);
     g.ds = ds.get();
-    g.ds_version = g.regs_version;
+    g.ds_version = state_reusable ? g.regs_version : 0;
     batch.states.push_back(std::move(ds));
     return g.ds;
 }
-
-void raster_begin_draw(const DrawState *) {}
 
 // ---------------------------------------------------------------- clipping & setup
 namespace {
@@ -1294,7 +1345,7 @@ inline void finish_fragment(const DrawState &ds, TileState &ts, const Pending &f
         float fl = floorf(fi);
         fl = fl < 0 ? 0 : fl > 127 ? 127 : fl;
         const u32 ii = (u32)fl;
-        float ff = F.val[ii] + F.diff[ii] * (fi - fl);
+        float ff = F.vd[ii][0] + F.vd[ii][1] * (fi - fl);
         ff = ff < 0 ? 0 : ff > 1 ? 1 : ff;
         u32 o = c & 0xff000000u;
         for (u32 ch = 0; ch < 3; ch++) {
@@ -1565,22 +1616,36 @@ void process_tile(u32 item, u32 tid) {
 }
 }  // namespace
 
-void raster_flush() {
-    vtx_finish_jobs();
-    for (Parked &p : parked) {
-        hw_flush(p.rt, p.mb);
-        if (p.rt.color_addr) texcache_invalidate(p.rt.color_addr, color_bytes_of(p.rt));
-        if (p.rt.depth_addr) texcache_invalidate(p.rt.depth_addr, depth_bytes_of(p.rt));
-    }
-    parked.clear();
+// The end of a command list. The software renderer draws what is batched. With a hardware backend the batches stay
+// open: games draw a picture with several lists in a row (Super Mario 3D Land: three per eye), and a batch the
+// next list goes on with is one pass instead of one per list. They are drawn when something reads what they draw
+// or changes what they sample: a transfer, a fill, a cache flush, a target switch that conflicts, a texture decoded
+// again (raster_flush). The draws the CPU shades are shaded now: the game may reuse their vertex arrays.
+// GPU_FLUSH_LISTS=1 draws everything at the end of each list, as the software renderer does (for comparing).
+void raster_end_list() {
+    static const bool flush_lists = getenv("GPU_FLUSH_LISTS") != nullptr;
+    if (use_hw && !flush_lists)
+        vtx_finish_jobs();
+    else
+        raster_flush();
+}
+
+// a hardware batch is drawn; the texture cache is told what it wrote
+static void flush_batch(const RTConfig &rt, const MBatch &mb, bool uses_depth) {
+    hw_flush(rt, mb);
+    if (rt.color_addr) texcache_invalidate(rt.color_addr, color_bytes_of(rt));
+    if (rt.depth_addr && uses_depth) texcache_invalidate(rt.depth_addr, depth_bytes_of(rt));
+}
+
+// the current batch is drawn and emptied
+static void flush_current() {
     batch.tex.clear();
+    const bool used_depth = batch.uses_depth;
+    batch.uses_depth = false;
     if (!batch.mb.empty()) {
         const double tf = g_stats ? now_ms() : 0;
-        hw_flush(batch.rt, batch.mb);
+        flush_batch(batch.rt, batch.mb, used_depth);
         batch.mb.clear();
-        const RTConfig &rt = batch.rt;
-        if (rt.color_addr) texcache_invalidate(rt.color_addr, rt.w * rt.h * color_bytes(rt.color_fmt & 7));
-        if (rt.depth_addr) texcache_invalidate(rt.depth_addr, rt.w * rt.h * depth_bytes(rt.depth_fmt));
         if (g_stats) g_t_flush += now_ms() - tf;
     }
     if (!batch.tris.empty()) {
@@ -1635,5 +1700,43 @@ void raster_flush() {
     g.ds = nullptr;
     g.ds_version = 0;
 }
+
+void raster_flush() {
+    vtx_finish_jobs();
+    for (Parked &p : parked) flush_batch(p.rt, p.mb, p.uses_depth);
+    parked.clear();
+    flush_current();
+}
+
+// Before guest memory in [addr, addr + size) is read or written by something other than a draw (a transfer, a
+// fill, a texture copy, the game's own code): the batches that draw into it or sample it are drawn. The others
+// stay open (open batches share no memory, so the order they are drawn in does not matter), and go on taking the
+// draws of the lists that follow.
+void raster_flush_touching(u32 addr, u32 size) {
+    if (!use_hw || (u64)addr + size > UINT32_MAX) {
+        raster_flush();
+        return;
+    }
+    vtx_finish_jobs();
+    auto touches = [&](const RTConfig &rt, bool uses_depth, const std::vector<std::pair<u32, u32>> &tex) {
+        if (rt_touches(used(rt, uses_depth), addr, size)) return true;
+        for (const auto &[a, n] : tex)
+            if (range_overlap(a, n, addr, size)) return true;
+        return false;
+    };
+    for (size_t i = 0; i < parked.size();) {
+        if (touches(parked[i].rt, parked[i].uses_depth, parked[i].tex)) {
+            flush_batch(parked[i].rt, parked[i].mb, parked[i].uses_depth);
+            parked.erase(parked.begin() + i);
+        } else {
+            i++;
+        }
+    }
+    if (batch.has_rt && touches(batch.rt, batch.uses_depth, batch.tex)) flush_current();
+    // (the textures of the state last built may be in that memory: the next draw builds its own)
+    g.ds = nullptr;
+    g.ds_version = 0;
+}
+
 
 }  // namespace gpu

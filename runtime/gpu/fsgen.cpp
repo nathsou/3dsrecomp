@@ -343,6 +343,7 @@ bool frag_depth(const DrawState &ds) { return ds.wbuffer; }
 // key describing everything the generated fragment shader depends on
 std::string fs_key(const DrawState &ds) {
     std::string k;
+    k.reserve(256);  // (most keys: one allocation)
     auto put = [&](u32 v) { k.append((const char *)&v, 4); };
     put(ds.need_shade | ds.wbuffer << 1 | (ds.scissor_mode == 1) << 2 | ds.depth_bits << 3 | ds.color_write << 9 |
         hw_blend(ds) << 10);

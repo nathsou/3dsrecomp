@@ -133,7 +133,7 @@ void set_trust_invalidations(bool trust) { trust_invalidations = trust; }
 
 void invalidate_memory(u32 paddr, u32 size) {
     ensure_init();
-    raster_flush();
+    raster_flush_touching(paddr, size);
     hw_poll();
     texcache_invalidate(paddr, size);
     hw_guest_written(paddr, size, false);  // CPU cache maintenance: maybe written
@@ -152,6 +152,7 @@ void texcache_new_epoch() {
 
 void texcache_trim() {
     if (total_bytes < (256u << 20)) return;
+    raster_flush();  // (open batches hold entries)
     for (auto it = cache.begin(); it != cache.end();) {
         if (it->second->last_use + 2 < use_counter) {
             for (auto &l : it->second->lv) total_bytes -= l.data.size() * 4;
@@ -191,6 +192,7 @@ const TexEntry *texcache_get(u32 addr, u32 w, u32 h, u32 fmt, u32 levels) {
     if (!p || !pptr(addr + e.size - 1)) return nullptr;
     u64 hv = hash_mem(p, e.size);
     if (hv != e.hash || e.lv.empty()) {
+        if (!e.lv.empty()) raster_flush();  // (the draws batched with what it held are drawn first)
         const double t0 = now_ms();
         for (auto &l : e.lv) total_bytes -= l.data.size() * 4;
         e.lv.resize(levels);
@@ -316,7 +318,7 @@ static u32 sample_2d(const TexUnitState &tu, const TexEntry *e, float u, float v
     if (!tu.need_lod || lod <= 0.0f) {
         s32 l = tu.min_level < nlv ? tu.min_level : nlv - 1;
         if (l < 0) l = 0;
-        return sample_level(tu, e->lv[l], u, v, tu.need_lod ? tu.mag_linear : tu.mag_linear);
+        return sample_level(tu, e->lv[l], u, v, tu.mag_linear);
     }
     float lmin = (float)tu.min_level, lmax = (float)std::min(tu.max_level, nlv - 1);
     if (lmax < lmin) lmax = lmin;

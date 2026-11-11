@@ -32,6 +32,12 @@ u32 heap_size, linear_used;
 // what it allocated. Games size their heap from what is left of the 64 MiB (Picross 3D: Round 2 takes all of it,
 // and needs every page the program does not use).
 static u32 pages(u32 size) { return (size + 0xFFF) & ~0xFFFu; }
+// a kernel object's name for the logs: its kind and the guest code that made it (the creating call's return address)
+static std::string made_at(const char *kind, const CPU *c) {
+    char name[32];
+    snprintf(name, sizeof name, "%s@%08x", kind, c->r[14]);
+    return name;
+}
 static u32 memory_used() {
     return pages(g_game.text_size) + pages(g_game.ro_size) + pages(g_game.data_size + g_game.bss_size) +
            pages(g_game.stack_size) + heap_size + linear_used;
@@ -120,11 +126,14 @@ void set_clock_speed(u32 pct) {
 }
 
 void add_timeout(u64 deadline, std::function<void()> fn) {
+    // (the thread waits for the earliest deadline: a later one changes nothing for it)
+    const bool earliest = tq.q.empty() || deadline < tq.q.begin()->first;
     tq.q.emplace(deadline, std::move(fn));
-    tq.cv.notify_one();
+    if (earliest) tq.cv.notify_one();
 }
 
 static void timeout_thread() {
+    platform::set_thread_name("timeouts");
     Lock lk(kmutex);
     for (;;) {
         if (tq.q.empty()) {
@@ -504,12 +513,12 @@ static void wait_on(Thread *t, std::vector<std::shared_ptr<WaitObject>> objs, bo
         LOG("[sched] thread %u waits on %s%s (lr %08x)\n", t->id, what.c_str(),
             timeout >= 0 ? (" for " + std::to_string(timeout / 1000) + " us").c_str() : "", c ? c->r[14] : 0);
     }
-    t->wait_objs = objs;
+    t->wait_objs = std::move(objs);
     t->wait_all = all;
     t->status = TStatus::WaitSync;
     t->wait_result = RES_TIMEOUT;
     t->wait_index = -1;
-    for (auto &o : objs) o->add_waiter(t);
+    for (auto &o : t->wait_objs) o->add_waiter(t);
     if (timeout >= 0) {
         u64 gen = t->wait_gen;
         add_timeout(now_ns() + (u64)timeout, [t, gen] {
@@ -545,7 +554,7 @@ static u32 svc_control_memory(CPU *c) {
             heap_size += size;
         }
         memset(gptr(a), 0, size);
-        add_region(a, size, perm, linear ? 5 : 5);
+        add_region(a, size, perm, 5);
         c->r[1] = a;
         return RES_OK;
     }
@@ -570,7 +579,7 @@ static u32 svc_control_memory(CPU *c) {
         return RES_OK;
     }
     LOG("[svc] ControlMemory: unknown op %x\n", op);
-    return 0xE0E01BEE;
+    return RES_INVALID_COMBINATION;
 }
 
 static u32 svc_query_memory(CPU *c) {
@@ -698,7 +707,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x13: {  // CreateMutex(initial=r1)
         auto m = std::make_shared<Mutex>();
-        m->name = "mutex@" + std::to_string(c->r[14]);
+        m->name = made_at("mutex", c);
         if (c->r[1]) m->acquire(t);
         c->r[1] = add_handle(m);
         c->r[0] = RES_OK;
@@ -713,7 +722,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x15: {  // CreateSemaphore(initial=r1, max=r2)
         auto s = std::make_shared<Semaphore>();
-        s->name = "sema@" + std::to_string(c->r[14]);
+        s->name = made_at("sema", c);
         s->count = (s32)c->r[1];
         s->max = (s32)c->r[2];
         c->r[1] = add_handle(s);
@@ -734,9 +743,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x17: {  // CreateEvent(reset=r1)
         auto e = make_event((ResetType)c->r[1], "guest");
-        char nm[32];
-        snprintf(nm, sizeof nm, "event@%08x", c->r[14]);
-        e->name = nm;
+        e->name = made_at("event", c);
         c->r[1] = add_handle(e);
         c->r[0] = RES_OK;
         break;
@@ -762,7 +769,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     }
     case 0x1A: {  // CreateTimer(reset=r1)
         auto tm = std::make_shared<Timer>();
-        tm->name = "timer@" + std::to_string(c->r[14]);
+        tm->name = made_at("timer", c);
         tm->reset = (ResetType)c->r[1];
         c->r[1] = add_handle(tm);
         c->r[0] = RES_OK;
@@ -899,7 +906,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             break;
         }
         if (ns > 100000000) VLOG("[svc] thread %u waits on %d objects (%s) for %lld ms (lr %08x)\n", t->id, n, objs[0]->name.c_str(), (long long)(ns / 1000000), c->r[14]);
-        wait_on(t, objs, all, ns, lk, c, true);
+        wait_on(t, std::move(objs), all, ns, lk, c, true);
         break;
     }
     case 0x27: {  // DuplicateHandle(r1)
@@ -953,13 +960,10 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
         auto svc = find_port(name);
         if (!svc) {
             LOG("[svc] ConnectToPort(%s): no such port\n", name.c_str());
-            c->r[0] = 0xD88007FA;
+            c->r[0] = RES_NOT_FOUND;
             break;
         }
-        auto s = std::make_shared<Session>();
-        s->service = svc;
-        s->name = name;
-        c->r[1] = add_handle(s);
+        c->r[1] = add_handle(make_session(svc, name));
         c->r[0] = RES_OK;
         break;
     }
@@ -996,9 +1000,11 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
             u64 v = 0;
             bool limit = imm == 0x39;
             switch (name) {
-            case 0: v = limit ? 0x18 : 0x18; break;                                   // priority
+            case 0: v = 0x18; break;                                // priority
             case 1: v = limit ? 0x04000000 : memory_used(); break;  // commit
-            case 2: v = limit ? 32 : threads.size(); break;
+            case 2:  // threads (those that have not exited)
+                v = limit ? 32 : std::count_if(threads.begin(), threads.end(), [](const auto &th) { return th->status != TStatus::Dead; });
+                break;
             case 3: v = limit ? 32 : 8; break;
             case 4: v = limit ? 32 : 8; break;
             case 5: v = limit ? 32 : 8; break;

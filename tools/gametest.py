@@ -4,8 +4,8 @@
   tools/gametest.py [options] [title id or test name ...]
 
 Each test is a TOML file in tests/games/<title id>/ (see tests/README.md for the format). A test starts the game
-headless (SDL's offscreen video and dummy audio) with scripted input, optionally from a save of your own console,
-and checks:
+headless (SDL's offscreen video, its dummy one on macOS, and dummy audio) with scripted input, optionally from a save
+of your own console, and checks:
 
   - the run ends normally, with no fatal error and no code the recompiler missed (lazily recompiled code);
   - every "unimplemented command" the services log is one the test lists (`known_unimplemented`), so a game that
@@ -224,7 +224,9 @@ def run_test(spec, args, games):
     frames = int(spec['frames'])
     shot_frames = sorted({int(c['frame']) for c in checkpoints})
     env = dict(os.environ)
-    env.update({'SDL_VIDEO_DRIVER': 'offscreen', 'SDL_AUDIO_DRIVER': 'dummy', 'RECOMP_FRAMES': str(frames)})
+    # (SDL's offscreen driver wants OpenGL for its windows, which macOS does not give it: the dummy driver there)
+    video = 'dummy' if sys.platform == 'darwin' else 'offscreen'
+    env.update({'SDL_VIDEO_DRIVER': video, 'SDL_AUDIO_DRIVER': 'dummy', 'RECOMP_FRAMES': str(frames)})
     for k in list(env):
         if k.startswith(('RECOMP_', 'GPU_')) and k not in ('RECOMP_FRAMES',):
             del env[k]  # (the caller's debugging variables would change the run)

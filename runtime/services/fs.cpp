@@ -348,7 +348,8 @@ static void romfs_read_delay(IPC &ipc, u32 len) { fs_delay(ipc, std::max<u64>((u
 // Formatting a save takes a while on a 3DS too (erasing the card's flash, or writing the SD card's save image): Star
 // Fox 64 3D formats on a worker thread and marks the task running only after creating it, so an instant format let
 // the worker report "done" first and the mark overwrote it (stuck on "Initialising game data..." for good). The
-// formatting thread sleeps 50 ms after the reply.
+// formatting thread sleeps this long after the reply.
+constexpr u64 kFormatDelayNs = 50'000'000;
 
 static std::string archive_dir(u32 id, const LowPath &p) {
     std::string root = save_root();
@@ -465,11 +466,7 @@ struct FileSession : Service {
             unimplemented(ipc);
         }
     }
-    static ObjPtr get_object_for(std::shared_ptr<Service> s) {
-        auto ses = std::make_shared<Session>();
-        ses->service = s;
-        return ses;
-    }
+    static ObjPtr get_object_for(std::shared_ptr<Service> s) { return make_session(std::move(s)); }
 };
 
 struct DirSession : Service {
@@ -651,9 +648,7 @@ struct FsUser : Service {
             }
             VLOG("[fs] open %s\n", path.c_str());
         }
-        auto ses = std::make_shared<Session>();
-        ses->service = fs;
-        *out = ses;
+        *out = make_session(fs);
         return 0;
     }
 
@@ -788,10 +783,8 @@ struct FsUser : Service {
             if (!fsys::is_directory(path)) { ipc.result(ERR_PATH_NOT_FOUND, 1, 2); ipc.handles(2, {nullptr}, true); break; }
             auto ds = std::make_shared<DirSession>();
             for (auto &e : fsys::directory_iterator(path)) ds->entries.push_back(e);
-            auto ses = std::make_shared<Session>();
-            ses->service = ds;
             ipc.ok(1, 2);
-            ipc.handles(2, {ses}, true);
+            ipc.handles(2, {make_session(ds)}, true);
             break;
         }
         case 0x080F:    // FormatThisUserSaveData
@@ -803,7 +796,7 @@ struct FsUser : Service {
             LOG("[fs] formatted save data at %s\n", d.c_str());
             save_changed(d);
             ipc.ok();
-            fs_delay(ipc, 50000000);
+            fs_delay(ipc, kFormatDelayNs);
             break;
         }
         case 0x0875:  // SetSaveDataSecureValue(value u64, slot, title unique id, title variation)
