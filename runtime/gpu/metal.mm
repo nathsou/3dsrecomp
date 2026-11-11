@@ -1571,22 +1571,12 @@ id<MTLDepthStencilState> get_dss(const DrawState &ds) {
 }
 
 // ---------------------------------------------------------------- display images
-struct DisplayImage {
-    u32 out_addr = 0, out_size = 0;
-    u32 out_w = 0, out_bpp = 0, hs = 0, vs = 0;  // output rows' pixels and bytes per pixel; downscaling shifts
-    u32 scale = 1;                               // internal scale the image was made at
-    bool incomplete = false;                     // some draws were left out (the screen keeps the last image)
-    u64 out_hash = 0;  // guest framebuffer bytes the image corresponds to
-    int screen = -1;
-    u32 w = 0, h = 0;
-    u64 version = 0;          // new for every new image
+struct DisplayImage : DisplayImageBase {  // (the bookkeeping in hwshared.h)
     id<MTLBuffer> buf;        // the image (RGBA8 rows)
     id<MTLCommandBuffer> cb;  // while the image is still being made: its command buffer
 };
 std::mutex disp_mtx;
-std::unordered_map<u32, DisplayImage> displays;  // by framebuffer physical address
-u32 last_screen_addr[2] = {0, 0};
-u64 disp_version = 0;
+DisplayImages<DisplayImage> displays;  // (disp_mtx held)
 
 bool eager_writeback = false;
 bool warned_shadow = false, warned_proctex = false;
@@ -1642,8 +1632,8 @@ void finalize(PendingXfer &op) {
     xbuf_free.push_back(op.gbytes);
     xbuf_free.push_back(op.obytes);
     std::lock_guard<std::mutex> lk(disp_mtx);
-    auto it = displays.find(op.out_paddr);
-    if (it != displays.end() && it->second.cb == op.cb) {
+    auto it = displays.by_addr.find(op.out_paddr);
+    if (it != displays.by_addr.end() && it->second.cb == op.cb) {
         DisplayImage &d = it->second;
         d.out_hash = hash_mem(pptr(d.out_addr), d.out_size);
         d.cb = nil;  // the image stays in op.disp
@@ -2491,18 +2481,9 @@ namespace {
 // display images made from guest memory in [paddr, paddr + size): dropped if it was written (definite: certainly)
 void drop_displays(u32 paddr, u32 size, bool definite) {
     std::lock_guard<std::mutex> lk(disp_mtx);
-    for (auto it = displays.begin(); it != displays.end();) {
-        const DisplayImage &d = it->second;
-        if (overlaps(d.out_addr, d.out_size, paddr, size) && (definite || (!d.cb && hash_mem(pptr(d.out_addr), d.out_size) != d.out_hash))) {
-            if (g_stats)
-                LOG("gpu metal: display image %08x dropped (%s write %08x+%x)\n", d.out_addr, definite ? "GPU" : "CPU",
-                    paddr, size);
-            if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
-            it = displays.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    displays.written(paddr, size, definite, "metal", [](const DisplayImage &d) { return !d.cb; }, [](DisplayImage &d) {
+        if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
+    });
 }
 }  // namespace
 
@@ -2522,29 +2503,9 @@ void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u3
 // new display image entry for out_paddr (lock held), replacing any image the output overlaps; the
 // buffers of finished images go back to disp_free (those of unfinished ones when they finish)
 DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, u32 w, u32 h) {
-    const u32 out_h0 = out_dims >> 16;
-    for (auto it = displays.begin(); it != displays.end();) {
-        if (overlaps(it->second.out_addr, it->second.out_size, out_paddr, out_size)) {
-            if (!it->second.cb && recyclable(it->second.buf)) disp_free.push_back(it->second.buf);
-            it = displays.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    DisplayImage &d = displays[out_paddr];
-    d.out_addr = out_paddr;
-    d.out_size = out_size;
-    d.w = w;
-    d.h = h;
-    d.hs = ((flags >> 24) & 3) ? 1 : 0;
-    d.vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
-    d.out_w = (out_dims & 0xffff) >> d.hs;
-    d.out_bpp = pixel_bytes((flags >> 12) & 7);
-    d.scale = S;
-    d.version = ++disp_version;
-    d.screen = out_h0 == 400 ? 0 : out_h0 == 320 ? 1 : -1;
-    if (d.screen >= 0) last_screen_addr[d.screen] = out_paddr;
-    return d;
+    return displays.add(out_paddr, out_size, out_dims, flags, w, h, S, [](DisplayImage &d) {
+        if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
+    });
 }
 }  // namespace
 
@@ -2770,40 +2731,14 @@ void metal_set_clear_after_top_transfer(bool on) { clear_after_top = on; }
 void metal_set_key_black_bottom(bool on) { key_black_bottom = on; }
 
 namespace {
-// The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes
-// apart) may start inside a display transfer's output, e.g. NSMB2 transfers 256x416 and shows rows 16 to 415.
-// The image's x runs along the output rows, its y backwards along each row's pixels. (disp_mtx held)
-struct DisplayView {
-    const DisplayImage *d = nullptr;
-    u32 x0 = 0, y0 = 0, w = 0, h = 0;
-    u64 key = 0;  // changes with the image or the part shown
-};
-bool find_view(u32 fb, u32 stride, u32 lines, DisplayView &v) {
-    for (const auto &[addr, d] : displays) {
-        if (fb < d.out_addr || fb >= d.out_addr + d.out_size) continue;
-        const u32 row_bytes = d.out_w * d.out_bpp;
-        if (!row_bytes || (stride && stride != row_bytes)) return false;
-        const u32 off = fb - d.out_addr, r0 = off / row_bytes, c0 = off % row_bytes / d.out_bpp;
-        const u32 fx = d.scale << d.vs, fy = d.scale << d.hs;  // image pixels per output row / pixel
-        if (c0 + 240 > d.out_w || (r0 + lines) * fx > d.w || (c0 + 240) * fy > d.h) return false;
-        v.d = &d;
-        v.x0 = r0 * fx;
-        v.w = lines * fx;
-        v.y0 = d.h - (c0 + 240) * fy;
-        v.h = 240 * fy;
-        v.key = d.version << 20 ^ off;
-        return true;
-    }
-    return false;
-}
 // The image for the framebuffer finished on the GPU, waited for without disp_mtx held (the GX thread takes it to
 // finish transfers and to replace images meanwhile); false: no image there.
 bool wait_for_view(u32 fb, u32 stride, u32 lines) {
     id<MTLCommandBuffer> cb;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
-        DisplayView v;
-        if (!find_view(fb, stride, lines, v)) return false;
+        DisplayView<DisplayImage> v;
+        if (!displays.view(fb, stride, lines, v)) return false;
         cb = v.d->cb;
     }
     if (cb) [cb waitUntilCompleted];
@@ -2822,7 +2757,7 @@ std::unordered_map<u64, PresentImage> present_images;
 id<MTLCommandBuffer> present_cb;
 std::vector<id<MTLBuffer>> present_bufs;
 // copies the view of a display image (rows of dw pixels) into a present image of its size
-bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
+bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView<DisplayImage> &v, u64 image) {
     id<MTLTexture> tex;
     {
         std::lock_guard<std::mutex> lk(present_mtx);
@@ -2851,12 +2786,12 @@ bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
     return true;
 }
 // calls fn with the view of a display image (buf: its pixels, rows of dw), in place
-void view_pixels(id<MTLBuffer> buf, u32 dw, const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+void view_pixels(id<MTLBuffer> buf, u32 dw, const DisplayView<DisplayImage> &v, const std::function<void(const ScreenImage &)> &fn) {
     ScreenImage si{(const u32 *)buf.contents + (size_t)v.y0 * dw + v.x0, (int)v.w, (int)v.h, (int)dw, {}};
     si.copy_to = [&](u64 image) { return copy_view(buf, dw, v, image); };
     fn(si);
 }
-void with_view(const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+void with_view(const DisplayView<DisplayImage> &v, const std::function<void(const ScreenImage &)> &fn) {
     if (v.d->cb) [v.d->cb waitUntilCompleted];
     view_pixels(v.d->buf, v.d->w, v, fn);
 }
@@ -2866,8 +2801,8 @@ bool metal_get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 
     thread_local std::vector<u32> out;
     if (!wait_for_view(fb_paddr, stride, lines)) return false;
     std::lock_guard<std::mutex> lk(disp_mtx);
-    DisplayView v;
-    if (!find_view(fb_paddr, stride, lines, v)) return false;
+    DisplayView<DisplayImage> v;
+    if (!displays.view(fb_paddr, stride, lines, v)) return false;
     with_view(v, [&](const ScreenImage &si) {
         out.resize((size_t)si.w * si.h);
         for (int y = 0; y < si.h; y++) memcpy(&out[(size_t)y * si.w], si.px + (size_t)y * si.pitch, (size_t)si.w * 4);
@@ -2882,12 +2817,12 @@ u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const
     if (!wait_for_view(fb_paddr, stride, lines)) return 0;
     // fn (an upload to the UI's texture: slow for a large image) runs without disp_mtx held, the buffer kept from
     // being reused meanwhile
-    DisplayView v;
+    DisplayView<DisplayImage> v;
     id<MTLBuffer> buf;
     u32 dw;
     {
         std::unique_lock<std::mutex> lk(disp_mtx);
-        if (!find_view(fb_paddr, stride, lines, v)) return 0;
+        if (!displays.view(fb_paddr, stride, lines, v)) return 0;
         if (v.key == have) return have;
         // a frame drawn while new pipelines were compiling lacks those draws (often most of the scene: a flash of
         // the clear colour); keep showing the last image instead, for a few frames at most
@@ -2958,8 +2893,8 @@ bool metal_get_display_image(int screen, const u32 **rgba, int *w, int *h) {
     u32 addr;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
-        if (screen < 0 || screen > 1 || !last_screen_addr[screen]) return false;
-        addr = last_screen_addr[screen];
+        if (screen < 0 || screen > 1 || !displays.last_screen_addr[screen]) return false;
+        addr = displays.last_screen_addr[screen];
     }
     return metal_get_display_image_for(addr, 0, screen ? 320 : 400, rgba, w, h);
 }

@@ -2,6 +2,7 @@
 // image that is not a call into Metal or Vulkan. Each backend keeps only the encoding of its GPU work.
 #pragma once
 #include <deque>
+#include <unordered_map>
 #include <memory>
 #include <vector>
 
@@ -160,6 +161,98 @@ struct GpuOutputs {
         return made_elsewhere(addr, size);
     }
     bool made_elsewhere(u32 addr, u32 size) const;
+};
+
+// ---- display images: the upright pictures display transfers make from render targets (what the screens show at
+// the internal resolution), by the guest memory the transfer wrote. A backend's image extends DisplayImageBase with
+// its buffer and whatever says it is still being made.
+struct DisplayImageBase {
+    u32 out_addr = 0, out_size = 0;
+    u32 out_w = 0, out_bpp = 0, hs = 0, vs = 0;  // output rows' pixels and bytes per pixel; downscaling shifts
+    u32 scale = 1;                               // internal scale the image was made at
+    bool incomplete = false;                     // some draws were left out (the screen keeps the last image)
+    u64 out_hash = 0;                            // guest framebuffer bytes the image corresponds to
+    int screen = -1;
+    u32 w = 0, h = 0;
+    u64 version = 0;  // new for every new image
+};
+// The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes apart)
+// may start inside a display transfer's output, e.g. NSMB2 transfers 256x416 and shows rows 16 to 415. The image's x
+// runs along the output rows, its y backwards along each row's pixels.
+template <class D> struct DisplayView {
+    const D *d = nullptr;
+    u32 x0 = 0, y0 = 0, w = 0, h = 0;
+    u64 key = 0;  // changes with the image or the part shown
+};
+template <class D> struct DisplayImages {
+    std::unordered_map<u32, D> by_addr;  // by the output's physical address
+    u32 last_screen_addr[2] = {0, 0};    // the latest image of each screen (by its height)
+    u64 version = 0;
+
+    // A new image (w x h) of a display transfer's output; images it overwrites are dropped (drop: frees what the
+    // backend holds for one). The caller fills in the rest.
+    template <class Drop> D &add(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, u32 w, u32 h, u32 scale, Drop drop) {
+        for (auto it = by_addr.begin(); it != by_addr.end();) {
+            if (overlaps(it->second.out_addr, it->second.out_size, out_paddr, out_size)) {
+                drop(it->second);
+                it = by_addr.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        D &d = by_addr[out_paddr];
+        const u32 out_h0 = out_dims >> 16;
+        d.out_addr = out_paddr;
+        d.out_size = out_size;
+        d.w = w;
+        d.h = h;
+        d.hs = ((flags >> 24) & 3) ? 1 : 0;
+        d.vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
+        d.out_w = (out_dims & 0xffff) >> d.hs;
+        d.out_bpp = pixel_bytes((flags >> 12) & 7);
+        d.scale = scale;
+        d.version = ++version;
+        d.screen = out_h0 == 400 ? 0 : out_h0 == 320 ? 1 : -1;
+        if (d.screen >= 0) last_screen_addr[d.screen] = out_paddr;
+        return d;
+    }
+    // Guest memory in [paddr, paddr + size) was written: images made of it are dropped (definite: certainly
+    // written; else only if its bytes changed, for images whose guest memory is final, `settled`)
+    template <class Settled, class Drop>
+    void written(u32 paddr, u32 size, bool definite, const char *backend, Settled settled, Drop drop) {
+        for (auto it = by_addr.begin(); it != by_addr.end();) {
+            D &d = it->second;
+            if (overlaps(d.out_addr, d.out_size, paddr, size) &&
+                (definite || (settled(d) && hash_mem(pptr(d.out_addr), d.out_size) != d.out_hash))) {
+                if (g_stats)
+                    LOG("gpu %s: display image %08x dropped (%s write %08x+%x)\n", backend, d.out_addr,
+                        definite ? "GPU" : "CPU", paddr, size);
+                drop(d);
+                it = by_addr.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    // the view of the framebuffer at fb (false: no image of it, or not one that can show it)
+    bool view(u32 fb, u32 stride, u32 lines, DisplayView<D> &v) const {
+        for (const auto &[addr, d] : by_addr) {
+            if (fb < d.out_addr || fb >= d.out_addr + d.out_size) continue;
+            const u32 row_bytes = d.out_w * d.out_bpp;
+            if (!row_bytes || (stride && stride != row_bytes)) return false;
+            const u32 off = fb - d.out_addr, r0 = off / row_bytes, c0 = off % row_bytes / d.out_bpp;
+            const u32 fx = d.scale << d.vs, fy = d.scale << d.hs;  // image pixels per output row / pixel
+            if (c0 + 240 > d.out_w || (r0 + lines) * fx > d.w || (c0 + 240) * fy > d.h) return false;
+            v.d = &d;
+            v.x0 = r0 * fx;
+            v.w = lines * fx;
+            v.y0 = d.h - (c0 + 240) * fy;
+            v.h = 240 * fy;
+            v.key = d.version << 20 ^ off;
+            return true;
+        }
+        return false;
+    }
 };
 
 }  // namespace gpu
