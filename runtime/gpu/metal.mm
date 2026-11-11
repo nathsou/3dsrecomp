@@ -1116,11 +1116,11 @@ struct Pipe {
 std::mutex pipe_mtx;
 std::condition_variable pipe_cv;
 std::unordered_map<std::string, std::unique_ptr<Pipe>> pipe_cache;
+ShaderList pipe_list;  // known pipelines (hwshared.h)
 std::deque<std::string> pipe_queue;
 int pipe_workers = 0;
 id<MTLLibrary> pre_lib;  // shaders.metallib
 id<MTLFunction> pre_vs;
-FILE *key_log;  // the user's pipeline list, appended to
 bool dump_shaders = false, sync_shaders = false, verify_keys = false;
 struct {
     u32 lib = 0, src = 0, fresh = 0, waited = 0, skipped = 0;
@@ -1232,11 +1232,7 @@ void start_workers() {
 
 // with pipe_mtx held
 void record_key(const std::string &key) {
-    if (!key_log) return;
-    const u32 n = (u32)key.size();
-    fwrite(&n, 4, 1, key_log);
-    fwrite(key.data(), 1, n, key_log);
-    fflush(key_log);
+    pipe_list.record(key);
 }
 
 void verify_key(const std::string &key, const DrawState &ds) {
@@ -1252,7 +1248,7 @@ std::string exe_dir() {
     return std::filesystem::path(exe).parent_path().string();
 }
 
-void vs_kernels_init(const std::string &tid);
+void vs_kernels_init();
 // the shipped and user pipeline lists, the precompiled library, and the background workers
 void pipelines_init() {
     sync_shaders = getenv("GPU_SYNC_SHADERS") != nullptr;
@@ -1282,31 +1278,13 @@ void pipelines_init() {
         std::error_code ec;
         std::filesystem::create_directories(g_save_base + "/shadercache", ec);
     }
-    vs_kernels_init(tid);
+    vs_kernels_init();
     // known pipelines: shipped with the game, then the user's own
-    std::vector<std::string> keys;
-    for (const auto &p : {g_game.dir + "/pipelines.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/pipelines.bin"}) {
-        if (!std::filesystem::exists(p)) continue;
-        keys = read_keys(p);
-        LOG("gpu metal: %zu pipelines listed in %s\n", keys.size(), p.c_str());
-        break;
-    }
-    const size_t shipped = keys.size();
-    const std::string dir = g_save_base + "/shadercache", user = dir + "/" + tid + ".bin";
-    std::vector<std::string> mine = read_keys(user);
-    keys.insert(keys.end(), mine.begin(), mine.end());
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (mine.empty()) {
-        // new or outdated: start over
-        key_log = fopen(user.c_str(), "wb");
-        const u32 hdr[2] = {kKeyMagic, kKeyVersion};
-        if (key_log) fwrite(hdr, 4, 2, key_log);
-    } else {
-        key_log = fopen(user.c_str(), "ab");
-    }
+    pipe_list = load_shader_list("pipelines.bin", ".bin", kKeyMagic, kKeyVersion);
+    if (!pipe_list.shipped_path.empty())
+        LOG("gpu metal: %zu pipelines listed in %s\n", pipe_list.shipped, pipe_list.shipped_path.c_str());
     std::lock_guard<std::mutex> lk(pipe_mtx);
-    for (auto &k : keys) {
+    for (auto &k : pipe_list.items) {
         auto &p = pipe_cache[k];
         if (p) continue;
         p = std::make_unique<Pipe>();
@@ -1316,7 +1294,7 @@ void pipelines_init() {
     if (!pipe_queue.empty()) start_workers();
     pipe_cv.notify_all();
     LOG("gpu metal: %zu known pipelines (%zu shipped, %zu in %s), building in the background%s (%.1f ms)\n",
-        pipe_cache.size(), shipped, mine.size(), user.c_str(), sync_shaders ? "; new ones synchronously" : "",
+        pipe_cache.size(), pipe_list.shipped, pipe_list.items.size() - pipe_list.shipped, pipe_list.user_path.c_str(), sync_shaders ? "; new ones synchronously" : "",
         now_ms() - t0);
 }
 
@@ -1334,7 +1312,7 @@ struct VsKern {
 };
 std::recursive_mutex vk_mtx;  // recursive: synchronous builds (GPU_SYNC_SHADERS) run under it
 std::unordered_map<u64, std::unique_ptr<VsKern>> vk_cache;  // by program hash and entry
-FILE *vk_log;
+ShaderList vs_list;  // known vertex programs (hwshared.h)
 struct {
     u32 lib = 0, src = 0, fail = 0, cpu_draws = 0;
     double ms = 0;
@@ -1408,59 +1386,25 @@ VsKern *vs_add(const std::string &blob) {
     return k.get();
 }
 
-void vs_kernels_init(const std::string &tid) {
-    std::vector<std::string> blobs;
-    for (const auto &p : {g_game.dir + "/vsprograms.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/vsprograms.bin"}) {
-        if (!std::filesystem::exists(p)) continue;
-        blobs = read_blobs(p, kVsMagic, kVsVersion);
-        break;
-    }
-    const size_t shipped = blobs.size();
-    const std::string user = g_save_base + "/shadercache/" + tid + ".vs.bin";
-    std::vector<std::string> mine = read_blobs(user, kVsMagic, kVsVersion);
-    blobs.insert(blobs.end(), mine.begin(), mine.end());
-    if (mine.empty()) {
-        vk_log = fopen(user.c_str(), "wb");
-        const u32 hdr[2] = {kVsMagic, kVsVersion};
-        if (vk_log) fwrite(hdr, 4, 2, vk_log);
-    } else {
-        vk_log = fopen(user.c_str(), "ab");
-    }
+void vs_kernels_init() {
+    vs_list = load_shader_list("vsprograms.bin", ".vs.bin", kVsMagic, kVsVersion);
     std::lock_guard<std::recursive_mutex> lk(vk_mtx);
-    for (const auto &b : blobs) vs_add(b);
-    LOG("gpu metal: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(),
-        shipped, mine.size(), user.c_str());
+    for (const auto &b : vs_list.items) vs_add(b);
+    LOG("gpu metal: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(), vs_list.shipped, vs_list.items.size() - vs_list.shipped, vs_list.user_path.c_str());
 }
 }  // namespace
 
 const void *metal_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s) {
     if (!active) return nullptr;
     std::lock_guard<std::recursive_mutex> lk(vk_mtx);
-    // the uniforms the program's flow control reads (masks cached per program)
-    static std::unordered_map<u64, std::pair<u32, u32>> masks;
     const u64 ph = shader_program_hash(p);
-    auto mi = masks.find(ph);
-    if (mi == masks.end()) {
-        u32 lm;
-        const u32 bm = shader_static_uniforms(p, &lm);
-        mi = masks.emplace(ph, std::make_pair(bm, lm)).first;
-    }
-    VsSpec sp;
-    for (u32 i = 0; i < 16; i++)
-        if (((mi->second.first >> i) & 1) && s.b[i]) sp.b |= 1u << i;
-    for (u32 i = 0; i < 4; i++)
-        if ((mi->second.second >> i) & 1) memcpy(sp.iu[i], s.i[i], 3);
+    const VsSpec sp = vs_spec(p, s);
     const u64 key = vk_key(ph, entry);
     auto it = vk_cache.find(spec_key(key, sp));
     if (it == vk_cache.end()) {
         const std::string blob = vs_blob(s, entry, &sp);
         VsKern *k = vs_add(blob);
-        if (k && vk_log) {
-            const u32 n = (u32)blob.size();
-            fwrite(&n, 4, 1, vk_log);
-            fwrite(blob.data(), 1, n, vk_log);
-            fflush(vk_log);
-        }
+        if (k) vs_list.record(blob);
         LOG("gpu metal: new vertex program %016llx entry %u (bools %04x, loops %02x%02x%02x %02x%02x%02x %02x%02x%02x "
             "%02x%02x%02x)%s\n", (unsigned long long)ph, entry, sp.b, sp.iu[0][0], sp.iu[0][1], sp.iu[0][2], sp.iu[1][0],
             sp.iu[1][1], sp.iu[1][2], sp.iu[2][0], sp.iu[2][1], sp.iu[2][2], sp.iu[3][0], sp.iu[3][1], sp.iu[3][2],

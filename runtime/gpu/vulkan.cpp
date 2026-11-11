@@ -1300,9 +1300,9 @@ struct Pipe {
 std::mutex &pipe_mtx = *new std::mutex;
 std::condition_variable &pipe_cv = *new std::condition_variable;
 std::unordered_map<std::string, std::unique_ptr<Pipe>> &pipe_cache = *new std::unordered_map<std::string, std::unique_ptr<Pipe>>;
+ShaderList pipe_list;  // known pipelines (hwshared.h)
 std::deque<std::string> &pipe_queue = *new std::deque<std::string>;
 int pipe_workers = 0;
-FILE *key_log;
 struct {
     u32 built = 0, fresh = 0, waited = 0, skipped = 0;
     double ms = 0, max_ms = 0, wait_ms = 0;
@@ -1366,11 +1366,7 @@ void start_workers() {  // (pipe_mtx held)
     for (int i = 0; i < pipe_workers; i++) std::thread(pipe_worker).detach();
 }
 void record_key(const std::string &key) {  // (pipe_mtx held)
-    if (!key_log) return;
-    const u32 n = (u32)key.size();
-    fwrite(&n, 4, 1, key_log);
-    fwrite(key.data(), 1, n, key_log);
-    fflush(key_log);
+    pipe_list.record(key);
 }
 void verify_key(const std::string &key, const DrawState &ds) {
     const FsOptions fo{ShaderLang::GLSL, has_logic_op, MS};
@@ -1389,7 +1385,7 @@ struct VsKern {
 };
 std::recursive_mutex &vk_mtx = *new std::recursive_mutex;
 std::unordered_map<u64, std::unique_ptr<VsKern>> &vk_cache = *new std::unordered_map<u64, std::unique_ptr<VsKern>>;
-FILE *vk_log;
+ShaderList vs_list;  // known vertex programs (hwshared.h)
 struct {
     u32 built = 0, fail = 0, cpu_draws = 0;
     double ms = 0;
@@ -1448,28 +1444,11 @@ VsKern *vs_add(const std::string &blob) {  // (vk_mtx held)
     vs_compile_async(k.get(), blob);
     return k.get();
 }
-void vs_kernels_init(const std::string &tid) {
-    std::vector<std::string> blobs;
-    for (const auto &p : {g_game.dir + "/vsprograms.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/vsprograms.bin"}) {
-        if (!std::filesystem::exists(p)) continue;
-        blobs = read_blobs(p, kVsMagic, kVsVersion);
-        break;
-    }
-    const size_t shipped = blobs.size();
-    const std::string user = g_save_base + "/shadercache/" + tid + ".vs.bin";
-    std::vector<std::string> mine = read_blobs(user, kVsMagic, kVsVersion);
-    blobs.insert(blobs.end(), mine.begin(), mine.end());
-    if (mine.empty()) {
-        vk_log = fopen(user.c_str(), "wb");
-        const u32 hdr[2] = {kVsMagic, kVsVersion};
-        if (vk_log) fwrite(hdr, 4, 2, vk_log);
-    } else {
-        vk_log = fopen(user.c_str(), "ab");
-    }
+void vs_kernels_init() {
+    vs_list = load_shader_list("vsprograms.bin", ".vs.bin", kVsMagic, kVsVersion);
     std::lock_guard<std::recursive_mutex> lk(vk_mtx);
-    for (const auto &b : blobs) vs_add(b);
-    LOG("gpu vulkan: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(),
-        shipped, mine.size(), user.c_str());
+    for (const auto &b : vs_list.items) vs_add(b);
+    LOG("gpu vulkan: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(), vs_list.shipped, vs_list.items.size() - vs_list.shipped, vs_list.user_path.c_str());
 }
 
 void pipelines_init() {
@@ -1481,7 +1460,7 @@ void pipelines_init() {
     const std::string dir = g_save_base + "/shadercache";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
-    vs_kernels_init(tid);
+    vs_kernels_init();
     // the driver's compiled pipelines from earlier runs
     {
         pcache_path = dir + "/" + tid + ".vkpc";
@@ -1505,26 +1484,12 @@ void pipelines_init() {
         LOG("gpu vulkan: GPU_NO_PRECOMPILE: no known pipelines built ahead\n");
         return;
     }
-    std::vector<std::string> keys;
-    for (const auto &p : {g_game.dir + "/pipelines.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/pipelines.bin"}) {
-        if (!std::filesystem::exists(p)) continue;
-        keys = read_keys(p);
-        LOG("gpu vulkan: %zu pipelines listed in %s\n", keys.size(), p.c_str());
-        break;
-    }
-    const size_t shipped = keys.size();
-    const std::string user = dir + "/" + tid + ".bin";
-    std::vector<std::string> mine = read_keys(user);
-    keys.insert(keys.end(), mine.begin(), mine.end());
-    if (mine.empty()) {
-        key_log = fopen(user.c_str(), "wb");
-        const u32 hdr[2] = {kKeyMagic, kKeyVersion};
-        if (key_log) fwrite(hdr, 4, 2, key_log);
-    } else {
-        key_log = fopen(user.c_str(), "ab");
-    }
+    // known pipelines: shipped with the game, then the user's own
+    pipe_list = load_shader_list("pipelines.bin", ".bin", kKeyMagic, kKeyVersion);
+    if (!pipe_list.shipped_path.empty())
+        LOG("gpu vulkan: %zu pipelines listed in %s\n", pipe_list.shipped, pipe_list.shipped_path.c_str());
     std::lock_guard<std::mutex> lk(pipe_mtx);
-    for (auto &k : keys) {
+    for (auto &k : pipe_list.items) {
         auto &p = pipe_cache[k];
         if (p) continue;
         p = std::make_unique<Pipe>();
@@ -1534,7 +1499,7 @@ void pipelines_init() {
     if (!pipe_queue.empty()) start_workers();
     pipe_cv.notify_all();
     LOG("gpu vulkan: %zu known pipelines (%zu shipped, %zu in %s), building in the background%s (%.1f ms)\n",
-        pipe_cache.size(), shipped, mine.size(), user.c_str(), sync_shaders ? "; new ones synchronously" : "",
+        pipe_cache.size(), pipe_list.shipped, pipe_list.items.size() - pipe_list.shipped, pipe_list.user_path.c_str(), sync_shaders ? "; new ones synchronously" : "",
         now_ms() - t0);
 }
 
@@ -2362,31 +2327,14 @@ VkPipeline build_vs_pipeline(const VsBlob &v) {
 const void *vk_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s) {
     if (!active) return nullptr;
     std::lock_guard<std::recursive_mutex> lk(vk_mtx);
-    // the uniforms the program's flow control reads (masks cached per program)
-    static std::unordered_map<u64, std::pair<u32, u32>> masks;
     const u64 ph = shader_program_hash(p);
-    auto mi = masks.find(ph);
-    if (mi == masks.end()) {
-        u32 lm;
-        const u32 bm = shader_static_uniforms(p, &lm);
-        mi = masks.emplace(ph, std::make_pair(bm, lm)).first;
-    }
-    VsSpec sp;
-    for (u32 i = 0; i < 16; i++)
-        if (((mi->second.first >> i) & 1) && s.b[i]) sp.b |= 1u << i;
-    for (u32 i = 0; i < 4; i++)
-        if ((mi->second.second >> i) & 1) memcpy(sp.iu[i], s.i[i], 3);
+    const VsSpec sp = vs_spec(p, s);
     const u64 key = vk_key(ph, entry);
     auto it = vk_cache.find(spec_key(key, sp));
     if (it == vk_cache.end()) {
         const std::string blob = vs_blob(s, entry, &sp);
         VsKern *k = vs_add(blob);
-        if (k && vk_log) {
-            const u32 n = (u32)blob.size();
-            fwrite(&n, 4, 1, vk_log);
-            fwrite(blob.data(), 1, n, vk_log);
-            fflush(vk_log);
-        }
+        if (k) vs_list.record(blob);
         LOG("gpu vulkan: new vertex program %016llx entry %u%s\n", (unsigned long long)ph, entry,
             sync_shaders ? "" : ", compiling in the background");
         if (k && k->done && k->ps) return k;

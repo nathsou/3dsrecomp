@@ -1,12 +1,15 @@
 // What the hardware backends (metal.mm, vulkan.cpp) share: everything about a draw, a render target or a display
 // image that is not a call into Metal or Vulkan. Each backend keeps only the encoding of its GPU work.
 #pragma once
+#include <cstdio>
 #include <deque>
+#include <string>
 #include <unordered_map>
 #include <memory>
 #include <vector>
 
 #include "gpu/pica.h"
+#include "gpu/vsblob.h"
 
 namespace gpu {
 
@@ -254,5 +257,21 @@ template <class D> struct DisplayImages {
         return false;
     }
 };
+
+// ---- the shader lists: the pipelines (fs_key strings, fsgen.h) and vertex programs (blobs, vsblob.h) a game was seen
+// using, shipped with it (games/<title id>/<file>, or the game folder's own) and the user's own, which grow as new ones
+// are met (<saves>/shadercache/<title id><user_ext>)
+struct ShaderList {
+    std::vector<std::string> items;  // the shipped ones, then the user's
+    size_t shipped = 0;
+    std::string shipped_path, user_path;
+    FILE *log = nullptr;  // the user's list, open for appending
+    void record(const std::string &item);
+};
+std::string title_id_hex();  // the game's, as the lists are named
+ShaderList load_shader_list(const char *file, const char *user_ext, u32 magic, u32 version);
+
+// a vertex program's kernel specialization: the bool and int uniforms its flow control reads, with their values
+VsSpec vs_spec(const ShaderProgram *p, const ShaderSetup &s);
 
 }  // namespace gpu

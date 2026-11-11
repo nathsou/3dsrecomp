@@ -1,7 +1,11 @@
 // What the hardware backends share (hwshared.h).
 #include "gpu/hwshared.h"
 
+#include "loader.h"
+
 #include <algorithm>
+#include <filesystem>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace gpu {
@@ -145,6 +149,67 @@ bool GpuOutputs::made_elsewhere(u32 addr, u32 size) const {
     for (const Out &g : outs)
         if (overlaps(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
     return false;
+}
+
+void ShaderList::record(const std::string &item) {
+    if (!log) return;
+    const u32 n = (u32)item.size();
+    fwrite(&n, 4, 1, log);
+    fwrite(item.data(), 1, n, log);
+    fflush(log);
+}
+
+std::string title_id_hex() {
+    char tid[20];
+    snprintf(tid, sizeof tid, "%016llx", (unsigned long long)g_game.program_id);
+    return tid;
+}
+
+ShaderList load_shader_list(const char *file, const char *user_ext, u32 magic, u32 version) {
+    ShaderList l;
+    const std::string tid = title_id_hex();
+    for (const auto &p : {g_game.dir + "/" + file, std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/" + file}) {
+        if (!std::filesystem::exists(p)) continue;
+        l.items = read_blobs(p, magic, version);
+        l.shipped_path = p;
+        break;
+    }
+    l.shipped = l.items.size();
+    const std::string dir = g_save_base + "/shadercache";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    l.user_path = dir + "/" + tid + user_ext;
+    std::vector<std::string> mine = read_blobs(l.user_path, magic, version);
+    l.items.insert(l.items.end(), mine.begin(), mine.end());
+    if (mine.empty()) {  // new or outdated: started over
+        l.log = fopen(l.user_path.c_str(), "wb");
+        const u32 hdr[2] = {magic, version};
+        if (l.log) {
+            fwrite(hdr, 4, 2, l.log);
+            fflush(l.log);
+        }
+    } else {
+        l.log = fopen(l.user_path.c_str(), "ab");
+    }
+    return l;
+}
+
+VsSpec vs_spec(const ShaderProgram *p, const ShaderSetup &s) {
+    // (the uniforms a program's flow reads: found once per program; callers hold their kernel lock)
+    static std::unordered_map<u64, std::pair<u32, u32>> masks;
+    const u64 ph = shader_program_hash(p);
+    auto mi = masks.find(ph);
+    if (mi == masks.end()) {
+        u32 loops;
+        const u32 bools = shader_static_uniforms(p, &loops);
+        mi = masks.emplace(ph, std::make_pair(bools, loops)).first;
+    }
+    VsSpec sp;
+    for (u32 i = 0; i < 16; i++)
+        if (((mi->second.first >> i) & 1) && s.b[i]) sp.b |= 1u << i;
+    for (u32 i = 0; i < 4; i++)
+        if ((mi->second.second >> i) & 1) memcpy(sp.iu[i], s.i[i], 3);
+    return sp;
 }
 
 }  // namespace gpu
