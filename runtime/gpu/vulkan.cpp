@@ -40,6 +40,7 @@
 #include <unordered_map>
 
 #include "gpu/fsgen.h"
+#include "gpu/hwshared.h"
 #include "gpu/pica.h"
 #include "gpu/vk_shaders.h"
 #include "gpu/vk_texfilter.h"
@@ -639,24 +640,6 @@ VkSampler dummy_sampler;
 BufP dummy_buf;
 ImgP black;  // 1x1 transparent black texture, also the dummy one
 
-// C++ mirror of the GLSL uniform block (fsgen.cpp's Uni, std140)
-struct alignas(16) LightU {
-    float spec0[4], spec1[4], diffuse[4], ambient[4], pos[4], spot[4], att[4];
-};
-struct alignas(16) Uni {
-    float rt[4];
-    float depth[4];
-    s32 scissor[4];
-    u32 konst[8];
-    u32 tevc[4];
-    u32 misc[4];
-    u32 border[4];
-    float bias[4];
-    float lscale[8];
-    float ambient[4];
-    LightU lights[8];
-};
-static_assert(sizeof(Uni) == 16 * 12 + 8 * 112, "uniform layout");
 struct VsDraw {
     float rt[4], vp[4], clip[4];
     u32 flags[4];
@@ -790,43 +773,23 @@ void save_pipeline_cache() {
 }
 
 // ---------------------------------------------------------------- render targets
-struct GRT {
-    u32 addr = 0, w = 0, h = 0, fmt = 0;
-    bool depth = false;
+struct GRT : TargetState {  // (the bookkeeping in hwshared.h)
     ImgP tex;                // single-sample copy (what everything else reads)
     ImgP ms;                 // with MSAA: the multisampled target, resolved into tex at the end of each pass
-    bool ms_valid = false;   // ms matches tex (else it is restored from tex before drawing)
-    bool synced = false;     // GPU copy corresponds to guest memory as hashed below
-    u64 hash = 0;
-    u64 checked = 0;         // g_frame when guest memory last matched the hash
-    u64 id = 0;              // unique among all targets ever made
-    u64 version = 0;         // changes whenever the GPU copy does
-    bool gpu_newer = false;  // changes not yet written to guest memory
-    u32 skipped = 0;         // draws left out since its last display transfer (pipelines still compiling)
-    bool clear_next = false; // set_clear_after_top_transfer: cleared to transparent before it is drawn into again,
-    bool own = false;        // ... and its GPU copy kept (guest memory ignored) until its own next display transfer
 };
 std::atomic<bool> clear_after_top{false};
 std::atomic<bool> key_black_bottom{false};
-std::vector<std::unique_ptr<GRT>> rts;
+TargetList<GRT> rts;
+GpuOutputs gpu_outs;  // (texture filter: guest memory holding GPU output)
 
-u32 rt_bytes(const GRT &r) {
-    if (r.depth) return r.w * r.h * (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4);
-    return r.w * r.h * pixel_bytes(cbuf_to_pixfmt(r.fmt));
-}
-bool overlaps(u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; }
 
-void clear_overlapping(GRT &r) {
-    for (auto &o : rts)
-        if (!o->depth && overlaps(o->addr, rt_bytes(*o), r.addr, rt_bytes(r))) o->clear_next = o->own = true;
-}
 
 GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
     for (auto &r : rts)
         if (r->addr == addr && r->w == w && r->h == h && r->fmt == fmt && r->depth == depth) return *r;
     static u64 next_id;
     auto r = std::make_unique<GRT>();
-    r->id = ++next_id;
+    r->serial = ++next_id;
     r->addr = addr;
     r->w = w;
     r->h = h;
@@ -861,13 +824,6 @@ void encode_guest_color(VkCommandBuffer cb, const GRT &r, const Buf &dst, VkDevi
     dispatch(cb, K_ENC, {ki(4, *r.tex), kb(0, dst, off)}, prm, nullptr, r.w, r.h);
 }
 
-struct LoadAction {
-    bool clear = false;
-    u32 color = 0;
-    float depth = 0;
-    u32 stencil = 0;
-};
-inline float depth_quantum(u32 fmt) { return fmt == 0 ? 1.0f / 65536.0f : 1.0f / 16777216.0f; }
 
 VkBufferImageCopy buf_copy(VkDeviceSize off, u32 w, u32 h, VkImageAspectFlags aspect, u32 level = 0, s32 x = 0,
                            s32 y = 0) {
@@ -881,41 +837,14 @@ VkBufferImageCopy buf_copy(VkDeviceSize off, u32 w, u32 h, VkImageAspectFlags as
     return c;
 }
 
-// make the GPU copy of a render target match guest memory (if the guest changed since the last sync); uniform
-// contents become a clear of the render pass
+// makes the GPU copy of a render target match guest memory (sync_target): the guest bytes decoded into it, or a clear
+// of the render pass for one value
 LoadAction sync_rt(GRT &r) {
-    LoadAction la;
+    LoadAction la = sync_target(r);
+    if (!la.upload) return la;
     const u8 *p = pptr(r.addr);
-    if (!p) return la;
-    const u64 frame = g_frame.load(std::memory_order_relaxed);
-    if (r.synced && r.checked == frame) return la;
-    const u64 hv = hash_mem(p, rt_bytes(r));
-    r.checked = frame;
-    if (r.synced && hv == r.hash) return la;
-    if (r.own) {
-        r.hash = hv;
-        r.synced = true;
-        return la;
-    }
-    r.synced = true;
-    r.hash = hv;
-    r.gpu_newer = false;
-    const u32 rbpp = r.depth ? (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4) : pixel_bytes(cbuf_to_pixfmt(r.fmt));
-    if (rt_bytes(r) > rbpp && memcmp(p, p + rbpp, rt_bytes(r) - rbpp) == 0) {
-        la.clear = true;
-        if (!r.depth) {
-            la.color = decode_pixel(cbuf_to_pixfmt(r.fmt), p);
-        } else {
-            const u32 z = r.fmt == 0 ? (u32)(p[0] | p[1] << 8) : (u32)(p[0] | p[1] << 8 | p[2] << 16);
-            la.depth = (float)z * depth_quantum(r.fmt);
-            la.stencil = r.fmt == 3 ? p[3] : 0;
-        }
-        return la;
-    }
     const Slice raw = arena(rt_bytes(r));
     memcpy(raw.p, p, rt_bytes(r));
-    r.ms_valid = false;
-    r.version++;
     VkCommandBuffer cb = rec();
     barrier(cb);
     if (!r.depth) {
@@ -940,23 +869,11 @@ LoadAction sync_rt(GRT &r) {
 struct PendingXfer;
 void drain_touching(u32 paddr, u32 size, const GRT *keep, const PendingXfer *skip);
 
-bool guest_kept(GRT &r) {
-    if (hash_mem(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
-    static int logged;
-    if (logged < 8 || g_stats) {
-        logged++;
-        LOG("gpu vulkan: %s target %08x (%ux%u) was rewritten by the game since it was drawn; not written back\n",
-            r.depth ? "depth" : "colour", r.addr, r.w, r.h);
-    }
-    r.gpu_newer = false;
-    r.synced = false;
-    return false;
-}
 
 // write a colour target's GPU contents back to guest memory (box-filtered to 1x)
 void write_back_color(GRT &r) {
     drain_touching(r.addr, rt_bytes(r), nullptr, nullptr);  // (earlier write-backs of this memory land first)
-    if (!guest_kept(r)) return;
+    if (!guest_kept(r, "vulkan")) return;
     ensure_buffer(stage_color, rt_bytes(r));
     VkCommandBuffer cb = new_cb();
     barrier(cb);
@@ -972,7 +889,7 @@ void write_back_color(GRT &r) {
 // write a depth target's GPU contents back to guest memory (top-left sample of each pixel)
 void write_back_depth(GRT &r) {
     drain_touching(r.addr, rt_bytes(r), nullptr, nullptr);
-    if (!guest_kept(r)) return;
+    if (!guest_kept(r, "vulkan")) return;
     const u32 W = r.w * S, H = r.h * S;
     ensure_buffer(stage_depth, (size_t)W * H * 4, Mem::Device);
     ensure_buffer(stage_stencil, (size_t)W * H, Mem::Device);
@@ -1028,31 +945,6 @@ constexpr size_t kTfBudget = 512u << 20;  // beyond: least recently used ones ev
 u32 st_uploads = 0, st_upscaled = 0, st_partial = 0, st_tiles = 0, st_fetch = 0;  // RECOMP_STATS
 double st_upload_ms = 0, st_upscale_ms = 0;
 
-// Guest memory holding GPU output (render targets, or transfer / copy outputs made from them, as long as the bytes
-// are unchanged): render-to-texture, not upscaled. Only tracked while a texture filter is on.
-struct GpuOut {
-    u32 addr, size;
-    u64 hash;
-};
-std::deque<GpuOut> gpu_outs;
-bool gpu_made(u32 addr, u32 size) {
-    for (auto &r : rts)
-        if (overlaps(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_mem(pptr(r->addr), rt_bytes(*r)) == r->hash))
-            return true;
-    for (const GpuOut &g : gpu_outs)
-        if (overlaps(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
-    return false;
-}
-void note_gpu_out(u32 addr, u32 size) {
-    if (!pptr(addr) || !pptr(addr + size - 1)) return;
-    for (auto it = gpu_outs.begin(); it != gpu_outs.end(); ++it)
-        if (it->addr == addr) {
-            gpu_outs.erase(it);
-            break;
-        }
-    gpu_outs.push_back({addr, size, hash_mem(pptr(addr), size)});
-    if (gpu_outs.size() > 64) gpu_outs.pop_front();
-}
 
 // upscale factor of a texture (0: not upscaled): 4x at internal scales above 2, else 2x, up to 1024x1024; never
 // lookup / gradient tables (thin or tiny) or HILO8 (vectors, not colours)
@@ -1274,7 +1166,7 @@ const Img *get_texture(const TexEntry *e, const TexUnitState *up = nullptr, u32 
     m.src = m.mid = nullptr;
     m.prev.clear();
     m.prev.shrink_to_fit();
-    if (f && (m.win_changes > 6 || gpu_made(e->addr, e->size))) f = 0;
+    if (f && (m.win_changes > 6 || gpu_outs.made(rts, e->addr, e->size))) f = 0;
     const bool keep = f && m.changes > 0 && nl == 1;  // rewritten before: keep what partial updates need
     size_t bytes = 0;
     for (u32 l = 0; l < nl + u; l++) bytes += (size_t)std::max(1u, (w * f) >> l) * std::max(1u, (h * f) >> l) * 4;
@@ -1754,16 +1646,12 @@ BufP take_buffer(std::vector<BufP> &fl, size_t n) {
     return make_buf(n, Mem::Readback);
 }
 
-void rts_overwritten(u32 paddr, u32 size) {
-    for (auto &r : rts)
-        if (overlaps(r->addr, rt_bytes(*r), paddr, size)) r->synced = false;
-}
 
 void finalize(PendingXfer &op) {
     wait_value(op.tl, op.depth_wb ? "depth write-back" : "display transfer", op.depth_wb ? op.rt->addr : op.out_paddr);
     GRT &r = *op.rt;
     const u32 nb = rt_bytes(r);
-    if (op.rt_writeback && guest_kept(r)) {
+    if (op.rt_writeback && guest_kept(r, "vulkan")) {
         op.gbytes->invalidate();
         r.hash = copy_hash(pptr(r.addr), op.gbytes->p, nb);
         r.checked = g_frame.load(std::memory_order_relaxed);
@@ -1777,8 +1665,8 @@ void finalize(PendingXfer &op) {
     op.obytes->invalidate();
     const u64 out_hash = copy_hash(pptr(op.out_paddr), op.obytes->p, op.out_size);
     texcache_invalidate(op.out_paddr, op.out_size);
-    rts_overwritten(op.out_paddr, op.out_size);
-    if (tf_mode) note_gpu_out(op.out_paddr, op.out_size);
+    rts_overwritten(rts, op.out_paddr, op.out_size);
+    if (tf_mode) gpu_outs.note(op.out_paddr, op.out_size);
     xbuf_free.push_back(std::move(op.gbytes));
     xbuf_free.push_back(std::move(op.obytes));
     std::lock_guard<std::mutex> lk(disp_mtx);
@@ -1888,14 +1776,6 @@ bool gpu_valid(const GRT &r) {
         if (op->rt == &r && op->rt_writeback) return true;
     return false;
 }
-GRT *find_view(u32 addr, u32 w, u32 fmt, bool depth, bool any = false) {
-    GRT *best = nullptr;
-    for (auto &r : rts)
-        if (r->depth == depth && (r->synced || any) && r->addr == addr && r->w == w && r->fmt == fmt && (!best || r->h > best->h))
-            best = r.get();
-    return best;
-}
-GRT *find_color(u32 addr, u32 w, u32 fmt) { return find_view(addr, w, fmt, false); }
 
 // clears an image now (outside a pass)
 void clear_image(const Img &im, bool depth, u32 color, float z, u32 stencil) {
@@ -1952,7 +1832,7 @@ GRT *grow(GRT &old, u32 h) {
 }
 
 GRT &target_for(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
-    GRT *t = find_view(addr, w, fmt, depth, true);
+    GRT *t = find_view(rts, addr, w, fmt, depth, true);
     if (t && t->h == h) return *t;
     if (t && t->h < h && t->gpu_newer)
         if (GRT *n = grow(*t, h)) return *n;
@@ -1963,26 +1843,15 @@ void drop_displays(u32 paddr, u32 size, bool definite);
 
 bool claim(GRT *src, GRT *dst, u32 paddr, u32 size) {
     drain_touching(paddr, size);
-    bool changed = false;
-    for (auto &r : rts) {
-        if (r.get() == src || r.get() == dst || !overlaps(r->addr, rt_bytes(*r), paddr, size)) continue;
-        if (r->gpu_newer) {
-            if (r->addr >= paddr && r->addr + rt_bytes(*r) <= paddr + size) {
-                r->gpu_newer = false;
-            } else {
-                if (r->depth) write_back_depth(*r);
-                else write_back_color(*r);
-                changed = true;
-            }
-        }
-        r->synced = false;
-    }
-    return changed;
+    return claim_memory(rts, src, dst, paddr, size, [](GRT &r) {
+        if (r.depth) write_back_depth(r);
+        else write_back_color(r);
+    });
 }
 
 GRT *dest_surface(u32 addr, u32 w, u32 h, u32 fmt, GRT *src, u32 bytes) {
     if (overlaps(addr, bytes, src->addr, rt_bytes(*src))) return nullptr;
-    GRT *d = find_color(addr, w, fmt);
+    GRT *d = find_color(rts, addr, w, fmt);
     if (d && overlaps(d->addr, rt_bytes(*d), src->addr, rt_bytes(*src))) return nullptr;
     if (claim(src, d, addr, bytes)) return nullptr;
     if (!d) {
@@ -2009,20 +1878,20 @@ struct Snap {
 };
 std::unordered_map<u64, Snap> snaps;
 const Img *surface_snapshot(u32 addr, u32 w, u32 h, u32 fmt) {
-    GRT *r = find_color(addr, w, fmt);
+    GRT *r = find_color(rts, addr, w, fmt);
     if (!r || r->h < h) return nullptr;
     Snap &sn = snaps[(u64)addr << 32 ^ (u64)w << 20 ^ (u64)h << 4 ^ fmt];
     if (!sn.tex || sn.tex->w != w * S || sn.tex->h != h * S) {
         sn.tex = make_img(w * S, h * S, VK_FORMAT_R8G8B8A8_UNORM, 1, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_STORAGE_BIT);
         sn.id = 0;
-    } else if (sn.id == r->id && sn.version == r->version) {
+    } else if (sn.id == r->serial && sn.version == r->version) {
         return sn.tex.get();
     }
     VkCommandBuffer cb = rec();
     barrier(cb);
     const u32 p[4] = {w * S, h * S, fmt == 1 || fmt == 3 ? 1u : 0u, 0};  // RGB8, RGB565: no alpha
     dispatch(cb, K_SNAP, {ki(4, *r->tex), ki(5, *sn.tex)}, p, nullptr, w * S, h * S);
-    sn.id = r->id;
+    sn.id = r->serial;
     sn.version = r->version;
     return sn.tex.get();
 }
@@ -2471,9 +2340,9 @@ const char *vk_texture_filter_name(int mode) {
     static const char *const names[kVkTfCount] = {"Off", "Sharp", "Smooth"};
     return mode >= 0 && mode < kVkTfCount ? names[mode] : "?";
 }
-bool vk_gpu_made(u32 paddr, u32 size) { return active && tf_mode && size && gpu_made(paddr, size); }
+bool vk_gpu_made(u32 paddr, u32 size) { return active && tf_mode && size && gpu_outs.made(rts, paddr, size); }
 void vk_note_gpu_output(u32 paddr, u32 size) {
-    if (active && tf_mode && size) note_gpu_out(paddr, size);
+    if (active && tf_mode && size) gpu_outs.note(paddr, size);
 }
 
 namespace {
@@ -2554,14 +2423,14 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         LOG("gpu vulkan: texture filter %s -> %s\n", vk_texture_filter_name(tf_mode), vk_texture_filter_name(wf));
         tf_mode = wf;
         tf_drop_all();
-        gpu_outs.clear();
+        gpu_outs.outs.clear();
     }
     flush_no++;
     bool uses_depth = false;
     for (const MSeg &seg : mb.segs) uses_depth |= seg.ds->depth_test || seg.ds->depth_write || seg.ds->stencil;
     const bool has_dep = uses_depth && rt.depth_addr && pptr(rt.depth_addr);
-    const GRT *tall_c = find_view(rt.color_addr, rt.w, rt.color_fmt, false, true);
-    const GRT *tall_d = has_dep ? find_view(rt.depth_addr, rt.w, rt.depth_fmt, true, true) : nullptr;
+    const GRT *tall_c = find_view(rts, rt.color_addr, rt.w, rt.color_fmt, false, true);
+    const GRT *tall_d = has_dep ? find_view(rts, rt.depth_addr, rt.w, rt.depth_fmt, true, true) : nullptr;
     const u32 hc = std::max(rt.h, tall_c ? tall_c->h : 0u), hd = has_dep ? std::max(rt.h, tall_d ? tall_d->h : 0u) : hc;
     const u32 H = hc == hd ? hc : rt.h;
     GRT &col = target_for(rt.color_addr, rt.w, H, rt.color_fmt, false);
@@ -2580,7 +2449,7 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         if (o->gpu_newer) {
             if (o->depth && ov_c && !ov_d && !eager_writeback && col.addr >= o->addr &&
                 col.addr + rt_bytes(col) <= o->addr + rt_bytes(*o) && (col.addr - o->addr) % storage_align == 0 &&
-                guest_kept(*o))
+                guest_kept(*o, "vulkan"))
                 dsrc = defer_depth_writeback(*o);
             else if (o->depth) write_back_depth(*o);
             else write_back_color(*o);
@@ -2592,7 +2461,7 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
     for (const MSeg &seg : mb.segs)
         for (const TexUnitState &t : seg.ds->tex) {
             if (!t.surf || surf_decoded.count(surf_key(t))) continue;
-            GRT *r = find_color(t.surf_addr, t.w, t.surf_fmt);
+            GRT *r = find_color(rts, t.surf_addr, t.w, t.surf_fmt);
             if (r && r->h >= t.h) continue;
             vk_guest_read(t.surf_addr, t.w * t.h * pixel_bytes(cbuf_to_pixfmt(t.surf_fmt)));
             surf_decoded[surf_key(t)] = texcache_get(t.surf_addr, t.w, t.h, t.surf_fmt, 1);
@@ -2709,20 +2578,12 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
     preps.reserve(mb.segs.size());
     size_t uoff = 0;
     auto ualloc = [&](size_t n) {
-        const size_t o = (uoff + 255) & ~(size_t)255;
+        const size_t o = (uoff + kUniformAlign - 1) & ~(kUniformAlign - 1);
         uoff = o + n;
         return o;
     };
-    // first pass: size (a uniform block for each draw, each distinct LUT snapshot once)
-    std::unordered_map<const void *, size_t> lut_map;  // a snapshot's place in the buffer
-    size_t need = mb.segs.size() * (256 + sizeof(Uni));
-    for (const MSeg &seg : mb.segs) {
-        const DrawState &ds = *seg.ds;
-        if (ds.lighting && lut_map.emplace(ds.light.luts.get(), 0).second) need += 256 + sizeof(LightLuts);
-        if (ds.fog && lut_map.emplace(ds.fog_lut.get(), 0).second) need += 256 + sizeof(FogLut);
-    }
-    lut_map.clear();
-    const Slice us = arena(need);
+    std::unordered_map<const void *, size_t> lut_map;  // a LUT snapshot's place in the buffer
+    const Slice us = arena(uniform_bytes(mb));
     u8 *ub = us.p;
     for (const MSeg &seg : mb.segs) {
         const DrawState &ds = *seg.ds;
@@ -2748,58 +2609,14 @@ void vk_flush(const RTConfig &rt, const MBatch &mb) {
         pr.fetch = fetch;
         st_fetch += fetch;
         if (fetch && g_stats) LOG("gpu vulkan: draw blending in the shader (logic op %u, blend %u)\n", ds.logic_op, ds.blend);
-        pr.sc = {{0, 0}, {rt.w * S, rt.h * S}};
-        if (ds.scissor_mode == 3) {
-            const s32 x1 = std::clamp<s32>(ds.sc_x1, 0, rt.w), x2 = std::clamp<s32>(ds.sc_x2, 0, rt.w);
-            const s32 y1 = std::clamp<s32>(ds.sc_y1, 0, rt.h), y2 = std::clamp<s32>(ds.sc_y2, 0, rt.h);
-            if (x2 <= x1 || y2 <= y1) continue;
-            pr.sc = {{(s32)(x1 * S), (s32)((rt.h - y2) * S)}, {(u32)(x2 - x1) * S, (u32)(y2 - y1) * S}};
-        }
+        u32 sc[4];
+        if (!scissor_rect(ds, rt, S, sc)) continue;
+        pr.sc = {{(s32)sc[0], (s32)sc[1]}, {sc[2], sc[3]}};
         pr.uo = ualloc(sizeof(Uni));
         Uni &u = *(Uni *)(ub + pr.uo);
-        memset(&u, 0, sizeof u);
-        u.rt[0] = (float)rt.w;
-        u.rt[1] = (float)rt.h;
-        u.rt[2] = (float)S;
-        u.rt[3] = (float)((1u << ds.depth_bits) - 1);
-        u.depth[0] = ds.depth_scale;
-        u.depth[1] = ds.depth_offset;
-        u.depth[2] = ds.depth_bits == 16 ? 1.0f / 65536.0f : 1.0f / 16777216.0f;
-        u.scissor[0] = ds.sc_x1;
-        u.scissor[1] = ds.sc_y1;
-        u.scissor[2] = ds.sc_x2;
-        u.scissor[3] = ds.sc_y2;
-        for (int k = 0; k < 6; k++) u.konst[k] = ds.tev[k].konst;
-        u.tevc[0] = ds.tev_init_out;
-        u.tevc[1] = ds.tev_init_buf;
-        u.tevc[2] = ds.tev_init_next;
-        u.misc[0] = ds.blend_color;
-        u.misc[1] = ds.fog_color;
-        u.misc[2] = ds.alpha_ref;
-        u.misc[3] = ds.tex[0].shadow_bias;
-        for (int k = 0; k < 3; k++) {
-            u.border[k] = ds.tex[k].border;
-            u.bias[k] = ds.tex[k].bias;
-        }
+        fill_uniforms(u, ds, rt, S);
         if (ds.lighting) {
             const LightingState &l = ds.light;
-            const LutSel *sels[7] = {&l.d0, &l.d1, &l.sp, &l.fr, &l.rb, &l.rg, &l.rr};
-            for (int k = 0; k < 7; k++) u.lscale[k] = sels[k]->scale;
-            for (int k = 0; k < 3; k++) u.ambient[k] = l.global_ambient[k];
-            for (u32 k = 0; k < l.num_lights; k++) {
-                const LightState &s = l.lights[k];
-                LightU &d = u.lights[k];
-                for (int c = 0; c < 3; c++) {
-                    d.spec0[c] = s.spec0[c];
-                    d.spec1[c] = s.spec1[c];
-                    d.diffuse[c] = s.diffuse[c];
-                    d.ambient[c] = s.ambient[c];
-                    d.pos[c] = s.pos[c];
-                    d.spot[c] = s.spot[c];
-                }
-                d.att[0] = s.da_scale;
-                d.att[1] = s.da_bias;
-            }
             const void *lk = l.luts.get();
             auto it = lut_map.find(lk);
             if (it == lut_map.end()) {
@@ -3200,20 +3017,6 @@ void drop_displays(u32 paddr, u32 size, bool definite) {
     }
 }
 
-GRT *transfer_source(u32 in_paddr, u32 in_dims, u32 out_dims, u32 &row0) {
-    const u32 in_w = in_dims & 0xffff, out_h0 = out_dims >> 16;
-    GRT *src = nullptr;
-    for (auto &r : rts) {
-        if (r->depth || !r->synced || r->w != in_w || in_paddr < r->addr) continue;
-        const u32 line = r->w * pixel_bytes(cbuf_to_pixfmt(r->fmt));
-        const u32 off = in_paddr - r->addr;
-        if (off % (line * 8) || off / line + out_h0 > r->h) continue;
-        src = r.get();
-        row0 = off / line;
-    }
-    if (src && (out_dims & 0xffff) > src->w) return nullptr;  // (narrower: the transfer keeps the first columns)
-    return src;
-}
 
 // rows x TW (scaled) of a target as an upright image: TW its first columns (all of them, or fewer for a transfer
 // keeping only those), from row row0 (1x)
@@ -3259,7 +3062,7 @@ void clear_now(GRT &r) {
 bool vk_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
     if (!active || eager_writeback || (flags & 2)) return false;
     u32 row0 = 0;
-    GRT *src = transfer_source(in_paddr, in_dims, out_dims, row0);
+    GRT *src = transfer_source(rts, in_paddr, in_dims, out_dims, row0);
     if (!src || overlaps(src->addr, rt_bytes(*src), out_paddr, out_size)) return false;
     bool writing_back = false;  // a pending transfer writes the target back already
     for (auto &op : pending)
@@ -3294,7 +3097,7 @@ bool vk_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u
     op->tl = submit();
     src->gpu_newer = false;
     src->own = false;
-    if (clear_after_top) clear_overlapping(*src);
+    if (clear_after_top) clear_overlapping(rts, *src);
     op->rt = src;
     op->in_paddr = in_paddr;
     op->out_paddr = out_paddr;
@@ -3382,7 +3185,7 @@ bool vk_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32
 
 bool vk_surface_for(u32 addr, u32 w, u32 h, u32 fmt) {
     if (!active || fmt > 4) return false;
-    GRT *r = find_color(addr, w, fmt);
+    GRT *r = find_color(rts, addr, w, fmt);
     if (!r || !gpu_valid(*r) || r->clear_next) return false;
     if (r->h < h) r = grow(*r, h);
     return r != nullptr;
@@ -3392,7 +3195,7 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
     if (!active) return;
     if (flags & 2) return;
     u32 row0 = 0;
-    GRT *src = transfer_source(in_paddr, in_dims, out_dims, row0);
+    GRT *src = transfer_source(rts, in_paddr, in_dims, out_dims, row0);
     if (!src) {
         if (g_stats)
             LOG("gpu vulkan: transfer %08x -> %08x (%08x -> %08x, flags %08x): no matching render target, no display image\n",
@@ -3426,7 +3229,7 @@ void vk_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims,
     d.incomplete = src->skipped > 0;
     src->skipped = 0;
     src->own = false;
-    if (clear_after_top) clear_overlapping(*src);
+    if (clear_after_top) clear_overlapping(rts, *src);
 }
 
 void vk_set_clear_after_top_transfer(bool on) { clear_after_top = on; }
