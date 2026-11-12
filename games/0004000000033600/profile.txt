@@ -1,0 +1,10 @@
+# The Legend of Zelda: Ocarina of Time 3D (EUR). Format: runtime/profile.cpp.
+
+# ---- a free camera on the right stick (runtime/freecam.cpp), as Majora's Mask 3D has on the C-stick. The camera's
+# update, Camera_Update(Vec3s *direction out, Camera *) in the OoT decompilation's names, is 0x2d84c4 (called
+# through the dispatcher: dispatched.txt); its collision check, Camera_BGCheckInfo(Camera *, Vec3f *from,
+# CamColChk *to), is 0x3553fc; the save context is at 0x587958. The game mode (save context + 0x14e4) is 0 while
+# playing (title screen, file select and the opening's cutscenes are other modes).
+value game_mode = s32 0x588e3c
+camera update 0x2d84c4 collide 0x3553fc save 0x587958
+camera when game_mode == 0

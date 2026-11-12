@@ -11,4 +11,5 @@ for M in save/missing_functions.txt "$HOME/Library/Application Support/3dsrecomp
 done
 sort -u -o games/$TID/functions.txt games/$TID/functions.txt
 PY=python3; [ -x .venv/bin/python ] && PY=.venv/bin/python  # the recompiler needs only the standard library
-$PY -m tools.recomp.gen $D generated/$N --extra games/$TID/functions.txt
+# (dispatched.txt: functions the runtime hooks, whose direct calls go through the dispatcher)
+$PY -m tools.recomp.gen $D generated/$N --extra games/$TID/functions.txt --dispatched games/$TID/dispatched.txt

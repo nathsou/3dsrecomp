@@ -74,6 +74,9 @@ void run_guest(CPU *c);  // runs until the thread returns to EXIT_MAGIC
 constexpr u32 EXIT_MAGIC = 0xFFFF0000u;
 // Guest calls made by the host, on a guest thread: the hook runs when a thread dispatches to <addr> (an indirect
 // call, such as a virtual method, is about to run there), and may call guest functions with rt_guest_call, which
-// leaves the thread's state as it found it. Up to 4 hooks (several may share an address).
+// leaves the thread's state as it found it. A hook that sets c->pc to c->r[14] makes the call return there instead
+// of running the function (the hook does its work, with rt_guest_call to the function itself if it wants). Up to 4
+// hooks (several may share an address). Direct calls are not dispatched, except calls to the functions a game's
+// games/<title id>/dispatched.txt lists (tools/recomp/gen.py --dispatched).
 void rt_add_dispatch_hook(u32 addr, void (*hook)(CPU *c));
 u32 rt_guest_call(CPU *c, u32 fn, u32 a0 = 0, u32 a1 = 0, u32 a2 = 0, u32 a3 = 0);  // fn's r0

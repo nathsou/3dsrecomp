@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "aim.h"
+#include "freecam.h"
 #include "audio_iface.h"
 #include "gpu_iface.h"
 #include "kernel.h"
@@ -1232,8 +1233,8 @@ static void present() {
 }
 
 // scripted input for testing: RECOMP_INPUT="frame:BUTTONS:duration,..." (BUTTONS like A+START; T@x/y touches
-// the bottom screen at pixel x, y)
-struct ScriptEntry { u64 frame, dur; u32 buttons; int cx, cy, tx = -1, ty = -1; };
+// the bottom screen at pixel x, y; RSUP, RSDOWN, RSLEFT, RSRIGHT push the right stick)
+struct ScriptEntry { u64 frame, dur; u32 buttons; int cx, cy, tx = -1, ty = -1; float rsx = 0, rsy = 0; };
 // host keys for testing the menu: "frame:KEY_<SDL key name>" (KEY_Escape, KEY_Down, KEY_Return...), typed text
 // ("frame:TEXT_<text>", for the software keyboard, or taps on the game's own keyboard from the profile's keys), the mouse in layout coordinates: "frame:MOUSE_DOWN@x/y"
 // (also MOUSE_MOVE, MOUSE_UP) and "frame:MOUSE_WHEEL@x/y/dy", and fingers in window points for the touch controls:
@@ -1312,7 +1313,12 @@ static void parse_script() {
         if (has("CDOWN")) cy = -155;
         int tx = -1, ty = -1;
         if (size_t t = n.find("T@"); t != std::string::npos) sscanf(n.c_str() + t + 2, "%d/%d", &tx, &ty);
-        script.push_back({f, d, b, cx, cy, tx, ty});
+        float rsx = 0, rsy = 0;
+        if (has("RSUP")) rsy = 1;
+        if (has("RSDOWN")) rsy = -1;
+        if (has("RSLEFT")) rsx = -1;
+        if (has("RSRIGHT")) rsx = 1;
+        script.push_back({f, d, b, cx, cy, tx, ty, rsx, rsy});
     }
 }
 
@@ -1337,6 +1343,11 @@ static u32 host_input(float &rsx, float &rsy) {
     if (h & H_RSDOWN) rsy = -1;
     if (h & H_RSLEFT) rsx = -1;
     if (h & H_RSRIGHT) rsx = 1;
+    for (auto &e : script)
+        if (frame_count >= e.frame && frame_count < e.frame + e.dur) {
+            if (e.rsx) rsx = e.rsx;
+            if (e.rsy) rsy = e.rsy;
+        }
     if (!pad) return h;
     const std::pair<SDL_GamepadButton, u32> btns[] = {
         {SDL_GAMEPAD_BUTTON_EAST, H_A}, {SDL_GAMEPAD_BUTTON_SOUTH, H_B}, {SDL_GAMEPAD_BUTTON_NORTH, H_X},
@@ -1387,6 +1398,7 @@ static void poll_input(u32 &buttons, s16 &cx, s16 &cy, bool &touch, u16 &tx, u16
     float rsx, rsy;
     const u32 host = host_input(rsx, rsy);
     update_aim(rsx, rsy);
+    if (freecam::update(rsx, rsy)) rsx = rsy = 0;  // (the right stick turns the camera: no pointer, no binds)
     constexpr float CSTICK_RADIUS = 0x7FF;
     const bool own = onescreen::active();
     sx = own ? 0 : (s16)(rsx * CSTICK_RADIUS);

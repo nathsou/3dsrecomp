@@ -292,8 +292,12 @@ u32 rt_guest_call(CPU *c, u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
 // everything but a cached target without tracing (rt_dispatch's fast path)
 __attribute__((noinline, cold)) static void dispatch_slow(CPU *c) {
     trace(c, "dispatch");
-    for (int i = 0, n = hook_count; i < n; i++)
-        if (c->pc == hooks[i].addr) hooks[i].fn(c);
+    const u32 pc = c->pc;
+    for (int i = 0, n = hook_count; i < n; i++) {
+        if (pc != hooks[i].addr) continue;
+        hooks[i].fn(c);
+        if (c->pc != pc) return;  // (the hook made the call return: pc is lr, where the caller goes on)
+    }
     if (__builtin_expect(c->pc == CALL_RETURN, 0)) return;  // (an indirect return from rt_guest_call's function)
     const GuestEntry *e = lookup_cached(c->pc);
     if (__builtin_expect(!e, 0)) {

@@ -1,0 +1,2 @@
+# Functions the runtime hooks: their direct calls go through the dispatcher (tools/recomp/gen.py --dispatched).
+2d84c4  # Camera_Update (the free camera, profile.txt)

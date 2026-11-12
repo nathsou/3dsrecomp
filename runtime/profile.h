@@ -112,6 +112,14 @@ struct Aim {
     int cond = -2;                                // when it applies (-2: never)
 };
 
+// a free camera on the right stick, for games of Ocarina of Time 3D's engine (runtime/freecam.cpp)
+struct Camera {
+    u32 update = 0;   // the camera's update, Camera_Update(Vec3s *direction out, Camera *)
+    u32 collide = 0;  // its collision check (Camera *, Vec3f *from, CamColChk *to): moves a point in front of walls
+    u32 save = 0;     // the save context (Link's age, Master Quest's mirrored world)
+    int cond = -2;    // when it applies (-2: never)
+};
+
 bool load();              // games/<title id>/profile.txt (or RECOMP_PROFILE); false if the game has none
 bool loaded();
 bool has_focus_rules();
@@ -136,6 +144,7 @@ const std::vector<MapArea> &map_areas();
 const Tools &tools();
 const Stacks &stacks();
 const Aim &aim();
+const Camera &camera();
 // read from guest memory now, from any thread (runtime flags: as of the last update)
 bool value_now(int i, s64 &v, u32 *at = nullptr);
 bool cond_now(int i);

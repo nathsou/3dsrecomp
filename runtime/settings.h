@@ -33,6 +33,8 @@ struct Settings {
     int hud = 1;              // the profile's HUD over the top screen: 0 off, 1 when the bottom screen is hidden, 2 always
     int tex_filter = 0;       // texture upscaling (gpu::texture_filter_name)
     bool stack_items = true;   // stacks in the pockets, for games whose profile has them (runtime/stacks.cpp)
+    bool free_camera = true;       // the right stick turns the camera, for games whose profile has it (freecam.cpp)
+    bool camera_invert_y = false;  // ...pushed up, it looks down
 };
 
 extern Settings g_settings;
