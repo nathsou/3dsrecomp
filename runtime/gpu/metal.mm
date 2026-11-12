@@ -23,6 +23,7 @@
 #include <unordered_map>
 
 #include "gpu/fsgen.h"
+#include "gpu/hwshared.h"
 #include "gpu/vsblob.h"
 #include "gpu/pica.h"
 #include "gpu/texfilter.h"
@@ -417,24 +418,6 @@ kernel void k_snap(texture2d<float, access::read> src [[texture(0)]], texture2d<
 }
 )";
 
-// C++ mirror of the MSL uniform block
-struct alignas(16) LightU {
-    float spec0[4], spec1[4], diffuse[4], ambient[4], pos[4], spot[4], att[4];
-};
-struct alignas(16) Uni {
-    float rt[4];
-    float depth[4];
-    s32 scissor[4];
-    u32 konst[8];
-    u32 tevc[4];
-    u32 misc[4];
-    u32 border[4];
-    float bias[4];
-    float lscale[8];
-    float ambient[4];
-    LightU lights[8];
-};
-static_assert(sizeof(Uni) == 16 * 12 + 8 * 112, "uniform layout");
 
 // ---------------------------------------------------------------- device state
 id<MTLDevice> dev;
@@ -576,48 +559,26 @@ void ensure_buffer(id<MTLBuffer> __strong &b, size_t n) {
 }
 
 // ---------------------------------------------------------------- render targets
-struct GRT {
-    u32 addr = 0, w = 0, h = 0, fmt = 0;
-    bool depth = false;
+struct GRT : TargetState {  // (the bookkeeping in hwshared.h)
     id<MTLTexture> tex;
     id<MTLTexture> stencil_view;  // tex's stencil as a texture (MSAA restore)
     id<MTLTexture> ms;       // with MSAA: the multisampled target, resolved into tex at the end of each pass
-    bool ms_valid = false;   // ms matches tex (else it is restored from tex before drawing; never with ms_memoryless)
-    bool synced = false;     // GPU copy corresponds to guest memory as hashed below
-    u64 hash = 0;
-    u64 checked = 0;         // g_frame when guest memory last matched the hash
-    u64 id = 0;              // unique among all targets ever made
-    u64 version = 0;         // changes whenever the GPU copy does
-    bool gpu_newer = false;  // depth/stencil changes not yet written to guest memory
-    u32 skipped = 0;         // draws left out since its last display transfer (pipelines still compiling)
-    bool clear_next = false; // set_clear_after_top_transfer: cleared to transparent before it is drawn into again,
-    bool own = false;        // ... and its GPU copy kept (guest memory ignored) until its own next display transfer
 };
 std::atomic<bool> clear_after_top{false};
 std::atomic<bool> key_black_bottom{false};  // set_key_black_bottom
 
-std::vector<std::unique_ptr<GRT>> rts;
+TargetList<GRT> rts;
+GpuOutputs gpu_outs;  // (texture filter: guest memory holding GPU output)
 
-bool overlaps(u32 a, u32 an, u32 b, u32 bn) { return a < b + bn && b < a + an; }
 
-// a target's bytes per pixel in guest memory
-u32 rt_bpp(const GRT &r) { return r.depth ? (r.fmt == 0 ? 2 : r.fmt == 2 ? 3 : 4) : pixel_bytes(cbuf_to_pixfmt(r.fmt)); }
-u32 rt_bytes(const GRT &r) {
-    return r.w * r.h * rt_bpp(r);
-}
 
-// (set_clear_after_top_transfer) the colour targets in the same memory as r: cleared before their next draw
-void clear_overlapping(GRT &r) {
-    for (auto &o : rts)
-        if (!o->depth && overlaps(o->addr, rt_bytes(*o), r.addr, rt_bytes(r))) o->clear_next = o->own = true;
-}
 
 GRT &get_rt(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
     for (auto &r : rts)
         if (r->addr == addr && r->w == w && r->h == h && r->fmt == fmt && r->depth == depth) return *r;
     static u64 next_id;
     auto r = std::make_unique<GRT>();
-    r->id = ++next_id;
+    r->serial = ++next_id;
     r->addr = addr;
     r->w = w;
     r->h = h;
@@ -693,54 +654,17 @@ void encode_guest_color(id<MTLComputeCommandEncoder> ce, const GRT &r, id<MTLBuf
     dispatch2d(ce, r.w, r.h);
 }
 
-struct LoadAction {
-    bool clear = false;
-    u32 color = 0;       // packed RGBA
-    float depth = 0;
-    u32 stencil = 0;
-};
 
-inline float depth_quantum(u32 fmt) { return fmt == 0 ? 1.0f / 65536.0f : 1.0f / 16777216.0f; }
 
-// make the GPU copy of a render target match guest memory (if the guest changed since the last
-// sync); uniform contents become a clear of the render pass
+// makes the GPU copy of a render target match guest memory (sync_target): the guest bytes decoded into it, or a clear
+// of the render pass for one value
 LoadAction sync_rt(GRT &r, id<MTLCommandBuffer> cb) {
-    LoadAction la;
+    LoadAction la = sync_target(r);
+    if (!la.upload) return la;
     const u8 *p = pptr(r.addr);
-    if (!p) return la;
-    // Checked during this frame already: writes reported since (GPU operations, cache flushes, DMA) clear synced, and a
-    // CPU write the game does not flush out of its data cache would not reach a 3DS GPU before the frame's end either.
-    const u64 frame = g_frame.load(std::memory_order_relaxed);
-    if (r.synced && r.checked == frame) return la;
-    const u64 hv = hash_mem(p, rt_bytes(r));
-    r.checked = frame;
-    if (r.synced && hv == r.hash) return la;
-    if (r.own) {  // (cleared after a transfer to the top screen: the top screen's write-back is not its picture)
-        r.hash = hv;
-        r.synced = true;
-        return la;
-    }
-    r.synced = true;
-    r.hash = hv;
-    r.gpu_newer = false;
-    // a target filled with one value (typically a memory fill clearing it): bytes repeat every pixel
-    const u32 rbpp = rt_bpp(r);
-    if (rt_bytes(r) > rbpp && memcmp(p, p + rbpp, rt_bytes(r) - rbpp) == 0) {
-        la.clear = true;
-        if (!r.depth) {
-            la.color = decode_pixel(cbuf_to_pixfmt(r.fmt), p);
-        } else {
-            const u32 z = r.fmt == 0 ? (u32)(p[0] | p[1] << 8) : (u32)(p[0] | p[1] << 8 | p[2] << 16);
-            la.depth = (float)z * depth_quantum(r.fmt);
-            la.stencil = r.fmt == 3 ? p[3] : 0;
-        }
-        return la;
-    }
     // otherwise the guest bytes as they are, decoded by the GPU
     const Slice raw = arena(rt_bytes(r));
     memcpy(raw.p, p, rt_bytes(r));
-    r.ms_valid = false;
-    r.version++;
     if (!r.depth) {
         id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
         label(ce, "upload %08x %ux%u", r.addr, r.w, r.h);
@@ -789,25 +713,10 @@ void wait_cb(id<MTLCommandBuffer> cb, const char *why, u32 addr) {
     if (t > 0.05) LOG("gpu metal: waited %.2f ms for the GPU (%s %08x)\n", t, why, addr);
 }
 
-// Before writing a target back: the guest memory must still hold what it held when the GPU copy took over. A
-// game that freed a target and reused its memory (heap objects, other buffers) has written it since, and on the
-// 3DS those later CPU writes land on top of what the GPU drew: the guest's bytes win, the GPU copy is dropped.
-bool guest_kept(GRT &r) {
-    if (hash_mem(pptr(r.addr), rt_bytes(r)) == r.hash) return true;
-    static int logged;
-    if (logged < 8 || g_stats) {
-        logged++;
-        LOG("gpu metal: %s target %08x (%ux%u) was rewritten by the game since it was drawn; not written back\n",
-            r.depth ? "depth" : "colour", r.addr, r.w, r.h);
-    }
-    r.gpu_newer = false;
-    r.synced = false;
-    return false;
-}
 
 // write a colour target's GPU contents back to guest memory (box-filtered to 1x)
 void write_back_color(GRT &r) {
-    if (!guest_kept(r)) return;
+    if (!guest_kept(r, "metal")) return;
     ensure_buffer(stage_color, rt_bytes(r));
     id<MTLCommandBuffer> cb = list_cb();
     id<MTLComputeCommandEncoder> ce = [cb computeCommandEncoder];
@@ -824,7 +733,7 @@ void write_back_color(GRT &r) {
 
 // write a depth target's GPU contents back to guest memory (top-left sample of each pixel)
 void write_back_depth(GRT &r) {
-    if (!guest_kept(r)) return;
+    if (!guest_kept(r, "metal")) return;
     const u32 W = r.w * S, H = r.h * S;
     ensure_buffer(stage_depth, (size_t)W * H * 4);
     ensure_buffer(stage_stencil, (size_t)W * H);
@@ -894,31 +803,6 @@ id<MTLCommandBuffer> tf_cb;               // this flush's upscaling work, commit
 u32 st_uploads = 0, st_upscaled = 0, st_partial = 0, st_tiles = 0;  // RECOMP_STATS
 double st_upload_ms = 0, st_upscale_ms = 0, st_upscale_gpu = 0;      // st_upscale_gpu: under busy_mtx
 
-// Guest memory holding GPU output (render targets, or transfer / copy outputs made from them, as long as the
-// bytes are unchanged): render-to-texture, not upscaled. Only tracked while a texture filter is on.
-struct GpuOut {
-    u32 addr, size;
-    u64 hash;
-};
-std::deque<GpuOut> gpu_outs;
-bool gpu_made(u32 addr, u32 size) {
-    for (auto &r : rts)
-        if (overlaps(r->addr, rt_bytes(*r), addr, size) && (r->gpu_newer || hash_mem(pptr(r->addr), rt_bytes(*r)) == r->hash))
-            return true;
-    for (const GpuOut &g : gpu_outs)
-        if (overlaps(g.addr, g.size, addr, size) && hash_mem(pptr(g.addr), g.size) == g.hash) return true;
-    return false;
-}
-void note_gpu_out(u32 addr, u32 size) {
-    if (!pptr(addr) || !pptr(addr + size - 1)) return;
-    for (auto it = gpu_outs.begin(); it != gpu_outs.end(); ++it)
-        if (it->addr == addr) {
-            gpu_outs.erase(it);
-            break;
-        }
-    gpu_outs.push_back({addr, size, hash_mem(pptr(addr), size)});
-    if (gpu_outs.size() > 64) gpu_outs.pop_front();
-}
 
 // upscale factor of a texture (0: not upscaled): 4x at internal scales above 2, else 2x, up to 1024x1024;
 // never lookup / gradient tables (thin or tiny) or HILO8 (vectors, not colours)
@@ -1081,7 +965,7 @@ id<MTLTexture> get_texture(const TexEntry *e, const TexUnitState *up = nullptr, 
     m.src = m.mid = nil;
     m.prev.clear();
     m.prev.shrink_to_fit();
-    if (f && (m.win_changes > 6 || gpu_made(e->addr, e->size))) f = 0;
+    if (f && (m.win_changes > 6 || gpu_outs.made(rts, e->addr, e->size))) f = 0;
     // rewritten before: keep what partial updates need
     const bool keep = f && m.changes > 0 && nl == 1;
     size_t bytes = 0;
@@ -1232,11 +1116,11 @@ struct Pipe {
 std::mutex pipe_mtx;
 std::condition_variable pipe_cv;
 std::unordered_map<std::string, std::unique_ptr<Pipe>> pipe_cache;
+ShaderList pipe_list;  // known pipelines (hwshared.h)
 std::deque<std::string> pipe_queue;
 int pipe_workers = 0;
 id<MTLLibrary> pre_lib;  // shaders.metallib
 id<MTLFunction> pre_vs;
-FILE *key_log;  // the user's pipeline list, appended to
 bool dump_shaders = false, sync_shaders = false, verify_keys = false;
 struct {
     u32 lib = 0, src = 0, fresh = 0, waited = 0, skipped = 0;
@@ -1348,11 +1232,7 @@ void start_workers() {
 
 // with pipe_mtx held
 void record_key(const std::string &key) {
-    if (!key_log) return;
-    const u32 n = (u32)key.size();
-    fwrite(&n, 4, 1, key_log);
-    fwrite(key.data(), 1, n, key_log);
-    fflush(key_log);
+    pipe_list.record(key);
 }
 
 void verify_key(const std::string &key, const DrawState &ds) {
@@ -1368,7 +1248,7 @@ std::string exe_dir() {
     return std::filesystem::path(exe).parent_path().string();
 }
 
-void vs_kernels_init(const std::string &tid);
+void vs_kernels_init();
 // the shipped and user pipeline lists, the precompiled library, and the background workers
 void pipelines_init() {
     sync_shaders = getenv("GPU_SYNC_SHADERS") != nullptr;
@@ -1398,31 +1278,13 @@ void pipelines_init() {
         std::error_code ec;
         std::filesystem::create_directories(g_save_base + "/shadercache", ec);
     }
-    vs_kernels_init(tid);
+    vs_kernels_init();
     // known pipelines: shipped with the game, then the user's own
-    std::vector<std::string> keys;
-    for (const auto &p : {g_game.dir + "/pipelines.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/pipelines.bin"}) {
-        if (!std::filesystem::exists(p)) continue;
-        keys = read_keys(p);
-        LOG("gpu metal: %zu pipelines listed in %s\n", keys.size(), p.c_str());
-        break;
-    }
-    const size_t shipped = keys.size();
-    const std::string dir = g_save_base + "/shadercache", user = dir + "/" + tid + ".bin";
-    std::vector<std::string> mine = read_keys(user);
-    keys.insert(keys.end(), mine.begin(), mine.end());
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
-    if (mine.empty()) {
-        // new or outdated: start over
-        key_log = fopen(user.c_str(), "wb");
-        const u32 hdr[2] = {kKeyMagic, kKeyVersion};
-        if (key_log) fwrite(hdr, 4, 2, key_log);
-    } else {
-        key_log = fopen(user.c_str(), "ab");
-    }
+    pipe_list = load_shader_list("pipelines.bin", ".bin", kKeyMagic, kKeyVersion);
+    if (!pipe_list.shipped_path.empty())
+        LOG("gpu metal: %zu pipelines listed in %s\n", pipe_list.shipped, pipe_list.shipped_path.c_str());
     std::lock_guard<std::mutex> lk(pipe_mtx);
-    for (auto &k : keys) {
+    for (auto &k : pipe_list.items) {
         auto &p = pipe_cache[k];
         if (p) continue;
         p = std::make_unique<Pipe>();
@@ -1432,7 +1294,7 @@ void pipelines_init() {
     if (!pipe_queue.empty()) start_workers();
     pipe_cv.notify_all();
     LOG("gpu metal: %zu known pipelines (%zu shipped, %zu in %s), building in the background%s (%.1f ms)\n",
-        pipe_cache.size(), shipped, mine.size(), user.c_str(), sync_shaders ? "; new ones synchronously" : "",
+        pipe_cache.size(), pipe_list.shipped, pipe_list.items.size() - pipe_list.shipped, pipe_list.user_path.c_str(), sync_shaders ? "; new ones synchronously" : "",
         now_ms() - t0);
 }
 
@@ -1450,7 +1312,7 @@ struct VsKern {
 };
 std::recursive_mutex vk_mtx;  // recursive: synchronous builds (GPU_SYNC_SHADERS) run under it
 std::unordered_map<u64, std::unique_ptr<VsKern>> vk_cache;  // by program hash and entry
-FILE *vk_log;
+ShaderList vs_list;  // known vertex programs (hwshared.h)
 struct {
     u32 lib = 0, src = 0, fail = 0, cpu_draws = 0;
     double ms = 0;
@@ -1524,59 +1386,25 @@ VsKern *vs_add(const std::string &blob) {
     return k.get();
 }
 
-void vs_kernels_init(const std::string &tid) {
-    std::vector<std::string> blobs;
-    for (const auto &p : {g_game.dir + "/vsprograms.bin", std::string(RECOMP_SOURCE_DIR) + "/games/" + tid + "/vsprograms.bin"}) {
-        if (!std::filesystem::exists(p)) continue;
-        blobs = read_blobs(p, kVsMagic, kVsVersion);
-        break;
-    }
-    const size_t shipped = blobs.size();
-    const std::string user = g_save_base + "/shadercache/" + tid + ".vs.bin";
-    std::vector<std::string> mine = read_blobs(user, kVsMagic, kVsVersion);
-    blobs.insert(blobs.end(), mine.begin(), mine.end());
-    if (mine.empty()) {
-        vk_log = fopen(user.c_str(), "wb");
-        const u32 hdr[2] = {kVsMagic, kVsVersion};
-        if (vk_log) fwrite(hdr, 4, 2, vk_log);
-    } else {
-        vk_log = fopen(user.c_str(), "ab");
-    }
+void vs_kernels_init() {
+    vs_list = load_shader_list("vsprograms.bin", ".vs.bin", kVsMagic, kVsVersion);
     std::lock_guard<std::recursive_mutex> lk(vk_mtx);
-    for (const auto &b : blobs) vs_add(b);
-    LOG("gpu metal: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(),
-        shipped, mine.size(), user.c_str());
+    for (const auto &b : vs_list.items) vs_add(b);
+    LOG("gpu metal: %zu known vertex programs (%zu shipped, %zu in %s), compiling in the background\n", vk_cache.size(), vs_list.shipped, vs_list.items.size() - vs_list.shipped, vs_list.user_path.c_str());
 }
 }  // namespace
 
 const void *metal_vs_kernel(const ShaderProgram *p, u32 entry, const ShaderSetup &s) {
     if (!active) return nullptr;
     std::lock_guard<std::recursive_mutex> lk(vk_mtx);
-    // the uniforms the program's flow control reads (masks cached per program)
-    static std::unordered_map<u64, std::pair<u32, u32>> masks;
     const u64 ph = shader_program_hash(p);
-    auto mi = masks.find(ph);
-    if (mi == masks.end()) {
-        u32 lm;
-        const u32 bm = shader_static_uniforms(p, &lm);
-        mi = masks.emplace(ph, std::make_pair(bm, lm)).first;
-    }
-    VsSpec sp;
-    for (u32 i = 0; i < 16; i++)
-        if (((mi->second.first >> i) & 1) && s.b[i]) sp.b |= 1u << i;
-    for (u32 i = 0; i < 4; i++)
-        if ((mi->second.second >> i) & 1) memcpy(sp.iu[i], s.i[i], 3);
+    const VsSpec sp = vs_spec(p, s);
     const u64 key = vk_key(ph, entry);
     auto it = vk_cache.find(spec_key(key, sp));
     if (it == vk_cache.end()) {
         const std::string blob = vs_blob(s, entry, &sp);
         VsKern *k = vs_add(blob);
-        if (k && vk_log) {
-            const u32 n = (u32)blob.size();
-            fwrite(&n, 4, 1, vk_log);
-            fwrite(blob.data(), 1, n, vk_log);
-            fflush(vk_log);
-        }
+        if (k) vs_list.record(blob);
         LOG("gpu metal: new vertex program %016llx entry %u (bools %04x, loops %02x%02x%02x %02x%02x%02x %02x%02x%02x "
             "%02x%02x%02x)%s\n", (unsigned long long)ph, entry, sp.b, sp.iu[0][0], sp.iu[0][1], sp.iu[0][2], sp.iu[1][0],
             sp.iu[1][1], sp.iu[1][2], sp.iu[2][0], sp.iu[2][1], sp.iu[2][2], sp.iu[3][0], sp.iu[3][1], sp.iu[3][2],
@@ -1687,22 +1515,12 @@ id<MTLDepthStencilState> get_dss(const DrawState &ds) {
 }
 
 // ---------------------------------------------------------------- display images
-struct DisplayImage {
-    u32 out_addr = 0, out_size = 0;
-    u32 out_w = 0, out_bpp = 0, hs = 0, vs = 0;  // output rows' pixels and bytes per pixel; downscaling shifts
-    u32 scale = 1;                               // internal scale the image was made at
-    bool incomplete = false;                     // some draws were left out (the screen keeps the last image)
-    u64 out_hash = 0;  // guest framebuffer bytes the image corresponds to
-    int screen = -1;
-    u32 w = 0, h = 0;
-    u64 version = 0;          // new for every new image
+struct DisplayImage : DisplayImageBase {  // (the bookkeeping in hwshared.h)
     id<MTLBuffer> buf;        // the image (RGBA8 rows)
     id<MTLCommandBuffer> cb;  // while the image is still being made: its command buffer
 };
 std::mutex disp_mtx;
-std::unordered_map<u32, DisplayImage> displays;  // by framebuffer physical address
-u32 last_screen_addr[2] = {0, 0};
-u64 disp_version = 0;
+DisplayImages<DisplayImage> displays;  // (disp_mtx held)
 
 bool eager_writeback = false;
 bool warned_shadow = false, warned_proctex = false;
@@ -1742,29 +1560,24 @@ id<MTLBuffer> take_buffer(std::vector<id<MTLBuffer>> &fl, size_t n) {
     return make_buffer(n);
 }
 
-// guest memory written by a GPU operation: stop trusting overlapping render targets' GPU copies
-void rts_overwritten(u32 paddr, u32 size) {
-    for (auto &r : rts)
-        if (overlaps(r->addr, rt_bytes(*r), paddr, size)) r->synced = false;
-}
 
 void finalize(PendingXfer &op) {
     wait_cb(op.cb, "display transfer", op.out_paddr);
     GRT &r = *op.rt;
     const u32 nb = rt_bytes(r);
-    if (op.rt_writeback && guest_kept(r)) {
+    if (op.rt_writeback && guest_kept(r, "metal")) {
         r.hash = copy_hash(pptr(r.addr), (const u8 *)op.gbytes.contents, nb);
         r.checked = g_frame.load(std::memory_order_relaxed);
     }
     memcpy(pptr(op.out_paddr), op.obytes.contents, op.out_size);
     texcache_invalidate(op.out_paddr, op.out_size);
-    rts_overwritten(op.out_paddr, op.out_size);
-    if (tf_mode) note_gpu_out(op.out_paddr, op.out_size);
+    rts_overwritten(rts, op.out_paddr, op.out_size);
+    if (tf_mode) gpu_outs.note(op.out_paddr, op.out_size);
     xbuf_free.push_back(op.gbytes);
     xbuf_free.push_back(op.obytes);
     std::lock_guard<std::mutex> lk(disp_mtx);
-    auto it = displays.find(op.out_paddr);
-    if (it != displays.end() && it->second.cb == op.cb) {
+    auto it = displays.by_addr.find(op.out_paddr);
+    if (it != displays.by_addr.end() && it->second.cb == op.cb) {
         DisplayImage &d = it->second;
         d.out_hash = hash_mem(pptr(d.out_addr), d.out_size);
         d.cb = nil;  // the image stays in op.disp
@@ -1818,16 +1631,6 @@ bool gpu_valid(const GRT &r) {
     return false;
 }
 
-// the GPU copy of an image at addr with this width and format (the tallest; null: none); any: also one that no
-// longer matches guest memory (synced again from it before it is drawn into)
-GRT *find_view(u32 addr, u32 w, u32 fmt, bool depth, bool any = false) {
-    GRT *best = nullptr;
-    for (auto &r : rts)
-        if (r->depth == depth && (r->synced || any) && r->addr == addr && r->w == w && r->fmt == fmt && (!best || r->h > best->h))
-            best = r.get();
-    return best;
-}
-GRT *find_color(u32 addr, u32 w, u32 fmt) { return find_view(addr, w, fmt, false); }
 
 // r's GPU copy made guest memory's contents (unless it is already)
 void fill_from_guest(GRT &r, id<MTLCommandBuffer> cb) {
@@ -1879,7 +1682,7 @@ GRT *grow(GRT &old, u32 h, id<MTLCommandBuffer> cb) {
 // copy of that image (a shorter view draws into its first rows: one copy of the memory instead of two kept in step
 // through guest memory), grown from a shorter one when this view is the tallest yet.
 GRT &target_for(u32 addr, u32 w, u32 h, u32 fmt, bool depth) {
-    GRT *t = find_view(addr, w, fmt, depth, true);
+    GRT *t = find_view(rts, addr, w, fmt, depth, true);
     if (t && t->h == h) return *t;
     if (t && t->h < h && t->gpu_newer)
         if (GRT *n = grow(*t, h, list_cb())) return *n;
@@ -1893,30 +1696,17 @@ void drop_displays(u32 paddr, u32 size, bool definite);
 // True if guest memory there changed meanwhile.
 bool claim(GRT *src, GRT *dst, u32 paddr, u32 size) {
     drain_touching(paddr, size);
-    bool changed = false;
-    for (auto &r : rts) {
-        if (r.get() == src || r.get() == dst || !overlaps(r->addr, rt_bytes(*r), paddr, size)) continue;
-        if (r->gpu_newer) {
-            if (r->addr >= paddr && r->addr + rt_bytes(*r) <= paddr + size) {
-                r->gpu_newer = false;
-            } else {
-                if (r->depth)
-                    write_back_depth(*r);
-                else
-                    write_back_color(*r);
-                changed = true;
-            }
-        }
-        r->synced = false;
-    }
-    return changed;
+    return claim_memory(rts, src, dst, paddr, size, [](GRT &r) {
+        if (r.depth) write_back_depth(r);
+        else write_back_color(r);
+    });
 }
 
 // The GPU copy that an operation reading src writes (all or the first rows of) the w x h image at addr in (bytes: the
 // guest memory it writes); null if it can't be done on the GPU.
 GRT *dest_surface(u32 addr, u32 w, u32 h, u32 fmt, GRT *src, u32 bytes) {
     if (overlaps(addr, bytes, src->addr, rt_bytes(*src))) return nullptr;
-    GRT *d = find_color(addr, w, fmt);
+    GRT *d = find_color(rts, addr, w, fmt);
     if (d && overlaps(d->addr, rt_bytes(*d), src->addr, rt_bytes(*src))) return nullptr;
     if (claim(src, d, addr, bytes)) return nullptr;  // (rare: other GPU copies of it were newer; the CPU does it)
     id<MTLCommandBuffer> cb = list_cb();  // (after claim's write-backs, which commit it)
@@ -1948,7 +1738,7 @@ std::unordered_map<u64, Snap> snaps;
 // (ce: the compute encoder of the flush's snapshots, made on cb by the first one needed)
 id<MTLTexture> surface_snapshot(u32 addr, u32 w, u32 h, u32 fmt, id<MTLCommandBuffer> cb,
                                 id<MTLComputeCommandEncoder> __strong &ce) {
-    GRT *r = find_color(addr, w, fmt);
+    GRT *r = find_color(rts, addr, w, fmt);
     if (!r || r->h < h) return nil;
     Snap &sn = snaps[(u64)addr << 32 ^ (u64)w << 20 ^ (u64)h << 4 ^ fmt];
     if (!sn.tex || sn.tex.width != w * S || sn.tex.height != h * S) {
@@ -1960,7 +1750,7 @@ id<MTLTexture> surface_snapshot(u32 addr, u32 w, u32 h, u32 fmt, id<MTLCommandBu
         d.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
         sn.tex = [dev newTextureWithDescriptor:d];
         sn.id = 0;
-    } else if (sn.id == r->id && sn.version == r->version) {
+    } else if (sn.id == r->serial && sn.version == r->version) {
         return sn.tex;
     }
     if (!ce) {
@@ -1973,7 +1763,7 @@ id<MTLTexture> surface_snapshot(u32 addr, u32 w, u32 h, u32 fmt, id<MTLCommandBu
     const u32 p[4] = {w * S, h * S, fmt == 1 || fmt == 3 ? 1u : 0u, 0};  // RGB8, RGB565: no alpha
     [ce setBytes:p length:16 atIndex:0];
     [ce dispatchThreads:MTLSizeMake(w * S, h * S, 1) threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-    sn.id = r->id;
+    sn.id = r->serial;
     sn.version = r->version;
     return sn.tex;
 }
@@ -2153,9 +1943,9 @@ const char *metal_texture_filter_name(int mode) {
     static const char *const names[kTexFilterCount] = {"Off", "Sharp", "Smooth"};
     return mode >= 0 && mode < kTexFilterCount ? names[mode] : "?";
 }
-bool metal_gpu_made(u32 paddr, u32 size) { return active && tf_mode && size && gpu_made(paddr, size); }
+bool metal_gpu_made(u32 paddr, u32 size) { return active && tf_mode && size && gpu_outs.made(rts, paddr, size); }
 void metal_note_gpu_output(u32 paddr, u32 size) {
-    if (active && tf_mode && size) note_gpu_out(paddr, size);
+    if (active && tf_mode && size) gpu_outs.note(paddr, size);
 }
 
 void metal_flush(const RTConfig &rt, const MBatch &mb) {
@@ -2172,7 +1962,7 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         LOG("gpu metal: texture filter %s -> %s\n", metal_texture_filter_name(tf_mode), metal_texture_filter_name(wf));
         tf_mode = wf;
         tf_drop_all();
-        gpu_outs.clear();
+        gpu_outs.outs.clear();
     }
     flush_no++;
     @autoreleasepool {
@@ -2184,8 +1974,8 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         bool uses_depth = false;
         for (const MSeg &seg : mb.segs) uses_depth |= seg.ds->depth_test || seg.ds->depth_write || seg.ds->stencil;
         const bool has_dep = uses_depth && rt.depth_addr && pptr(rt.depth_addr);
-        const GRT *tall_c = find_view(rt.color_addr, rt.w, rt.color_fmt, false, true);
-        const GRT *tall_d = has_dep ? find_view(rt.depth_addr, rt.w, rt.depth_fmt, true, true) : nullptr;
+        const GRT *tall_c = find_view(rts, rt.color_addr, rt.w, rt.color_fmt, false, true);
+        const GRT *tall_d = has_dep ? find_view(rts, rt.depth_addr, rt.w, rt.depth_fmt, true, true) : nullptr;
         const u32 hc = std::max(rt.h, tall_c ? tall_c->h : 0u), hd = has_dep ? std::max(rt.h, tall_d ? tall_d->h : 0u) : hc;
         const u32 H = hc == hd ? hc : rt.h;
         GRT &col = target_for(rt.color_addr, rt.w, H, rt.color_fmt, false);
@@ -2213,7 +2003,7 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         for (const MSeg &seg : mb.segs)
             for (const TexUnitState &t : seg.ds->tex) {
                 if (!t.surf || surf_decoded.count(surf_key(t))) continue;
-                GRT *r = find_color(t.surf_addr, t.w, t.surf_fmt);
+                GRT *r = find_color(rts, t.surf_addr, t.w, t.surf_fmt);
                 if (r && r->h >= t.h) continue;
                 metal_guest_read(t.surf_addr, t.w * t.h * pixel_bytes(cbuf_to_pixfmt(t.surf_fmt)));
                 surf_decoded[surf_key(t)] = texcache_get(t.surf_addr, t.w, t.h, t.surf_fmt, 1);
@@ -2376,20 +2166,12 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
         // per-draw uniforms and LUTs go into one shared buffer
         size_t uoff = 0;
         auto ualloc = [&](size_t n) {
-            const size_t o = (uoff + 255) & ~(size_t)255;
+            const size_t o = (uoff + kUniformAlign - 1) & ~(kUniformAlign - 1);
             uoff = o + n;
             return o;
         };
-        // first pass: size (a uniform block for each draw, each distinct LUT snapshot once)
-        std::unordered_map<const void *, size_t> lut_map;  // a snapshot's place in the buffer
-        size_t need = mb.segs.size() * (256 + sizeof(Uni));
-        for (const MSeg &seg : mb.segs) {
-            const DrawState &ds = *seg.ds;
-            if (ds.lighting && lut_map.emplace(ds.light.luts.get(), 0).second) need += 256 + sizeof(LightLuts);
-            if (ds.fog && lut_map.emplace(ds.fog_lut.get(), 0).second) need += 256 + sizeof(FogLut);
-        }
-        lut_map.clear();
-        const Slice us = arena(need);
+        std::unordered_map<const void *, size_t> lut_map;  // a LUT snapshot's place in the buffer
+        const Slice us = arena(uniform_bytes(mb));
         id<MTLBuffer> ubuf = us.buf;
         u8 *ub = us.p;
         bool wrote_color = false, wrote_depth = false;
@@ -2424,60 +2206,15 @@ void metal_flush(const RTConfig &rt, const MBatch &mb) {
             }
             if (ds.stencil) [re setStencilReferenceValue:ds.st_ref];
             // scissor
-            MTLScissorRect sr = {0, 0, rt.w * S, rt.h * S};
-            if (ds.scissor_mode == 3) {
-                const s32 x1 = std::clamp<s32>(ds.sc_x1, 0, rt.w), x2 = std::clamp<s32>(ds.sc_x2, 0, rt.w);
-                const s32 y1 = std::clamp<s32>(ds.sc_y1, 0, rt.h), y2 = std::clamp<s32>(ds.sc_y2, 0, rt.h);
-                if (x2 <= x1 || y2 <= y1) continue;
-                sr = {(NSUInteger)x1 * S, (NSUInteger)(rt.h - y2) * S, (NSUInteger)(x2 - x1) * S, (NSUInteger)(y2 - y1) * S};
-            }
-            [re setScissorRect:sr];
+            u32 sc[4];
+            if (!scissor_rect(ds, rt, S, sc)) continue;
+            [re setScissorRect:(MTLScissorRect){sc[0], sc[1], sc[2], sc[3]}];
             // uniforms
             const size_t uo = ualloc(sizeof(Uni));
             Uni &u = *(Uni *)(ub + uo);
-            memset(&u, 0, sizeof u);
-            u.rt[0] = (float)rt.w;
-            u.rt[1] = (float)rt.h;
-            u.rt[2] = (float)S;
-            u.rt[3] = (float)((1u << ds.depth_bits) - 1);
-            u.depth[0] = ds.depth_scale;
-            u.depth[1] = ds.depth_offset;
-            u.depth[2] = ds.depth_bits == 16 ? 1.0f / 65536.0f : 1.0f / 16777216.0f;
-            u.scissor[0] = ds.sc_x1;
-            u.scissor[1] = ds.sc_y1;
-            u.scissor[2] = ds.sc_x2;
-            u.scissor[3] = ds.sc_y2;
-            for (int k = 0; k < 6; k++) u.konst[k] = ds.tev[k].konst;
-            u.tevc[0] = ds.tev_init_out;
-            u.tevc[1] = ds.tev_init_buf;
-            u.tevc[2] = ds.tev_init_next;
-            u.misc[0] = ds.blend_color;
-            u.misc[1] = ds.fog_color;
-            u.misc[2] = ds.alpha_ref;
-            u.misc[3] = ds.tex[0].shadow_bias;
-            for (int k = 0; k < 3; k++) {
-                u.border[k] = ds.tex[k].border;
-                u.bias[k] = ds.tex[k].bias;
-            }
+            fill_uniforms(u, ds, rt, S);
             if (ds.lighting) {
                 const LightingState &l = ds.light;
-                const LutSel *sels[7] = {&l.d0, &l.d1, &l.sp, &l.fr, &l.rb, &l.rg, &l.rr};
-                for (int k = 0; k < 7; k++) u.lscale[k] = sels[k]->scale;
-                for (int k = 0; k < 3; k++) u.ambient[k] = l.global_ambient[k];
-                for (u32 k = 0; k < l.num_lights; k++) {
-                    const LightState &s = l.lights[k];
-                    LightU &d = u.lights[k];
-                    for (int c = 0; c < 3; c++) {
-                        d.spec0[c] = s.spec0[c];
-                        d.spec1[c] = s.spec1[c];
-                        d.diffuse[c] = s.diffuse[c];
-                        d.ambient[c] = s.ambient[c];
-                        d.pos[c] = s.pos[c];
-                        d.spot[c] = s.spot[c];
-                    }
-                    d.att[0] = s.da_scale;
-                    d.att[1] = s.da_bias;
-                }
                 // LUTs (once per distinct snapshot)
                 const void *lk = l.luts.get();
                 auto it = lut_map.find(lk);
@@ -2688,37 +2425,13 @@ namespace {
 // display images made from guest memory in [paddr, paddr + size): dropped if it was written (definite: certainly)
 void drop_displays(u32 paddr, u32 size, bool definite) {
     std::lock_guard<std::mutex> lk(disp_mtx);
-    for (auto it = displays.begin(); it != displays.end();) {
-        const DisplayImage &d = it->second;
-        if (overlaps(d.out_addr, d.out_size, paddr, size) && (definite || (!d.cb && hash_mem(pptr(d.out_addr), d.out_size) != d.out_hash))) {
-            if (g_stats)
-                LOG("gpu metal: display image %08x dropped (%s write %08x+%x)\n", d.out_addr, definite ? "GPU" : "CPU",
-                    paddr, size);
-            if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
-            it = displays.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    displays.written(paddr, size, definite, "metal", [](const DisplayImage &d) { return !d.cb; }, [](DisplayImage &d) {
+        if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
+    });
 }
 }  // namespace
 
 namespace {
-// the colour target a display transfer reads, starting at one of its tile rows (row0)
-GRT *transfer_source(u32 in_paddr, u32 in_dims, u32 out_dims, u32 &row0) {
-    const u32 in_w = in_dims & 0xffff, out_h0 = out_dims >> 16;
-    GRT *src = nullptr;
-    for (auto &r : rts) {
-        if (r->depth || !r->synced || r->w != in_w || in_paddr < r->addr) continue;
-        const u32 line = r->w * pixel_bytes(cbuf_to_pixfmt(r->fmt));
-        const u32 off = in_paddr - r->addr;
-        if (off % (line * 8) || off / line + out_h0 > r->h) continue;
-        src = r.get();
-        row0 = off / line;
-    }
-    if (src && (out_dims & 0xffff) > src->w) return nullptr;  // (narrower: the transfer keeps the first columns)
-    return src;
-}
 
 // TW: the target's first columns (scaled) the transfer keeps (all, or fewer)
 void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u32 rows, u32 TW, u32 flags, u32 row0) {
@@ -2734,29 +2447,9 @@ void encode_rot(id<MTLComputeCommandEncoder> ce, GRT &src, id<MTLBuffer> dst, u3
 // new display image entry for out_paddr (lock held), replacing any image the output overlaps; the
 // buffers of finished images go back to disp_free (those of unfinished ones when they finish)
 DisplayImage &new_display(u32 out_paddr, u32 out_size, u32 out_dims, u32 flags, u32 w, u32 h) {
-    const u32 out_h0 = out_dims >> 16;
-    for (auto it = displays.begin(); it != displays.end();) {
-        if (overlaps(it->second.out_addr, it->second.out_size, out_paddr, out_size)) {
-            if (!it->second.cb && recyclable(it->second.buf)) disp_free.push_back(it->second.buf);
-            it = displays.erase(it);
-        } else {
-            ++it;
-        }
-    }
-    DisplayImage &d = displays[out_paddr];
-    d.out_addr = out_paddr;
-    d.out_size = out_size;
-    d.w = w;
-    d.h = h;
-    d.hs = ((flags >> 24) & 3) ? 1 : 0;
-    d.vs = ((flags >> 24) & 3) == 2 ? 1 : 0;
-    d.out_w = (out_dims & 0xffff) >> d.hs;
-    d.out_bpp = pixel_bytes((flags >> 12) & 7);
-    d.scale = S;
-    d.version = ++disp_version;
-    d.screen = out_h0 == 400 ? 0 : out_h0 == 320 ? 1 : -1;
-    if (d.screen >= 0) last_screen_addr[d.screen] = out_paddr;
-    return d;
+    return displays.add(out_paddr, out_size, out_dims, flags, w, h, S, [](DisplayImage &d) {
+        if (!d.cb && recyclable(d.buf)) disp_free.push_back(d.buf);
+    });
 }
 }  // namespace
 
@@ -2776,7 +2469,7 @@ void clear_now(GRT &r, id<MTLCommandBuffer> cb) {
 bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, u32 flags, u32 out_size) {
     if (!active || eager_writeback || (flags & 2)) return false;
     u32 row0 = 0;
-    GRT *src = transfer_source(in_paddr, in_dims, out_dims, row0);
+    GRT *src = transfer_source(rts, in_paddr, in_dims, out_dims, row0);
     if (!src || !src->gpu_newer || overlaps(src->addr, rt_bytes(*src), out_paddr, out_size)) return false;
     for (auto &op : pending)
         if (op->rt_writeback && op->rt == src) return false;
@@ -2810,7 +2503,7 @@ bool metal_defer_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims
     }
     src->gpu_newer = false;  // the pending transfer writes it back
     src->own = false;
-    if (clear_after_top) clear_overlapping(*src);
+    if (clear_after_top) clear_overlapping(rts, *src);
     op->rt = src;
     op->in_paddr = in_paddr;
     op->out_paddr = out_paddr;
@@ -2918,7 +2611,7 @@ bool metal_gpu_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_dims, 
 
 bool metal_surface_for(u32 addr, u32 w, u32 h, u32 fmt) {
     if (!active || fmt > 4) return false;
-    GRT *r = find_color(addr, w, fmt);
+    GRT *r = find_color(rts, addr, w, fmt);
     if (!r || !gpu_valid(*r) || r->clear_next) return false;
     if (r->h < h) {
         @autoreleasepool {
@@ -2932,7 +2625,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     if (!active) return;
     if (flags & 2) return;  // linear input: not a render target
     u32 row0 = 0;
-    GRT *src = transfer_source(in_paddr, in_dims, out_dims, row0);
+    GRT *src = transfer_source(rts, in_paddr, in_dims, out_dims, row0);
     if (!src) {
         if (g_stats) LOG("gpu metal: transfer %08x -> %08x: no matching render target, no display image\n", in_paddr, out_paddr);
         return;
@@ -2967,7 +2660,7 @@ void metal_display_transfer(u32 in_paddr, u32 out_paddr, u32 in_dims, u32 out_di
     d.incomplete = src->skipped > 0;
     src->skipped = 0;
     src->own = false;
-    if (clear_after_top) clear_overlapping(*src);
+    if (clear_after_top) clear_overlapping(rts, *src);
 }
 
 // The bottom screen's pass of some games (Animal Crossing: New Leaf) reuses the render target the top screen's
@@ -2982,40 +2675,14 @@ void metal_set_clear_after_top_transfer(bool on) { clear_after_top = on; }
 void metal_set_key_black_bottom(bool on) { key_black_bottom = on; }
 
 namespace {
-// The part of a display image the screen shows: the framebuffer (`lines` rows of 240 pixels, `stride` bytes
-// apart) may start inside a display transfer's output, e.g. NSMB2 transfers 256x416 and shows rows 16 to 415.
-// The image's x runs along the output rows, its y backwards along each row's pixels. (disp_mtx held)
-struct DisplayView {
-    const DisplayImage *d = nullptr;
-    u32 x0 = 0, y0 = 0, w = 0, h = 0;
-    u64 key = 0;  // changes with the image or the part shown
-};
-bool find_view(u32 fb, u32 stride, u32 lines, DisplayView &v) {
-    for (const auto &[addr, d] : displays) {
-        if (fb < d.out_addr || fb >= d.out_addr + d.out_size) continue;
-        const u32 row_bytes = d.out_w * d.out_bpp;
-        if (!row_bytes || (stride && stride != row_bytes)) return false;
-        const u32 off = fb - d.out_addr, r0 = off / row_bytes, c0 = off % row_bytes / d.out_bpp;
-        const u32 fx = d.scale << d.vs, fy = d.scale << d.hs;  // image pixels per output row / pixel
-        if (c0 + 240 > d.out_w || (r0 + lines) * fx > d.w || (c0 + 240) * fy > d.h) return false;
-        v.d = &d;
-        v.x0 = r0 * fx;
-        v.w = lines * fx;
-        v.y0 = d.h - (c0 + 240) * fy;
-        v.h = 240 * fy;
-        v.key = d.version << 20 ^ off;
-        return true;
-    }
-    return false;
-}
 // The image for the framebuffer finished on the GPU, waited for without disp_mtx held (the GX thread takes it to
 // finish transfers and to replace images meanwhile); false: no image there.
 bool wait_for_view(u32 fb, u32 stride, u32 lines) {
     id<MTLCommandBuffer> cb;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
-        DisplayView v;
-        if (!find_view(fb, stride, lines, v)) return false;
+        DisplayView<DisplayImage> v;
+        if (!displays.view(fb, stride, lines, v)) return false;
         cb = v.d->cb;
     }
     if (cb) [cb waitUntilCompleted];
@@ -3034,7 +2701,7 @@ std::unordered_map<u64, PresentImage> present_images;
 id<MTLCommandBuffer> present_cb;
 std::vector<id<MTLBuffer>> present_bufs;
 // copies the view of a display image (rows of dw pixels) into a present image of its size
-bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
+bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView<DisplayImage> &v, u64 image) {
     id<MTLTexture> tex;
     {
         std::lock_guard<std::mutex> lk(present_mtx);
@@ -3063,12 +2730,12 @@ bool copy_view(id<MTLBuffer> buf, u32 dw, const DisplayView &v, u64 image) {
     return true;
 }
 // calls fn with the view of a display image (buf: its pixels, rows of dw), in place
-void view_pixels(id<MTLBuffer> buf, u32 dw, const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+void view_pixels(id<MTLBuffer> buf, u32 dw, const DisplayView<DisplayImage> &v, const std::function<void(const ScreenImage &)> &fn) {
     ScreenImage si{(const u32 *)buf.contents + (size_t)v.y0 * dw + v.x0, (int)v.w, (int)v.h, (int)dw, {}};
     si.copy_to = [&](u64 image) { return copy_view(buf, dw, v, image); };
     fn(si);
 }
-void with_view(const DisplayView &v, const std::function<void(const ScreenImage &)> &fn) {
+void with_view(const DisplayView<DisplayImage> &v, const std::function<void(const ScreenImage &)> &fn) {
     if (v.d->cb) [v.d->cb waitUntilCompleted];
     view_pixels(v.d->buf, v.d->w, v, fn);
 }
@@ -3078,8 +2745,8 @@ bool metal_get_display_image_for(u32 fb_paddr, u32 stride, u32 lines, const u32 
     thread_local std::vector<u32> out;
     if (!wait_for_view(fb_paddr, stride, lines)) return false;
     std::lock_guard<std::mutex> lk(disp_mtx);
-    DisplayView v;
-    if (!find_view(fb_paddr, stride, lines, v)) return false;
+    DisplayView<DisplayImage> v;
+    if (!displays.view(fb_paddr, stride, lines, v)) return false;
     with_view(v, [&](const ScreenImage &si) {
         out.resize((size_t)si.w * si.h);
         for (int y = 0; y < si.h; y++) memcpy(&out[(size_t)y * si.w], si.px + (size_t)y * si.pitch, (size_t)si.w * 4);
@@ -3094,12 +2761,12 @@ u64 metal_use_display_image(u32 fb_paddr, u32 stride, u32 lines, u64 have, const
     if (!wait_for_view(fb_paddr, stride, lines)) return 0;
     // fn (an upload to the UI's texture: slow for a large image) runs without disp_mtx held, the buffer kept from
     // being reused meanwhile
-    DisplayView v;
+    DisplayView<DisplayImage> v;
     id<MTLBuffer> buf;
     u32 dw;
     {
         std::unique_lock<std::mutex> lk(disp_mtx);
-        if (!find_view(fb_paddr, stride, lines, v)) return 0;
+        if (!displays.view(fb_paddr, stride, lines, v)) return 0;
         if (v.key == have) return have;
         // a frame drawn while new pipelines were compiling lacks those draws (often most of the scene: a flash of
         // the clear colour); keep showing the last image instead, for a few frames at most
@@ -3170,8 +2837,8 @@ bool metal_get_display_image(int screen, const u32 **rgba, int *w, int *h) {
     u32 addr;
     {
         std::lock_guard<std::mutex> lk(disp_mtx);
-        if (screen < 0 || screen > 1 || !last_screen_addr[screen]) return false;
-        addr = last_screen_addr[screen];
+        if (screen < 0 || screen > 1 || !displays.last_screen_addr[screen]) return false;
+        addr = displays.last_screen_addr[screen];
     }
     return metal_get_display_image_for(addr, 0, screen ? 320 : 400, rgba, w, h);
 }
@@ -3207,10 +2874,10 @@ const HwBackend *metal_backend() {
         .texture_filter_name = metal_texture_filter_name,
         .set_clear_after_top_transfer = metal_set_clear_after_top_transfer,
         .set_key_black_bottom = metal_set_key_black_bottom,
+        .emit_shaders = metal_emit_shaders,
         .present_image_create = metal_present_image_create,
         .present_image_destroy = metal_present_image_destroy,
         .present_images_done = metal_present_images_done,
-        .emit_shaders = metal_emit_shaders,
     };
     return &b;
 }

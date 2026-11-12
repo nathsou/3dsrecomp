@@ -630,6 +630,75 @@ struct Generic : Service {
     void handle(IPC &ipc) override { unimplemented(ipc); }
 };
 
+// nwm::UDS (local wireless play): it starts, scans and binds, and never finds anyone. As a stub, its "success" replies
+// left the request's own words where the game reads the event handles they return (New Super Mario Bros. 2's
+// local play menu then stopped with a fatal error on an invalid handle).
+struct Uds : Service {
+    using Service::Service;
+    static constexpr u32 kNotConnected = 3;            // ConnectionStatus::status
+    static constexpr u32 kNotFound = 0xC90113FA;        // UDS: not found (wrong argument)
+    static constexpr u32 kNodeInfoWords = 10;           // NodeInfo: 0x28 bytes
+    static constexpr u32 kConnectionStatusWords = 12;   // ConnectionStatus: 0x30 bytes
+    static constexpr u32 kBeaconReplyHeader = 12;       // BeaconDataReplyHeader: max size, total size, entries
+    static constexpr u64 kScanNs = 300000000;           // a beacon scan takes about this long on a 3DS
+    std::shared_ptr<Event> status_event = make_event(ONESHOT, "uds connection status");
+    u32 node[kNodeInfoWords] = {};  // this console's NodeInfo, as the game gave it
+    bool initialized = false;
+    void handle(IPC &ipc) override {
+        switch (ipc.cmd()) {
+        case 0x0001:    // InitializeDeprecated(shared memory size, NodeInfo, shared memory)
+        case 0x001B:    // InitializeWithVersion(shared memory size, NodeInfo, version, shared memory)
+            for (u32 i = 0; i < kNodeInfoWords; i++) node[i] = ipc[2 + i];
+            initialized = true;
+            ipc.ok(1, 2);
+            ipc.handles(2, {status_event});
+            break;
+        case 0x0003:  // Shutdown
+            initialized = false;
+            ipc.ok();
+            break;
+        case 0x000B:  // GetConnectionStatus: not connected, nobody around
+            ipc.ok(1 + kConnectionStatusWords);
+            ipc.set(2, kNotConnected);
+            for (u32 i = 1; i < kConnectionStatusWords; i++) ipc.set(2 + i, 0);
+            break;
+        case 0x000D: {  // GetNodeInformation(network node id): only this console's
+            const u16 id = (u16)ipc[1], own = (u16)(node[8] & 0xFFFF);  // (NodeInfo.network_node_id at 0x20)
+            if (!initialized || id != own) {
+                ipc.result(kNotFound);
+                break;
+            }
+            ipc.ok(1 + kNodeInfoWords);
+            for (u32 i = 0; i < kNodeInfoWords; i++) ipc.set(2 + i, node[i]);
+            break;
+        }
+        case 0x000F: {  // RecvBeaconBroadcastData(size, scan input, ..., event, output buffer): no beacons
+            const u32 size = ipc[1], out = ipc[20];
+            if (size >= kBeaconReplyHeader) {
+                w32(out, size);
+                w32(out + 4, kBeaconReplyHeader);
+                w32(out + 8, 0);
+            }
+            ipc.ok(1, 2);
+            ipc.set(2, (size << 4) | 0xC);
+            ipc.set(3, out);
+            sleep_current(kScanNs, *ipc.lk);
+            break;
+        }
+        case 0x0012:  // Bind(id, receive limit, data channel, network node id): an event nothing signals
+            ipc.ok(1, 2);
+            ipc.handles(2, {make_event(ONESHOT, "uds bind")});
+            break;
+        case 0x001A:  // GetChannel: none (not connected)
+            ipc.ok(2);
+            ipc.set(2, 0);
+            break;
+        default:
+            unimplemented(ipc);
+        }
+    }
+};
+
 // nim:aoc (add-on content downloads): initialised, nothing to download
 struct NimAoc : Service {
     using Service::Service;
@@ -654,7 +723,8 @@ void register_misc() {
     register_service(std::make_shared<Ir>("ir:u"));
     register_y2r();
     register_service(std::make_shared<NimAoc>("nim:aoc"));
-    for (const char *n : {"news:u", "cam:u", "soc:U", "ssl:C", "http:C", "nwm::UDS", "dlp:FKCL", "dlp:SRVR",
+    register_service(std::make_shared<Uds>("nwm::UDS"));
+    for (const char *n : {"news:u", "cam:u", "soc:U", "ssl:C", "http:C", "dlp:FKCL", "dlp:SRVR",
                           "pxi:dev", "act:u", "am:app", "qtm:u", "csnd:SND"})
         register_service(std::make_shared<Generic>(n));
 }
