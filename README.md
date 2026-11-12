@@ -34,6 +34,8 @@ All of them run at full speed with music and sound. Online play, StreetPass, Spo
 camera are not supported. Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline.
 
 Kid Icarus: Uprising's aiming, done with the stylus on a 3DS, also works with the right stick or the mouse.
+Ocarina of Time 3D gets a free camera on the right stick, like Majora's Mask 3D's on the C-stick (Z-targeting puts
+it back behind Link; the in-game menu turns it off or inverts it).
 
 Some games (Tomodachi Life, NSMB2, Mario Kart 7, Pullblox) need the Mii data or shared font system archives.
 Open-source replacements can be imported from an Azahar source checkout:

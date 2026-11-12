@@ -711,6 +711,7 @@ class Emitter:
         self.flag_returning = set()
         self.flag_reading_entries = set()
         self.override = {}
+        self.dispatched = set()     # --dispatched: functions whose calls go through the dispatcher
         self.verify_stores = False  # --verify-stores
         self.explored = {}          # explore()
         self.live = {}              # a function's flag liveness, where find_flag_returning computed it
@@ -853,7 +854,9 @@ class Emitter:
             pass
         elif i.kind == B:
             t = i.target
-            if (t | th) in an.funcs and t != (key & ~1):
+            if (t | th) in self.dispatched:
+                body.append('c->pc = 0x%xu; %s __attribute__((musttail)) return rt_dispatch(c, 0);' % (t | th, so))
+            elif (t | th) in an.funcs and t != (key & ~1):
                 body.append('%s __attribute__((musttail)) return %s(c, 0);' % (so or ';', fname(t | th)))
             elif t <= i.addr:
                 # a loop: give way if an interrupt readied a higher-priority thread (a busy wait for that
@@ -863,9 +866,10 @@ class Emitter:
                 self.stats['loop_checks'] += 1
             else:
                 body.append('goto L_%x;' % t)
-        elif i.kind == CALL and i.target not in an.funcs:
+        elif i.kind == CALL and (i.target not in an.funcs or i.target in self.dispatched):
             # a call to something discovery rejected (outside the code, or code reached only from data that
-            # was decoded as instructions): go through the dispatcher, which reports it if it is ever reached
+            # was decoded as instructions): go through the dispatcher, which reports it if it is ever reached.
+            # Also calls to the functions the runtime hooks (--dispatched).
             body.append('%s c->pc = 0x%xu; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
                 so, i.target, i.link | th))
         elif i.kind == CALL:
@@ -1054,6 +1058,8 @@ def main():
     ap.add_argument('--extra', action='append', default=[], help='file listing extra function addresses')
     ap.add_argument('--lazy', help='only emit the function at this address (and new functions it calls)')
     ap.add_argument('--lazy-out', help='C file for --lazy')
+    ap.add_argument('--dispatched', help='file listing functions whose calls go through the dispatcher, where the '
+                    'runtime can hook them (rt_add_dispatch_hook)')
     ap.add_argument('--verify-stores', action='store_true',
                     help='debugging: trap where a local left out of a store to the CPU struct differs from it')
     args = ap.parse_args()
@@ -1070,6 +1076,13 @@ def main():
     keys = an.discover()
     em = Emitter(an, args.outdir)
     em.verify_stores = args.verify_stores
+    em.dispatched = read_addresses(args.dispatched)
+    for a in sorted(em.dispatched - set(keys)):
+        print('warning: %x (--dispatched) is not a function' % a)
+    os.makedirs(args.outdir, exist_ok=True)
+    with open(os.path.join(args.outdir, 'dispatched.txt'), 'w') as f:  # (for --lazy)
+        for a in sorted(em.dispatched):
+            f.write('%x\n' % a)
     files = em.run(keys)
     with open(os.path.join(args.outdir, 'funcs.txt'), 'w') as f:
         for k in keys:
@@ -1088,6 +1101,17 @@ def main():
         print('undefined instructions in reachable code: %d' % len(em.undefined))
         for k, v in cnt.most_common(30):
             print('   %5d %s' % (v, k))
+
+
+def read_addresses(path):
+    """The hex addresses a file lists, one per line ('#' starts a comment); none if there is no file."""
+    out = set()
+    if path and os.path.exists(path):
+        for line in open(path):
+            line = line.split('#')[0].strip()
+            if line:
+                out.add(int(line, 16))
+    return out
 
 
 def lazy(args):
@@ -1114,6 +1138,7 @@ def lazy(args):
                 queue.append(i.target)
     em = Emitter(an, args.outdir)
     em.flag_opt = False
+    em.dispatched = read_addresses(os.path.join(args.outdir, 'dispatched.txt'))
     srcs = [em.emit_function(k) for k in new]
     with open(args.lazy_out, 'w') as f:
         f.write('#include "guest.h"\n\n')

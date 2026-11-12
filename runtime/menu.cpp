@@ -14,6 +14,7 @@
 
 #include "audio_iface.h"
 #include "cloud.h"
+#include "freecam.h"
 #include "gpu_iface.h"
 #include "loader.h"
 #include "platform.h"
@@ -195,6 +196,15 @@ std::vector<Row> rows(Page p) {
                          "Several of the same item share one pocket, as in New Horizons. Off: stacks go back to "
                          "free pockets as room allows.",
                          [&s](int) { s.stack_items = !s.stack_items; }});
+        if (freecam::configured()) {
+            r.push_back({"Free camera", onoff(s.free_camera),
+                         "The right stick turns the camera around Link. Z-targeting puts it back behind him.",
+                         [&s](int) { s.free_camera = !s.free_camera; }});
+            if (s.free_camera)
+                r.push_back({"Camera up/down", s.camera_invert_y ? "Inverted" : "Normal",
+                             s.camera_invert_y ? "Pushing the stick up looks down." : "Pushing the stick up looks up.",
+                             [&s](int) { s.camera_invert_y = !s.camera_invert_y; }});
+        }
         if (restart_pending()) r.push_back({"Restart to apply the graphics changes", "", "", nullptr, [] { frontend_restart(); }});
         r.push_back({"Restart game", "", "", nullptr, [] {
                          confirm("Restart the game? Progress since its last save is lost.", [] { frontend_restart(); });

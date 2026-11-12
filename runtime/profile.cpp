@@ -107,6 +107,12 @@
 //       rate the game multiplies by the frame time it holds in that VFP register (the mouse's motion is divided by
 //       it). "active": the byte at that register + offset (the game's own "aim input this frame") is set while the
 //       stick is held or the mouse moved lately. The mouse is captured meanwhile.
+//   camera update <address> collide <address> save <address>
+//   camera when <condition>
+//       A free camera on the right stick (runtime/freecam.cpp), for games of Ocarina of Time 3D's engine, while the
+//       condition holds: the game's camera update (update), called through the dispatcher (the game's
+//       dispatched.txt lists it), runs as usual, then the right stick turns the camera around Link from where it
+//       left it. "collide": the camera's collision check; "save": the save context.
 //   clearbottom
 //       Render targets are cleared to transparent after each display transfer (before they are drawn into again):
 //       for games whose bottom screen's pass reuses the top screen's target under a background, which "set" hides.
@@ -212,6 +218,7 @@ std::vector<MapArea> map_list;
 Tools tool_cfg;
 Stacks stack_cfg;
 Aim aim_cfg;
+Camera camera_cfg;
 std::map<std::string, s64> runtime_flags;
 bool one_screen;
 Focus cur_focus = FOCUS_NONE;
@@ -830,6 +837,22 @@ bool parse_line(const std::string &line, std::string &err) {
         err = "unknown aim directive " + t[1];
         return false;
     }
+    if (d == "camera" && t.size() >= 2) {
+        Camera &c = camera_cfg;
+        s64 a = 0, b = 0, v = 0;
+        if (t[1] == "update") {
+            if (t.size() != 7 || t[3] != "collide" || t[5] != "save" || !num(t[2], a) || !num(t[4], b) ||
+                !num(t[6], v)) {
+                err = "expected 'camera update <address> collide <address> save <address>'";
+                return false;
+            }
+            c.update = (u32)a, c.collide = (u32)b, c.save = (u32)v;
+            return true;
+        }
+        if (t[1] == "when") return (c.cond = parse_cond(t, 2, err)) != -2;
+        err = "unknown camera directive " + t[1];
+        return false;
+    }
     if (d == "stack" && t.size() >= 2) {
         Stacks &c = stack_cfg;
         if (t[1] == "owner") {
@@ -1222,6 +1245,7 @@ const std::vector<MapArea> &map_areas() { return map_list; }
 const Tools &tools() { return tool_cfg; }
 const Stacks &stacks() { return stack_cfg; }
 const Aim &aim() { return aim_cfg; }
+const Camera &camera() { return camera_cfg; }
 
 bool value_now(int i, s64 &out, u32 *at) {
     if (i < 0 || i >= (int)values.size()) return false;
