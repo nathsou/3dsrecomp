@@ -27,6 +27,8 @@ static u32 fs_err(u32 desc, u32 summary, u32 level = 25) { return (level << 27) 
 static const u32 ERR_FILE_NOT_FOUND = fs_err(112, 4);
 static const u32 ERR_PATH_NOT_FOUND = fs_err(113, 4);
 static const u32 ERR_NOT_FOUND = fs_err(120, 4);
+// archive ids: another title's save data (by media type and unique id), and the same with its permission checked
+constexpr u32 kOtherSaveData = 0x567890B2, kOtherSaveDataPermitted = 0x567890B4;
 static const u32 ERR_NOT_FORMATTED = fs_err(340, 5);
 static const u32 ERR_FILE_EXISTS = fs_err(180, 1);
 static const u32 ERR_DIR_EXISTS = fs_err(185, 1);
@@ -578,6 +580,11 @@ struct FsUser : Service {
                 VLOG("[fs] system archive %016llx not available\n", (unsigned long long)tid);
                 return ERR_NOT_FOUND;
             }
+        } else if (id == kOtherSaveData || id == kOtherSaveDataPermitted) {
+            // another title's save data (Tomodachi Life looks for its predecessors'): none here, as on a 3DS that
+            // never played them
+            VLOG("[fs] another title's save data (archive %x, path %s): none\n", id, p.str().c_str());
+            return ERR_NOT_FOUND;
         } else {
             a.host = archive_dir(id, p);
             if (a.host.empty()) {
