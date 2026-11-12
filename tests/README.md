@@ -7,8 +7,16 @@ changing anything shared (the runtime, the recompiler, a GPU backend):
 python3 tools/gametest.py --checkpoints <folder of your Checkpoint backups>   # every test that can run here
 python3 tools/gametest.py 0004000000049100            # one game (title id, test name, or <title id>-<test>)
 python3 tools/gametest.py --list                       # what can run here, and why not
-python3 tools/gametest.py -j 1                         # one at a time: frame rates are checked too
+python3 tools/gametest.py --twice                      # each test twice: the pictures must be the same
+python3 tools/gametest.py --realtime -j 1              # at the 3DS's speed, one at a time: frame rates are checked
 ```
+
+Tests run in deterministic mode (`RECOMP_DETERMINISTIC=1`): the same run gives the same pictures, byte for byte, on
+every run and under any load, as fast as the machine goes (several times the 3DS's speed). Guest time is virtual: it
+passes as guest code runs (a fixed amount per loop iteration) and jumps ahead when every guest thread waits; VBlank,
+input and audio come at fixed guest times; GPU work is finished when the game's call that queued it returns; the
+date is 2026-01-01; shaders are compiled before the draws that need them, at 1x resolution. `--realtime` runs the
+game as you play it, with real timing.
 
 A test needs the game's files in `data/<name>/` (any name: they are found by title id) and a build of them
 (a `build*/` folder configured with `-DGAME=<name>`). Tests that start from a save need your own Checkpoint backup
@@ -25,9 +33,12 @@ make them, to `~/.local/share/3dsrecomp/test-refs/` (`--update-refs`; `--refs` o
 - Every `[service] unimplemented command 0x...` line names a command the test lists in `known_unimplemented`: a game
   that starts using one more is noticed (implement it in `runtime/services/`, or add it to the list).
 - At each checkpoint: the listed screens are not blank, the profile's values are as given, and, where a reference
-  picture exists, the screens are close to it (mean difference of 40x24 thumbnails below `ref_tolerance`, 24 by
-  default: timing differs a little between runs).
-- `fps`: the game's frame rate over a stretch of frames (from the `[stats]` lines), only with `-j 1`.
+  picture exists, the screens are the same as it, pixel for pixel. Deterministic runs and real-time runs have
+  references of their own (`<refs>/<test>/deterministic/` and `<refs>/<test>/`); a real-time run only has to be close
+  to its reference (mean difference of 40x24 thumbnails below `ref_tolerance`, 24 by default: timing differs a little
+  between runs). `ref_tolerance` set in a test applies to both.
+- `--twice`: a second run gives the same pictures.
+- `fps`: the game's frame rate over a stretch of frames (from the `[stats]` lines), only with `--realtime -j 1`.
 
 ## Format
 

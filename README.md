@@ -86,7 +86,8 @@ recompiled game (`build-all/recomp`, `cmake -DGAMES=all`; with `--app`, an app o
    scripts for options).
 
 **Tests:** `python3 tools/gametest.py` plays every game you have through scripted runs and checks them
-(`tests/README.md`).
+(`tests/README.md`). They run in deterministic mode (`RECOMP_DETERMINISTIC=1`): a run gives the same pictures every
+time, faster than the 3DS.
 
 Saves go to `save/<title id>/` (`~/Library/Application Support/3dsrecomp/` for app bundles,
 `~/.local/share/3dsrecomp/` on Linux). A real console's save goes in its `savedata/` folder; Checkpoint backups leave

@@ -86,7 +86,15 @@ static std::mutex clock_m;
 static u64 clock_vbase, clock_rbase;  // guest and real time at the last speed change
 static u32 clock_pct = 100;
 
+bool deterministic() {
+    static const bool on = getenv("RECOMP_DETERMINISTIC") && atoi(getenv("RECOMP_DETERMINISTIC")) != 0;
+    return on;
+}
+constexpr u64 kDetStartNs = 1000000000;  // (the virtual clock's start: a second after power-on)
+static std::atomic<u64> vclock{kDetStartNs};
+
 u64 now_ns() {
+    if (deterministic()) return vclock.load(std::memory_order_relaxed);
     std::lock_guard<std::mutex> lk(clock_m);
     const u64 r = real_ns();
     if (!clock_rbase) clock_vbase = clock_rbase = r;
@@ -114,6 +122,7 @@ struct TimeoutQueue {
 static TimeoutQueue tq;
 
 void set_clock_speed(u32 pct) {
+    if (deterministic()) return;  // (virtual time does not follow the host's)
     const u64 v = now_ns();
     {
         std::lock_guard<std::mutex> lk(clock_m);
@@ -151,6 +160,50 @@ static void timeout_thread() {
         fn();
         schedule_async();
     }
+}
+
+// ---------------------------------------------------------------- deterministic mode
+// The events of virtual time: the timeouts (tq.q) and the host's periodic work. They run with the kernel lock held
+// and no guest code executing: from the running thread at a backward branch (rt_preempt, every
+// kDetBranchesPerStep), or from a thread that blocks with no other ready (the clock jumps to the next event).
+constexpr u64 kDetNsPerBranch = 2;       // virtual time a backward branch of guest code takes
+constexpr u32 kDetBranchesPerStep = 1024;
+struct DetPeriodic {
+    u64 next, period;
+    void (*fn)();
+};
+static DetPeriodic det_periodic[3];
+static bool det_in_event;  // (lock held) an event runs: schedule_async leaves the choice of a thread to the caller
+
+void det_set_hooks(const DetHooks &h) {
+    // VBlank 59.83 Hz, input 234 Hz, audio frames of 160 samples at 32728 Hz
+    det_periodic[0] = {kDetStartNs + 16715000, 16715000, h.vblank};
+    det_periodic[1] = {kDetStartNs + 1000000000ull / 234, 1000000000ull / 234, h.hid};
+    det_periodic[2] = {kDetStartNs + 1000000000ull * 160 / 32728, 1000000000ull * 160 / 32728, h.dsp};
+}
+
+// (lock held) runs the earliest event if it is due by `limit`; false if none is
+static bool det_run_next(u64 limit, Lock &lk) {
+    u64 t = tq.q.empty() ? UINT64_MAX : tq.q.begin()->first;
+    int which = tq.q.empty() ? -1 : 3;
+    for (int i = 0; i < 3; i++)
+        if (det_periodic[i].fn && det_periodic[i].next < t) t = det_periodic[i].next, which = i;
+    if (which < 0 || t > limit) return false;
+    if (t > vclock) vclock = t;
+    det_in_event = true;
+    if (which == 3) {
+        auto fn = std::move(tq.q.begin()->second);
+        tq.q.erase(tq.q.begin());
+        fn();
+    } else {
+        DetPeriodic &p = det_periodic[which];
+        p.next += p.period;
+        lk.unlock();  // (the hooks take the lock themselves; no guest code runs meanwhile)
+        p.fn();
+        lk.lock();
+    }
+    det_in_event = false;
+    return true;
 }
 
 // ---------------------------------------------------------------- scheduling
@@ -192,6 +245,11 @@ static void make_ready(Thread *t, bool front = false) {
 static void switch_from(Thread *cur, Lock &lk) {
     flush_deferred();
     Thread *next = best_ready();
+    if (deterministic() && !next) {
+        // every thread waits: virtual time jumps to the next event until one is ready
+        running = nullptr;
+        while (!(next = best_ready()) && det_run_next(UINT64_MAX, lk)) flush_deferred();
+    }
     running = next;
     if (next) {
         next->status = TStatus::Running;
@@ -232,6 +290,7 @@ static void flush_deferred() {
 }
 
 void schedule_async() {
+    if (det_in_event) return;  // (the event's caller picks the thread to run)
     if (running) {
         // the running thread keeps the CPU until its next SVC unless it is told to give way
         Thread *best = best_ready();
@@ -414,6 +473,10 @@ static void thread_exit_locked(Thread *t, Lock &lk) {
                 m->release(t);
             }
     Thread *next = best_ready();
+    if (deterministic() && !next) {  // (as in switch_from: virtual time goes on until a thread is ready)
+        running = nullptr;
+        while (!(next = best_ready()) && det_run_next(UINT64_MAX, lk)) flush_deferred();
+    }
     running = next;
     if (next) {
         next->status = TStatus::Running;
@@ -1126,11 +1189,14 @@ void dump_threads() {
 void start(const BootInfo &bi) {
     boot_ns = now_ns();
     linear_free[mem::LINEAR_BASE] = mem::LINEAR_SIZE - 0x00200000;  // (a little kept for the system)
-    tq.th = std::thread(timeout_thread);
-    tq.th.detach();
+    if (!deterministic()) {  // (deterministic mode: timeouts are events of virtual time)
+        tq.th = std::thread(timeout_thread);
+        tq.th.detach();
+    }
     u32 stack_top = mem::STACK_TOP;
     add_region(stack_top - bi.stack_size, bi.stack_size, 3, 7);
     Lock lk(kmutex);
+    if (deterministic()) rt_preempt_flag = 1;  // (every backward branch counts guest time: rt_preempt)
     auto t = create_thread(bi.entry, 0, stack_top, bi.priority, true);
     t->name = "main";
     schedule_async();
@@ -1144,6 +1210,18 @@ volatile u32 rt_preempt_flag;
 
 extern "C" void rt_preempt(CPU *) {
     using namespace kernel;
+    if (deterministic()) {
+        // (rt_preempt_flag stays set: every backward branch comes here and counts as guest time)
+        static u32 left = kDetBranchesPerStep;  // (only the running thread executes guest code)
+        if (--left) return;
+        left = kDetBranchesPerStep;
+        Lock lk(kmutex);
+        vclock += kDetNsPerBranch * kDetBranchesPerStep;
+        while (det_run_next(vclock, lk)) {}
+        flush_deferred();
+        reschedule(lk);
+        return;
+    }
     Lock lk(kmutex);
     rt_preempt_flag = 0;
     flush_deferred();

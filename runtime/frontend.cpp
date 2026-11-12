@@ -283,7 +283,19 @@ static bool SDLCALL app_events(void *, SDL_Event *ev) {
 }
 #endif
 
+static void det_vblank();
+static void hid_tick();
+
 void frontend_init() {
+    if (kernel::deterministic()) {
+        // the same pictures every run: GPU work done before the game hears it is (transfers, shaders), at a fixed
+        // resolution unless one is asked for
+        setenv("GPU_SYNC_SHADERS", "1", 1);
+        setenv("GPU_METAL_EAGER", "1", 1);
+        setenv("GPU_EAGER", "1", 1);
+        setenv("GPU_SCALE", "1", 0);
+        kernel::det_set_hooks({det_vblank, hid_tick, kernel::dsp_tick});
+    }
     if (!TARGET_OS_IOS && touch::enabled()) SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "1");  // the mouse is a finger
 #if TARGET_OS_IOS
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");
@@ -1562,6 +1574,14 @@ struct InputSnapshot { u32 buttons; s16 cx, cy; bool touch; u16 tx, ty; s16 sx, 
 static std::mutex input_m;
 static InputSnapshot input_now{};
 
+static void hid_tick() {
+    InputSnapshot s;
+    {
+        std::lock_guard<std::mutex> lk(input_m);
+        s = input_now;
+    }
+    kernel::hid_update(s.buttons, s.cx, s.cy, s.touch, s.tx, s.ty, s.sx, s.sy);
+}
 static void hid_thread() {
     platform::set_thread_name("hid");
     platform::set_thread_interactive();
@@ -1570,13 +1590,30 @@ static void hid_thread() {
     for (;;) {
         next += period;
         std::this_thread::sleep_until(next);
-        InputSnapshot s;
-        {
-            std::lock_guard<std::mutex> lk(input_m);
-            s = input_now;
-        }
-        kernel::hid_update(s.buttons, s.cx, s.cy, s.touch, s.tx, s.ty, s.sx, s.sy);
+        hid_tick();
     }
+}
+
+// Deterministic mode (kernel::deterministic): the frame's work (input, VBlank, presenting, the scripted run's
+// pictures) happens when virtual time reaches a VBlank, the guest thread that got there waiting for it; input and
+// audio ticks are events of virtual time too, without their threads.
+static std::mutex det_m;
+static std::condition_variable det_cv;
+static bool det_frame_due;
+static void det_vblank() {
+    std::unique_lock<std::mutex> lk(det_m);
+    det_frame_due = true;
+    det_cv.notify_all();
+    det_cv.wait(lk, [] { return !det_frame_due; });
+}
+static void det_frame_wait() {
+    std::unique_lock<std::mutex> lk(det_m);
+    det_cv.wait(lk, [] { return det_frame_due; });
+}
+static void det_frame_done() {
+    std::lock_guard<std::mutex> lk(det_m);
+    det_frame_due = false;
+    det_cv.notify_all();
 }
 
 static void audio_thread() {
@@ -1601,9 +1638,12 @@ void watch_poll();
 void frontend_run() {
     parse_script();
     watch_init();
-    std::thread(audio_thread).detach();
+    const bool det = kernel::deterministic();
+    if (!det) {
+        std::thread(audio_thread).detach();
+        std::thread(hid_thread).detach();
+    }
     std::thread(gpu_thread).detach();
-    std::thread(hid_thread).detach();
     auto frame = nanoseconds(16715000);  // 59.83 Hz (at 100% game speed)
     auto next_vblank = steady_clock::now() + frame;
     auto next_time = steady_clock::now();
@@ -1611,16 +1651,20 @@ void frontend_run() {
     if (const char *s = getenv("RECOMP_FRAMES")) max_frames = strtoull(s, nullptr, 10);
     for (;;) {
         auto now = steady_clock::now();
-        if (now < next_vblank) {
-            std::this_thread::sleep_until(next_vblank);
-            continue;
-        }
-        // faster than the 3DS: the next VBlank waits until the game has finished its frame (for up to one 3DS
-        // frame), so it never falls behind and plays the same at any speed
-        if (g_settings.speed > 100 && !paused && now < next_vblank + nanoseconds(16715000) &&
-            (kernel::guest_busy() || kernel::gsp_gx_pending())) {
-            std::this_thread::sleep_for(microseconds(100));
-            continue;
+        if (det) {
+            det_frame_wait();
+        } else {
+            if (now < next_vblank) {
+                std::this_thread::sleep_until(next_vblank);
+                continue;
+            }
+            // faster than the 3DS: the next VBlank waits until the game has finished its frame (for up to one 3DS
+            // frame), so it never falls behind and plays the same at any speed
+            if (g_settings.speed > 100 && !paused && now < next_vblank + nanoseconds(16715000) &&
+                (kernel::guest_busy() || kernel::gsp_gx_pending())) {
+                std::this_thread::sleep_for(microseconds(100));
+                continue;
+            }
         }
         // host events once per frame (pumping the macOS event loop is not free)
         {
@@ -1814,7 +1858,7 @@ void frontend_run() {
         }
         frame = nanoseconds(16715000ll * 100 / g_settings.speed);
         kernel::set_clock_speed((u32)g_settings.speed);
-        if (const int v = g_settings.speed <= 100 && !getenv("RECOMP_NOVSYNC") && !window_hidden &&
+        if (const int v = g_settings.speed <= 100 && !det && !getenv("RECOMP_NOVSYNC") && !window_hidden &&
                           steady_clock::now() >= vsync_held_until;
             v != vsync) {
             vsync = v;
@@ -1871,9 +1915,11 @@ void frontend_run() {
                 }
                 _exit(0);
             }
+            if (det) det_frame_done();
             next_vblank += frame;
             if (now > next_vblank + frame * 4) next_vblank = now + frame;
-            if (now >= next_time) {
+            constexpr u64 kFramesPerSecond = 60;  // (deterministic mode: the shared page's clock once a second)
+            if (det ? frame_count % kFramesPerSecond == 0 : now >= next_time) {
                 update_shared_page_time();
                 next_time = now + seconds(1);
                 static u64 last_game_frames;

@@ -24,6 +24,8 @@ struct GspState {
     // GX queue (guarded by its own mutex: the GPU thread consumes it without the kernel lock)
     std::mutex qm;
     std::deque<std::array<u32, 8>> queue;
+    u64 queued = 0, done = 0;        // commands queued and finished so far (deterministic mode waits on them)
+    std::condition_variable done_cv;
 };
 GspState gsp;
 std::mutex fb_mutex;
@@ -163,6 +165,13 @@ void gsp_process_gx() {
             c = gsp.queue.front();
             gsp.queue.pop_front();
         }
+        struct Finished {  // (once the command's interrupts are signalled and the kernel lock is let go)
+            ~Finished() {
+                std::lock_guard<std::mutex> lk(gsp.qm);
+                gsp.done++;
+                gsp.done_cv.notify_all();
+            }
+        } finished;
         std::vector<Irq> irqs;
         if (dump_state == 1) dump_begin();
         if (dump_state == 2) {
@@ -231,6 +240,25 @@ void gsp_process_gx() {
 
 void frontend_wake();
 
+// (lock held) a command for the GX thread; deterministic mode waits until it is done, interrupts signalled, so the
+// game finds it finished at the same point every run
+static void queue_gx(const std::array<u32, 8> &c) {
+    std::lock_guard<std::mutex> lk(gsp.qm);
+    gsp.queue.push_back(c);
+    gsp.queued++;
+}
+static void wait_gx_done(IPC &ipc) {
+    if (!deterministic()) return;
+    std::unique_lock<std::mutex> q(gsp.qm);
+    const u64 target = gsp.queued;
+    q.unlock();
+    ipc.lk->unlock();  // (the GX thread takes it to signal the interrupts)
+    q.lock();
+    gsp.done_cv.wait(q, [&] { return gsp.done >= target; });
+    q.unlock();
+    ipc.lk->lock();
+}
+
 struct GspGpu : Service {
     using Service::Service;
     void write_hw_regs(u32 reg, u32 size, u32 src) {
@@ -280,12 +308,9 @@ struct GspGpu : Service {
         case 0x0008:    // FlushDataCache(addr, size, process)
         case 0x0009: {  // InvalidateDataCache
             // queued so the GPU thread sees it in order with the GX commands
-            std::array<u32, 8> c{0xFF, ipc[1], ipc[2]};
-            {
-                std::lock_guard<std::mutex> lk(gsp.qm);
-                gsp.queue.push_back(c);
-            }
+            queue_gx({0xFF, ipc[1], ipc[2]});
             frontend_wake();
+            wait_gx_done(ipc);
             ipc.ok();
             break;
         }
@@ -355,13 +380,11 @@ struct GspGpu : Service {
             n--;
             index = (index + 1) % 0xF;
             w32(cb, (hdr & 0xFFFF0000) | (n << 8) | index);
-            {
-                std::lock_guard<std::mutex> lk(gsp.qm);
-                gsp.queue.push_back(c);
-            }
+            queue_gx(c);
             if (g_verbose >= 2) LOG("[gsp] GX %08x %08x %08x %08x\n", c[0], c[1], c[2], c[3]);
         }
         frontend_wake();
+        wait_gx_done(ipc);
     }
 };
 
