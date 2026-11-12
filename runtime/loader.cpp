@@ -41,10 +41,17 @@ static void init_config_mem() {
 void update_shared_page_time() {
     u32 sp = mem::SHARED_PAGE;
     // milliseconds since 1900-01-01
-    time_t now = time(nullptr) + (time_t)g_settings.clock_offset;  // the menu's Clock page
-    struct tm lt;
-    localtime_r(&now, &lt);
-    s64 local = (s64)now + lt.tm_gmtoff;
+    s64 local;
+    if (kernel::deterministic()) {
+        // (a fixed date, as guest time goes: games seed their random numbers with it)
+        constexpr s64 kDetDate = 1767225600;  // 2026-01-01 00:00
+        local = kDetDate + (s64)(kernel::now_ns() / 1000000000ull);
+    } else {
+        time_t now = time(nullptr) + (time_t)g_settings.clock_offset;  // the menu's Clock page
+        struct tm lt;
+        localtime_r(&now, &lt);
+        local = (s64)now + lt.tm_gmtoff;
+    }
     u64 ms = (u64)(local + 2208988800ll) * 1000ull;
     u32 counter = r32(sp);
     u32 which = (counter + 1) & 1;

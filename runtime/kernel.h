@@ -172,8 +172,19 @@ void run_when_quiescent(std::function<void()> fn);  // (lock held) run fn when n
 void reschedule(Lock &lk);             // (lock held, from a guest thread) yield to a higher priority thread
 void block_current(Lock &lk);          // (lock held) the current thread waits until resumed
 void sleep_current(u64 ns, Lock &lk);  // (lock held) the current thread sleeps for ns of guest time
-u64 now_ns();   // the guest clock: real time scaled by the game speed
+u64 now_ns();   // the guest clock: real time scaled by the game speed (deterministic mode: virtual time)
 u64 real_ns();
+// Deterministic mode (RECOMP_DETERMINISTIC=1, for tests): a run with the same input does the same thing every time.
+// Guest time is virtual: it passes as guest code runs (a fixed amount per backward branch: rt_preempt) and jumps to
+// the next event when every guest thread waits. The host's periodic work (VBlank, input, audio) happens at fixed
+// guest times, as events, while no guest code runs; GX commands complete before the call that queued them returns.
+bool deterministic();
+struct DetHooks {
+    void (*vblank)();  // the frame: the UI thread's work (input, VBlank, presenting), waited for
+    void (*hid)();     // the input's update (234 Hz)
+    void (*dsp)();     // an audio frame (32728 / 160 Hz)
+};
+void det_set_hooks(const DetHooks &h);  // before start()
 void set_clock_speed(u32 percent);
 u64 system_tick();
 void add_timeout(u64 deadline_ns, std::function<void()> fn);  // (lock held) run fn (lock held) at deadline

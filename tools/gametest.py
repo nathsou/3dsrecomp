@@ -134,6 +134,15 @@ def difference(a, b):
     return sum(abs(p - q) for p, q in zip(x, y)) / len(x)
 
 
+def changed_pixels(a, b):
+    """How many pixels of two pictures differ (all of them if their sizes do)."""
+    a, b = a.convert('RGB'), b.convert('RGB')
+    if a.size != b.size:
+        return a.size[0] * a.size[1]
+    x, y = a.tobytes(), b.tobytes()
+    return sum(1 for i in range(0, len(x), 3) if x[i:i + 3] != y[i:i + 3])
+
+
 def contact_sheet(run_dir, frames):
     if not Image:
         return
@@ -205,21 +214,14 @@ def run_test(spec, args, games):
         r.note('no build of %s (a build directory configured with GAME=%s)' % (gamedir, os.path.basename(gamedir)))
         return r
     run_dir = os.path.join(ROOT, 'shots', 'tests', spec['id'])
-    if os.path.isdir(run_dir):
-        shutil.rmtree(run_dir)
-    os.makedirs(run_dir)
-    save_kind = spec.get('save')
-    if save_kind == 'checkpoint':
-        src = find_checkpoint_save(args.checkpoints, tid, spec.get('checkpoint_id'))
-        if not src:
+    save_src = None
+    if spec.get('save') == 'checkpoint':
+        save_src = find_checkpoint_save(args.checkpoints, tid, spec.get('checkpoint_id'))
+        if not save_src:
             r.status = 'skip'
             r.note('no Checkpoint backup of %s under %s' % (tid, args.checkpoints or '(no --checkpoints)'))
             return r
-        dst = os.path.join(run_dir, 'save', tid, 'savedata')
-        shutil.copytree(src, dst)
-        for d in spec.get('save_dirs', []):  # Checkpoint leaves out empty folders
-            os.makedirs(os.path.join(dst, d), exist_ok=True)
-        r.note('save: %s' % src)
+        r.note('save: %s' % save_src)
     checkpoints = spec.get('checkpoint', [])
     frames = int(spec['frames'])
     shot_frames = sorted({int(c['frame']) for c in checkpoints})
@@ -230,6 +232,8 @@ def run_test(spec, args, games):
     for k in list(env):
         if k.startswith(('RECOMP_', 'GPU_')) and k not in ('RECOMP_FRAMES',):
             del env[k]  # (the caller's debugging variables would change the run)
+    if not args.realtime:
+        env['RECOMP_DETERMINISTIC'] = '1'  # (the same pictures every run, as fast as the machine goes)
     if shot_frames:
         step = 0
         for f in shot_frames:
@@ -248,15 +252,39 @@ def run_test(spec, args, games):
     for k, v in spec.get('env', {}).items():
         env[k] = str(v)
     timeout = spec.get('timeout', frames / 60 * 3 + 120)
+
+    def play(where):
+        """One run of the game in `where` (a fresh folder, with the test's save): exit code (None: timed out)."""
+        if os.path.isdir(where):
+            shutil.rmtree(where)
+        os.makedirs(where)
+        if save_src:
+            dst = os.path.join(where, 'save', tid, 'savedata')
+            shutil.copytree(save_src, dst)
+            for d in spec.get('save_dirs', []):  # Checkpoint leaves out empty folders
+                os.makedirs(os.path.join(dst, d), exist_ok=True)
+        with open(os.path.join(where, 'run.log'), 'w') as log:
+            try:
+                return subprocess.run([exe, gamedir], cwd=where, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                      timeout=timeout).returncode
+            except subprocess.TimeoutExpired:
+                return None
+
     t0 = time.time()
-    with open(os.path.join(run_dir, 'run.log'), 'w') as log:
-        try:
-            rc = subprocess.run([exe, gamedir], cwd=run_dir, env=env, stdout=log, stderr=subprocess.STDOUT,
-                                timeout=timeout).returncode
-        except subprocess.TimeoutExpired:
-            rc = None
+    rc = play(run_dir)
     r.seconds = time.time() - t0
     text = open(os.path.join(run_dir, 'run.log'), errors='replace').read()
+    if args.twice and not args.realtime and rc == 0:
+        # the same run again: every picture must come out the same, byte for byte
+        again = run_dir + '.again'
+        play(again)
+        pics = sorted(f for f in os.listdir(run_dir) if f.startswith('shot_') and f.endswith('.ppm'))
+        differ = [f for f in pics if not os.path.exists(os.path.join(again, f)) or
+                  open(os.path.join(run_dir, f), 'rb').read() != open(os.path.join(again, f), 'rb').read()]
+        if differ:
+            r.fail('not deterministic: %d of %d pictures differ in a second run (%s)' % (len(differ), len(pics),
+                                                                                       ', '.join(differ[:4])))
+        shutil.rmtree(again)
     if rc is None:
         r.fail('timed out after %d s' % timeout)
     elif rc != 0:
@@ -282,7 +310,8 @@ def run_test(spec, args, games):
     for m in re.finditer(r'^\s*(\d+) \[profile\] focus (\S+) hud (\d+):(.*)$', text, re.M):
         vals = dict(re.findall(r'(\w+)=(-?\d+)', m.group(4)))
         trace.append((int(m.group(1)), m.group(2), vals))
-    refs = os.path.join(args.refs, spec['id'])
+    # (deterministic runs have references of their own, compared exactly unless the test says otherwise)
+    refs = os.path.join(args.refs, spec['id'], '' if args.realtime else 'deterministic')
     for c in checkpoints:
         f = int(c['frame'])
         for screen in c.get('screens', []):
@@ -315,15 +344,22 @@ def run_test(spec, args, games):
                     os.makedirs(refs, exist_ok=True)
                     Image.open(p).convert('RGB').save(ref)
                 elif os.path.exists(ref):
-                    d = difference(Image.open(p), Image.open(ref))
-                    limit = c.get('ref_tolerance', spec.get('ref_tolerance', 24))
-                    if d > limit:
-                        r.fail('frame %d: %s screen differs from its reference (%.1f > %s)' % (f, screen, d, limit))
+                    limit = c.get('ref_tolerance', spec.get('ref_tolerance', None if not args.realtime else 24))
+                    if limit is None:  # (deterministic: the very same picture)
+                        n = changed_pixels(Image.open(p), Image.open(ref))
+                        if n:
+                            r.fail('frame %d: %s screen differs from its reference (%d pixels)' % (f, screen, n))
+                    else:
+                        d = difference(Image.open(p), Image.open(ref))
+                        if d > limit:
+                            r.fail('frame %d: %s screen differs from its reference (%.1f > %s)' % (f, screen, d, limit))
     if perf:
         windows = [(int(m.group(1)), int(m.group(2))) for m in
                    re.finditer(r'^\s*(\d+) \[stats\] \d+ vblanks/2s, (\d+) game frames', text, re.M)]
         sel = [n / 2 for fr, n in windows if perf['from'] <= fr <= perf['to']]
-        if args.jobs != 1:
+        if not args.realtime:
+            r.note('frame rate not measured (deterministic run; --realtime --jobs 1 measures it)')
+        elif args.jobs != 1:
             r.note('frame rate not measured (tests in parallel; --jobs 1 measures it)')
         elif not sel:
             r.fail('no frame rate statistics between frames %d and %d' % (perf['from'], perf['to']))
@@ -348,6 +384,11 @@ def main():
     ap.add_argument('--update-refs', action='store_true', help='save this run\'s checkpoint pictures as references')
     ap.add_argument('-j', '--jobs', type=int, default=max(1, min(4, (os.cpu_count() or 2) // 4)),
                     help='tests run at once (frame rates are only checked with 1)')
+    ap.add_argument('--realtime', action='store_true',
+                    help='run at the 3DS\'s speed with real timing (the default is deterministic mode, '
+                         'RECOMP_DETERMINISTIC: the same pictures every run, as fast as the machine goes)')
+    ap.add_argument('--twice', action='store_true',
+                    help='run each test a second time and check that every picture is the same (deterministic mode)')
     ap.add_argument('-l', '--list', action='store_true', help='list the tests and whether they can run here')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
