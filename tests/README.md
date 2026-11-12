@@ -67,3 +67,16 @@ ref = true                           # compare with the reference picture, if th
 Input events are `RECOMP_INPUT`'s (`<frame>:<buttons>:<frames>`, `T@x/y` for the touch screen, host keys...).
 `BUTTONS:N every E from F to T` repeats a press. To turn a session played with `RECOMP_LIVE` into a test, take the
 frames at which its commands started from the log (`[live] command N starts`).
+
+## Soak runs
+
+`tools/soak.py` plays each game for a long time (30000 frames by default, about 8 minutes) with random input from a
+seed: buttons, the circle pad held in a direction, taps on the touch screen. It reports what went wrong, grouped by
+kind: fatal errors, code the recompiler missed, unimplemented service commands, unsupported GPU features, a game
+that stopped submitting GPU work. Runs are deterministic, so a run that finds something plays again exactly
+(`input.txt` next to its log in `shots/soak/<name>-<seed>/`).
+
+```sh
+python3 tools/soak.py --seeds 1,2 --checkpoints <folder of your Checkpoint backups>
+python3 tools/soak.py --frames 100000 nsmb2      # one game, longer
+```
