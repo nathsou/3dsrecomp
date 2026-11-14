@@ -250,6 +250,10 @@ def decode_extra_ldst(i, w):
     elif sh == 3 and L:
         lines = pre + ['u32 v = (u32)(s32)(s16)RD16(ea);'] + wb + [W(i, rd, 'v')]
         i.note = 'ldrsh'
+    elif rd & 1 or rd == 14:  # LDRD/STRD need an even pair below pc (data decoded as code: r15/r16)
+        i.kind = UDF
+        i.note = 'ldrd/strd with r%d' % rd
+        return
     elif sh == 2:  # LDRD
         lines = pre + ['u32 v0 = RD32(ea); u32 v1 = RD32(ea + 4);'] + wb + [W(i, rd, 'v0'), W(i, rd + 1, 'v1')]
         i.note = 'ldrd'
