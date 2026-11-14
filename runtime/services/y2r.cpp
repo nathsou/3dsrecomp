@@ -3,6 +3,7 @@
 // with the transfer units and gaps the game gave, in strips of 8 lines, linear or in 8x8 tiles as textures want
 // it, with the hardware's fixed-point arithmetic.
 #include <algorithm>
+#include <cstring>
 
 #include "../service.h"
 #include "services.h"
@@ -44,46 +45,87 @@ void receive(Transfer &t, u8 *out, u32 n, int step) {
     const u32 per_unit = t.unit > 0 ? (u32)t.unit / step : n;
     while (n > 0) {
         const u32 k = std::min(per_unit, n);
-        for (u32 i = 0; i < k; i++) out[i] = r8(t.addr + i * step);
+        if (step == 1 && t.addr + k >= t.addr) {
+            memcpy(out, gptr(t.addr), k);
+        } else {
+            for (u32 i = 0; i < k; i++) out[i] = r8(t.addr + i * step);
+        }
         out += k;
         n -= k;
         t.addr += (t.unit > 0 ? (u32)t.unit : k * step) + (u32)t.gap;
     }
 }
 
-void send_pixel(u32 &addr, u32 &left_in_unit, u32 rgb) {
+// the bytes of one pixel in the output format (the PICA's RGBA8: a, b, g, r in memory); returns their count
+u32 pack_pixel(u8 *o, u32 rgb) {
     const u8 r = rgb >> 16, g = rgb >> 8, b = rgb;
     const u8 a = (u8)st.alpha;
-    auto unit_done = [&](u32 bytes) {
+    switch (st.output) {
+    case RGB32:
+        o[0] = a, o[1] = b, o[2] = g, o[3] = r;
+        return 4;
+    case RGB24:
+        o[0] = b, o[1] = g, o[2] = r;
+        return 3;
+    case RGB5A1: {
+        const u16 v = (u16)((r >> 3) << 11 | (g >> 3) << 6 | (b >> 3) << 1 | (a >> 7));
+        memcpy(o, &v, 2);
+        return 2;
+    }
+    default: {  // RGB565
+        const u16 v = (u16)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3));
+        memcpy(o, &v, 2);
+        return 2;
+    }
+    }
+}
+
+// writes the packed pixels (bpp bytes each) to the destination, in its units with their gaps
+void send(u32 &addr, u32 &left_in_unit, const u8 *p, u32 count, u32 bpp) {
+    const u32 bytes = count * bpp;
+    if (st.dst.unit <= 0 && addr + bytes >= addr) {
+        memcpy(gptr(addr), p, bytes);
         addr += bytes;
-        if (st.dst.unit > 0 && (left_in_unit -= bytes) == 0) {
+        return;
+    }
+    if (st.dst.unit > 0 && (u32)st.dst.unit % bpp == 0) {  // (units of whole pixels: whole runs at once)
+        for (u32 done = 0; done < bytes;) {
+            const u32 k = std::min(left_in_unit, bytes - done);
+            if (addr + k < addr) break;
+            memcpy(gptr(addr), p + done, k);
+            addr += k;
+            done += k;
+            if ((left_in_unit -= k) == 0) {
+                addr += (u32)st.dst.gap;
+                left_in_unit = (u32)st.dst.unit;
+            }
+        }
+        return;
+    }
+    // (a unit that cuts pixels: the hardware's way, a pixel at a time)
+    for (u32 i = 0; i < count; i++, p += bpp) {
+        for (u32 j = 0; j < bpp; j++) w8(addr + j, p[j]);
+        addr += bpp;
+        if (st.dst.unit > 0 && (left_in_unit -= bpp) == 0) {
             addr += (u32)st.dst.gap;
             left_in_unit = (u32)st.dst.unit;
         }
-    };
-    switch (st.output) {
-    case RGB32:  // (the PICA's RGBA8: a, b, g, r in memory)
-        w8(addr, a), w8(addr + 1, b), w8(addr + 2, g), w8(addr + 3, r);
-        unit_done(4);
-        break;
-    case RGB24:
-        w8(addr, b), w8(addr + 1, g), w8(addr + 2, r);
-        unit_done(3);
-        break;
-    case RGB5A1:
-        w16(addr, (u16)((r >> 3) << 11 | (g >> 3) << 6 | (b >> 3) << 1 | (a >> 7)));
-        unit_done(2);
-        break;
-    default:  // RGB565
-        w16(addr, (u16)((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3)));
-        unit_done(2);
-        break;
     }
 }
 
 // the position of (x, y) in an 8x8 tile (Morton order)
 u32 morton8(u32 x, u32 y) {
     return (x & 1) | (y & 1) << 1 | (x & 2) << 1 | (y & 2) << 2 | (x & 4) << 2 | (y & 4) << 3;
+}
+
+// one pixel, with the hardware's fixed-point arithmetic
+inline u32 yuv_rgb(const s16 *c, s32 Y, s32 U, s32 V) {
+    const s32 cy = c[0] * Y;
+    constexpr s32 kRounding = 0x18;
+    const s32 r = ((cy + c[1] * V) >> 3) + c[5] + kRounding;
+    const s32 g = ((cy - c[2] * V - c[3] * U) >> 3) + c[6] + kRounding;
+    const s32 b = ((cy + c[4] * U) >> 3) + c[7] + kRounding;
+    return (u32)std::clamp(r >> 5, 0, 255) << 16 | (u32)std::clamp(g >> 5, 0, 255) << 8 | (u32)std::clamp(b >> 5, 0, 255);
 }
 
 void convert() {
@@ -93,8 +135,10 @@ void convert() {
     const bool half_lines = st.input == YUV420_8 || st.input == YUV420_16;  // 4:2:0: one chroma line per two
     const int step = st.input == YUV422_16 || st.input == YUV420_16 ? 2 : 1;
     std::vector<u8> ybuf(w * 8 * 2), ubuf(w * 8 / 2), vbuf(w * 8 / 2);
-    std::vector<u32> strip(w * 8);
+    std::vector<u32> strip(w * 8), line(w);
+    std::vector<u8> packed(w * 8 * 4);
     u32 out = st.dst.addr, left = st.dst.unit > 0 ? (u32)st.dst.unit : 0;
+    const u32 bpp = st.output == RGB32 ? 4 : st.output == RGB24 ? 3 : 2;  // (pack_pixel's)
     const s16 *c = st.coef;
     for (u32 y0 = 0; y0 < h; y0 += 8) {
         const u32 rows = std::min(8u, h - y0), n = rows * w;
@@ -106,32 +150,28 @@ void convert() {
             receive(st.v, vbuf.data(), half_lines ? n / 4 : n / 2, step);
         }
         for (u32 y = 0; y < rows; y++) {
-            for (u32 x = 0; x < w; x++) {
-                s32 Y, U, V;
-                if (interleaved) {
-                    Y = ybuf[(y * w + x) * 2];
-                    U = ybuf[(y * w + (x & ~1u)) * 2 + 1];
-                    V = ybuf[(y * w + (x & ~1u)) * 2 + 3];
-                } else {
-                    Y = ybuf[y * w + x];
-                    const u32 ci = ((half_lines ? y / 2 : y) * w + x) / 2;
-                    U = ubuf[ci];
-                    V = vbuf[ci];
+            u32 *dst = st.block ? line.data() : strip.data() + y * w;
+            if (interleaved) {
+                const u8 *p = ybuf.data() + y * w * 2;
+                for (u32 x = 0; x < w; x++) {
+                    const u32 e = (x & ~1u) * 2;
+                    dst[x] = yuv_rgb(c, p[x * 2], p[e + 1], p[e + 3]);
                 }
-                const s32 cy = c[0] * Y;
-                constexpr s32 kRounding = 0x18;
-                const s32 r = ((cy + c[1] * V) >> 3) + c[5] + kRounding;
-                const s32 g = ((cy - c[2] * V - c[3] * U) >> 3) + c[6] + kRounding;
-                const s32 b = ((cy + c[4] * U) >> 3) + c[7] + kRounding;
-                const u32 rgb = (u32)std::clamp(r >> 5, 0, 255) << 16 | (u32)std::clamp(g >> 5, 0, 255) << 8 |
-                                (u32)std::clamp(b >> 5, 0, 255);
-                const u32 at = st.block ? (x / 8) * 64 + morton8(x % 8, y) : y * w + x;
-                strip[at] = rgb;
+            } else {
+                const u8 *py = ybuf.data() + y * w;
+                const u32 crow = (half_lines ? y / 2 : y) * w;
+                for (u32 x = 0; x < w; x++) {
+                    const u32 ci = (crow + x) / 2;
+                    dst[x] = yuv_rgb(c, py[x], ubuf[ci], vbuf[ci]);
+                }
             }
+            if (st.block)
+                for (u32 x = 0; x < w; x++) strip[(x / 8) * 64 + morton8(x % 8, y)] = line[x];
         }
         // (a partial last strip in tiles keeps whole tiles' worth of pixels: the hardware needs 8-line images there)
         const u32 count = st.block ? w * 8 : n;
-        for (u32 i = 0; i < count; i++) send_pixel(out, left, strip[i]);
+        for (u32 i = 0; i < count; i++) pack_pixel(packed.data() + i * bpp, strip[i]);
+        send(out, left, packed.data(), count, bpp);
     }
 }
 
