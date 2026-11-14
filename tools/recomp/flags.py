@@ -57,17 +57,17 @@ def reads_flags_first(insts_seq):
     return False
 
 
-def liveness(insts, th, start, funcs, live_at_exit, entry_reads=None):
+def liveness(insts, th, start, external, live_at_exit, entry_reads=None):
     """Returns {addr: live-out flag set} for every instruction of a function. entry_reads: {entry: flags} of the
     functions that read flags before setting them (mid-function code taken for an entry): those flags are live at
-    a jump or fall-through into one."""
+    a jump or fall-through into one. external(key): is that code outside the function (Analyzer.external)."""
     entry_reads = entry_reads or {}
     succ = {}
     for a, i in insts.items():
         s = []
         exit_ = False  # False, True (leaves the function) or the flags the code it goes to reads
         if i.kind == B:
-            if (i.target | th) in funcs and i.target != start:
+            if external(i.target | th):
                 exit_ = entry_reads.get(i.target | th, True)
             else:
                 s.append(i.target)

@@ -35,6 +35,20 @@ typedef struct {
     u32 entry;
 } GuestEntry;
 
+// An indirect call or jump's cache of the target it went to last (a static of the generated code at each such site:
+// most go to one target, and one guest thread runs at a time). A site whose cache does not hold its target sets
+// rt_ic to it and dispatches with rt_dispatch_ic, which fills it. rt_dispatch_gen changes when the dispatcher must
+// see a target again (a dispatch hook was added): every cache is stale then.
+typedef struct {
+    u32 addr, gen;
+    GuestFn fn;
+    u32 entry;
+} GuestIC;
+extern GuestIC *rt_ic;
+extern u32 rt_dispatch_gen;
+void rt_dispatch_ic(CPU *c, u32 unused);
+#define IC_HIT(ic, t) __builtin_expect((ic).addr == (t) && (ic).gen == rt_dispatch_gen, 1)
+
 // A C++ class of the game, from its RTTI (tools/recomp/rtti.py): the address its objects' vtable pointer holds
 typedef struct {
     const char *name;

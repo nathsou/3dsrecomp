@@ -272,6 +272,7 @@ void rt_add_dispatch_hook(u32 addr, void (*hook)(CPU *c)) {
     hooks[n] = {addr, hook};
     hook_count = n + 1;  // (published once the entry is in)
     dcache_slot(addr) = nullptr;  // dispatches to it take the slow path from now on
+    rt_dispatch_gen++;            // and so do the indirect calls and jumps that kept it in their caches
 }
 
 u32 rt_guest_call(CPU *c, u32 fn, u32 a0, u32 a1, u32 a2, u32 a3) {
@@ -320,6 +321,34 @@ extern "C" void rt_dispatch(CPU *c, u32) {
         return e->fn(c, e->entry);
     }
     dispatch_slow(c);
+}
+
+// An indirect call or jump of the recompiled code whose own cache (cpu.h: GuestIC, rt_ic) did not hold its target:
+// the target from the dispatch cache, then kept in the site's cache, unless it has to take rt_dispatch's slow path
+// each time (hooked, tracing, the special addresses)
+extern "C" {
+GuestIC *rt_ic;
+u32 rt_dispatch_gen = 1;
+}
+extern "C" void rt_dispatch_ic(CPU *c, u32) {
+    const u32 pc = c->pc;
+    if (trace_left == 0 && pc != CALL_RETURN && pc != EXIT_MAGIC && !hooked(pc)) {
+        if (const GuestEntry *e = lookup_cached(pc)) {
+            GuestIC *ic = rt_ic;
+            ic->fn = e->fn;
+            ic->entry = e->entry;
+            ic->addr = pc;
+            ic->gen = rt_dispatch_gen;
+#if defined(__clang__)
+            [[clang::musttail]]
+#endif
+            return e->fn(c, e->entry);
+        }
+    }
+#if defined(__clang__)
+    [[clang::musttail]]
+#endif
+    return rt_dispatch(c, 0);
 }
 
 void run_guest(CPU *c) {

@@ -31,6 +31,7 @@ class Analyzer:
         self.cache = {}
         self.log = log
         self.funcs = {}          # key (addr | thumb) -> True
+        self.hosted = {}         # key -> the function holding that code, which other code enters there (entries())
         self.rejected = set()
         self.rel_tables = set()
         self.pc_rel_ptrs = set()
@@ -405,6 +406,14 @@ class Analyzer:
         return targets
 
     # ------------------------------------------------------------ exploration
+    def external(self, t, f):
+        """Is the code at key t outside function f: another function, or code another function holds (hosted)? A
+        branch there leaves f (a tail call)."""
+        if t in self.funcs:
+            return t != f
+        h = self.hosted.get(t)
+        return h is not None and h != f
+
     def explore(self, entry, limit=None):
         """Instructions reachable from entry without crossing calls. Returns (insts dict, ok)."""
         th = entry & 1
@@ -427,7 +436,7 @@ class Analyzer:
                 ok = False
             if i.kind == B:
                 tk = i.target
-                if (tk | th) not in self.funcs or tk == start:
+                if not self.external(tk | th, entry):
                     work.append(tk)
             if i.kind == JMP and i.jt is None:
                 i.jt = self.jump_table(i, th)
@@ -437,7 +446,7 @@ class Analyzer:
                         work.append(t & ~1)
             if i.falls_through:
                 nxt = a + i.size
-                if nxt != start and (nxt | th) in self.funcs:
+                if self.external(nxt | th, entry):
                     continue  # tail call into the next function
                 work.append(nxt)
         return insts, ok
@@ -625,6 +634,111 @@ class Analyzer:
         # functions found later may cut earlier explorations: re-explore everything with final boundaries
         return sorted(self.funcs)
 
+    def host_case_labels(self, keep=()):
+        """Functions that are case labels of another function's switch become entries of that function (hosted):
+        discovery takes them for functions when their addresses appear as values (the words of an `ldr pc, [pc, rX,
+        lsl #2]` table, a table of states in data), and each then holds a copy of everything its switch reaches
+        (Tomodachi Life: 150 copies of one 29 KB state machine). A label's host is the function around it whose jump
+        table reaches it; code elsewhere enters it with the host's entry for it (entry_points()). keep: functions
+        that stay functions (the runtime hooks them). Returns the functions left."""
+        reached = defaultdict(set)  # label -> the functions whose jump tables reach it
+        for f in self.funcs:
+            insts, _ = self.explore(f)
+            for i in insts.values():
+                if i.kind == JMP and i.jt:
+                    for t in i.jt:
+                        if (t & 1) == (f & 1) and t != f and t in self.funcs and t not in keep:
+                            reached[t].add(f)
+        fixed = {self.img.entry} | set(self.img.extra_entries)
+        labels = set(reached) - fixed
+        while True:
+            # the host: the closest function before the label that reaches it and stays a function, else the host of
+            # a label that reaches it
+            host = {}
+            for s in sorted(labels):
+                hs = [f for f in reached[s] if f not in labels]
+                if hs:
+                    below = [f for f in hs if f < s]
+                    host[s] = max(below) if below else min(hs)
+            changed = True
+            while changed:
+                changed = False
+                for s in sorted(labels - set(host)):
+                    h = next((host[f] for f in sorted(reached[s]) if f in host), None)
+                    if h is not None:
+                        host[s] = h
+                        changed = True
+            left = sorted(labels - set(host))
+            if not left:
+                break
+            labels.discard(left[0])  # labels reaching one another, no function around them: the first stays one
+        for s in labels:
+            del self.funcs[s]
+            self.hosted[s] = host[s]
+        self.check_hosted(set(labels))
+        self.log('case labels hosted by the function of their switch: %d (in %d functions)' % (
+            len(self.hosted), len(set(self.hosted.values()))))
+        return sorted(self.funcs)
+
+    def host_shared_code(self, min_size=64, rounds=8):
+        """Code several functions reach (each branches into it: Tomodachi Life's state machine, entered from every
+        function that starts one of its states) belongs to one of them, the one reaching the most code; the others
+        enter it with a tail call to its entry there (hosted) instead of each holding a copy. A function whose
+        copies of others' code are smaller than min_size instructions keeps them (a few shared instructions run
+        faster in place than through an entry). Returns the functions."""
+        before = len(self.hosted)
+        for _ in range(rounds):
+            ex = {f: self.explore(f)[0] for f in self.funcs}
+            cover = defaultdict(list)
+            for f, insts in ex.items():
+                for a in insts:
+                    cover[(a, f & 1)].append(f)
+            owner = {k: max(fs, key=lambda f: (len(ex[f]), -f)) for k, fs in cover.items() if len(fs) > 1}
+            added = 0
+            for f, insts in ex.items():
+                th = f & 1
+                if sum(1 for a in insts if owner.get((a, th), f) != f) < min_size:
+                    continue
+                for a, i in insts.items():
+                    if owner.get((a, th), f) != f:
+                        continue
+                    succ = []
+                    if i.kind == B and not self.external(i.target | th, f):
+                        succ.append(i.target)
+                    if i.kind == JMP and i.jt:
+                        succ += [t & ~1 for t in i.jt if (t & 1) == th]
+                    if i.falls_through:
+                        succ.append(a + i.size)
+                    for t in succ:
+                        o = owner.get((t, th), f)
+                        if t in insts and o != f and (t | th) not in self.hosted and (t | th) not in self.funcs:
+                            self.hosted[t | th] = o
+                            added += 1
+            if not added:
+                break
+        self.check_hosted(set())
+        self.log('shared code entered in the function holding it: %d entries' % (len(self.hosted) - before))
+        return sorted(self.funcs)
+
+    def check_hosted(self, functions):
+        """Drops the hosted labels whose function no longer reaches them (its boundaries changed with the others'),
+        until none is left: those in `functions` (functions before) become functions again, the others code of
+        whatever reaches them."""
+        while True:
+            by_host = defaultdict(list)
+            for s, h in self.hosted.items():
+                by_host[h].append(s)
+            lost = []
+            for h, ss in by_host.items():
+                insts, _ = self.explore(h)
+                lost += [s for s in ss if (s & ~1) not in insts]
+            if not lost:
+                return
+            for s in lost:
+                del self.hosted[s]
+                if s in functions:
+                    self.funcs[s] = True
+
 
 def write_if_changed(path, text):
     """Writes text to path unless the file already holds exactly that (its date then stays, and so do the build's
@@ -644,6 +758,7 @@ def write_if_changed(path, text):
 # Sets of them are bit masks (bit i: LOCALS[i]).
 LOCALS = ['r%d' % i for i in range(16)] + ['nf', 'zf', 'cf', 'vf', 'qf', 'ge', 'fpsr'] + ['S%d' % i for i in range(32)]
 _BIT = {v: 1 << i for i, v in enumerate(LOCALS)}
+_FLAGS = _BIT['nf'] | _BIT['zf'] | _BIT['cf'] | _BIT['vf']
 _WRITES = re.compile(r'\b(r\d+|S\d+|nf|zf|cf|vf|qf|ge|fpsr) = |\bDSET\((S\d+), (S\d+),|&(qf|ge)\b')
 
 
@@ -666,7 +781,7 @@ def cpu_field(v):
     return 'c->fpscr' if v == 'fpsr' else 'c->' + v
 
 
-def unsaved(insts, th, start, funcs, code):
+def unsaved(insts, th, start, external, code):
     """The locals that may differ from the CPU struct: {addr: mask} once the instruction's own code has run (what its
     store to the struct must write), and {addr: mask} as it falls through to the next one. Locals are loaded from the
     struct on entry and after every call (SI), so only what was assigned since then is to be stored: the struct's
@@ -675,7 +790,7 @@ def unsaved(insts, th, start, funcs, code):
     succ = {}
     for a, i in insts.items():
         s = []
-        if i.kind == B and ((i.target | th) not in funcs or i.target == start):
+        if i.kind == B and not external(i.target | th):
             s.append(i.target)
         if i.kind == JMP and i.jt:
             s += [t & ~1 for t in i.jt if (t & 1) == th and (t & ~1) in insts]
@@ -717,6 +832,13 @@ class Emitter:
         self.live = {}              # a function's flag liveness, where find_flag_returning computed it
         self.locals = []            # of the function being emitted
         self.unsaved = {}           # ... see unsaved()
+        self.points = {}            # entry_points()
+        self.flive = None           # the flag liveness of the function being emitted (None: every flag kept)
+        self.emitted = set()        # (address, thumb) of the instructions emitted
+        self.hosted_k = {}          # hosted label -> its entry index, as the full build made it (for --lazy)
+        self.hosted_in = defaultdict(list)  # function -> the labels it holds
+        for t, h in an.hosted.items():
+            self.hosted_in[h].append(t)
 
     def explore(self, key):
         """A function's instructions (discovery is over: they no longer change)."""
@@ -724,6 +846,27 @@ class Emitter:
         if insts is None:
             insts = self.explored[key] = self.an.explore(key)[0]
         return insts
+
+    def entry_points(self, key):
+        """Where a function is entered besides its start ({address: entry index}, from 1): the code other functions
+        enter (Analyzer.hosted) and the return sites of its calls (to go on with a call chain whose host frames were
+        unwound)."""
+        pts = self.points.get(key)
+        if pts is None:
+            insts = self.explore(key)
+            sites = {a + i.size for a, i in insts.items()
+                     if i.kind in (CALL, ICALL) and i.falls_through and (a + i.size) in insts}
+            sites |= {h & ~1 for h in self.hosted_in.get(key, ())}
+            pts = self.points[key] = {a: k for k, a in enumerate(sorted(sites), 1)}
+        return pts
+
+    def call(self, t):
+        """The C call entering the code at key t: its function, or the function holding it."""
+        h = self.an.hosted.get(t)
+        if h is None:
+            return '%s(c, 0)' % fname(t)
+        k = self.hosted_k.get(t) or self.entry_points(h)[t & ~1]
+        return '%s(c, %d)' % (fname(h), k)
 
     def save(self, mask):
         """C storing these locals (a mask) to the CPU struct."""
@@ -742,32 +885,30 @@ class Emitter:
         insts = self.explore(key)
         addrs = sorted(insts)
         self.override = {}
+        ext = lambda t: an.external(t, key)
+        self.flive = None
         if self.flag_opt:
             lo = self.live.get(key)
             if lo is None:
-                lo = flags.liveness(insts, th, start, an.funcs, key in self.flag_returning, self.flag_reading_entries)
+                lo = flags.liveness(insts, th, start, ext, key in self.flag_returning, self.flag_reading_entries)
+            if not self.verify_stores:
+                self.flive = lo
             for a, i in insts.items():
                 c = flags.strip_dead(i, lo[a])
                 if c is not None:
                     self.override[a] = c
                     self.stats['flag_strips'] += 1
         labels = set([start])
-        resume = []
         for a in addrs:
             i = insts[a]
-            if i.kind == B and ((i.target | th) not in an.funcs or i.target == start):
+            if i.kind == B and not ext(i.target | th):
                 labels.add(i.target)
             if i.kind == JMP and i.jt:
                 for t in i.jt:
                     if (t & 1) == th:
                         labels.add(t & ~1)
-            if i.kind in (CALL, ICALL, SVC) and i.falls_through:
-                nxt = a + i.size
-                if nxt in insts:
-                    if i.kind != SVC:
-                        resume.append(nxt)
-        resume = sorted(set(resume))
-        labels |= set(resume)
+        points = self.entry_points(key)
+        labels |= set(points)
         regs = set()
         vregs = set()
         uses_flags = False
@@ -792,7 +933,7 @@ class Emitter:
         self.locals = ['r%d' % r for r in regs] + (['nf', 'zf', 'cf', 'vf'] if uses_flags else []) + \
             (['qf'] if uses_q else []) + (['ge'] if uses_ge else []) + (['fpsr'] if uses_fpsr else []) + \
             ['S%d' % v for v in vregs]
-        self.unsaved, unsaved_after = unsaved(insts, th, start, an.funcs, lambda a: self.override.get(a, insts[a].code))
+        self.unsaved, unsaved_after = unsaved(insts, th, start, ext, lambda a: self.override.get(a, insts[a].code))
         out.append('void %s(CPU *c, u32 entry) {' % fn)
         decl = []
         if regs:
@@ -810,9 +951,9 @@ class Emitter:
         decl.append('u32 tpc = 0; u8 *const M = MEMBASE; (void)M; (void)tpc;')
         out += ['  ' + d for d in decl]
         out.append('#define SI() do { %s } while (0)' % ' '.join('%s = %s;' % (v, cpu_field(v)) for v in self.locals))
-        if resume:
+        if points:
             out.append('  switch (entry) {')
-            for k, a in enumerate(resume, 1):
+            for a, k in sorted(points.items(), key=lambda p: p[1]):
                 out.append('  case %d: goto L_%x;' % (k, a))
                 self.entries.append(((a | th), fn, k))
             out.append('  default: break;\n  }')
@@ -834,20 +975,38 @@ class Emitter:
                     prev_falls = nxt
                 else:
                     # a tail call into the following function
-                    out.append('  %s __attribute__((musttail)) return %s(c, 0);' % (self.save(unsaved_after[a]) or ';',
-                                                                                     fname(nxt | th)))
+                    out.append('  %s __attribute__((musttail)) return %s;' % (self.save(self.leaving(a, unsaved_after[a])) or ';',
+                                                                              self.call(nxt | th)))
                     self.stats['fallthrough_tail'] += 1
         if prev_falls is not None:
             out.append('  goto L_%x;' % prev_falls)
         out.append('#undef SI\n}')
         self.stats['functions'] += 1
         self.stats['instructions'] += len(insts)
+        self.emitted.update((a, th) for a in insts)
         return '\n'.join(out)
+
+    def leaving(self, a, mask, live=None):
+        """The locals to store where the code leaves the function at a (a call, a return, a tail call): no flag
+        the code it goes to does not read (flag liveness: none for a call, AAPCS; at an exit, the flags of a
+        flag-returning function or of an entry that reads them first)."""
+        if self.flive is None:
+            return mask
+        if live is None:
+            live = self.flive[a]
+        return mask & ~(_FLAGS & ~sum(_BIT[f] for f in live))
 
     def emit_ins(self, i, key, insts):
         th = key & 1
         an = self.an
-        so = self.save(self.unsaved[i.addr]) if i.kind != OP else ''
+        so = ''
+        if i.kind != OP:
+            m = self.unsaved[i.addr]
+            if i.kind in (CALL, ICALL):
+                m = self.leaving(i.addr, m, ())
+            elif i.kind == JMP or (i.kind == B and (an.external(i.target | th, key) or (i.target | th) in self.dispatched)):
+                m = self.leaving(i.addr, m)
+            so = self.save(m)
         body = []
         body += self.override.get(i.addr, i.code)
         if i.kind == OP:
@@ -856,8 +1015,8 @@ class Emitter:
             t = i.target
             if (t | th) in self.dispatched:
                 body.append('c->pc = 0x%xu; %s __attribute__((musttail)) return rt_dispatch(c, 0);' % (t | th, so))
-            elif (t | th) in an.funcs and t != (key & ~1):
-                body.append('%s __attribute__((musttail)) return %s(c, 0);' % (so or ';', fname(t | th)))
+            elif an.external(t | th, key):
+                body.append('%s __attribute__((musttail)) return %s;' % (so or ';', self.call(t | th)))
             elif t <= i.addr:
                 # a loop: give way if an interrupt readied a higher-priority thread (a busy wait for that
                 # thread would otherwise never end; the 3DS kernel preempts)
@@ -866,18 +1025,20 @@ class Emitter:
                 self.stats['loop_checks'] += 1
             else:
                 body.append('goto L_%x;' % t)
-        elif i.kind == CALL and (i.target not in an.funcs or i.target in self.dispatched):
+        elif i.kind == CALL and ((i.target not in an.funcs and i.target not in an.hosted) or i.target in self.dispatched):
             # a call to something discovery rejected (outside the code, or code reached only from data that
             # was decoded as instructions): go through the dispatcher, which reports it if it is ever reached.
             # Also calls to the functions the runtime hooks (--dispatched).
             body.append('%s c->pc = 0x%xu; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
                 so, i.target, i.link | th))
         elif i.kind == CALL:
-            body.append('%s %s(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
-                so, fname(i.target), i.link | th))
+            body.append('%s %s; SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
+                so, self.call(i.target), i.link | th))
         elif i.kind == ICALL:
-            body.append('%s c->pc = tpc; rt_dispatch(c, 0); SI(); if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (
-                so, i.link | th))
+            # (the site's own cache of its target: cpu.h, GuestIC)
+            body.append('%s c->pc = tpc; { static GuestIC ic; if (IC_HIT(ic, tpc)) ic.fn(c, ic.entry); '
+                        'else { rt_ic = &ic; rt_dispatch_ic(c, 0); } } SI(); '
+                        'if (__builtin_expect(c->pc != 0x%xu, 0)) return;' % (so, i.link | th))
         elif i.kind == JMP:
             if i.jt:
                 cases = ' '.join('case 0x%xu: goto L_%x;' % (t, t & ~1) for t in sorted(set(i.jt)) if (t & 1) == th)
@@ -886,7 +1047,9 @@ class Emitter:
             if i.ret:
                 body.append('c->pc = tpc; %s return;' % so)
             else:
-                body.append('c->pc = tpc; %s __attribute__((musttail)) return rt_dispatch(c, 0);' % so)
+                body.append('c->pc = tpc; %s { static GuestIC ic; if (IC_HIT(ic, tpc)) __attribute__((musttail)) '
+                            'return ic.fn(c, ic.entry); rt_ic = &ic; } __attribute__((musttail)) '
+                            'return rt_dispatch_ic(c, 0);' % so)
                 self.stats['indirect_jumps'] += 1
         elif i.kind == SVC:
             body.append('%s c->pc = 0x%xu; rt_svc(c, 0x%x); SI();' % (so, i.addr + i.size, i.imm))
@@ -918,11 +1081,13 @@ class Emitter:
                             break
                         a += n.size
                     if flags.reads_flags_first(seq):
-                        fr.add(i.target)
-                if i.kind == B and (i.target | th) in an.funcs and i.target != (k & ~1):
-                    tails.setdefault(k, set()).add(i.target | th)
+                        fr.add(an.hosted.get(i.target, i.target))  # (code a function holds: that function)
+                # (a function's tail calls, and the functions holding the code it goes on to: when it returns flags,
+                # so does that code)
+                if i.kind == B and an.external(i.target | th, k):
+                    tails.setdefault(k, set()).add(an.hosted.get(i.target | th, i.target | th))
                 if i.falls_through and (i.addr + i.size) not in insts:
-                    tails.setdefault(k, set()).add((i.addr + i.size) | th)
+                    tails.setdefault(k, set()).add(an.hosted.get((i.addr + i.size) | th, (i.addr + i.size) | th))
         changed = True
         while changed:
             changed = False
@@ -936,7 +1101,8 @@ class Emitter:
         # fall-throughs into them keep those flags. Which flags an entry reads comes from its own liveness, which
         # depends on the entries it goes on to: iterated until nothing changes (a few instructions' look-ahead
         # missed a compare whose branch came later, e.g. after a run of VFP instructions)
-        fre = {}
+        # Code another function holds (hosted) is entered in the middle: it may read any flag
+        fre = {t: flags.ALL for t in an.hosted}
         into = defaultdict(set)  # entry -> functions that jump or fall through into it
         work = []
         for k in keys:
@@ -957,7 +1123,7 @@ class Emitter:
             if first is None:
                 continue
             # (a function is queued again whenever an entry it goes on to reads more flags: its last pass is final)
-            lo = self.live[k] = flags.liveness(insts, k & 1, k & ~1, an.funcs, k in fr, fre)
+            lo = self.live[k] = flags.liveness(insts, k & 1, k & ~1, lambda t, k=k: an.external(t, k), k in fr, fre)
             li = frozenset(flags.live_in(first, lo[k & ~1])) | fre.get(k, frozenset())
             if li and li != fre.get(k):
                 fre[k] = li
@@ -1074,9 +1240,12 @@ def main():
                 if line:
                     an.extra.add(int(line, 16))
     keys = an.discover()
+    dispatched = read_addresses(args.dispatched)
+    keys = an.host_case_labels(keep=dispatched)
+    keys = an.host_shared_code()
     em = Emitter(an, args.outdir)
     em.verify_stores = args.verify_stores
-    em.dispatched = read_addresses(args.dispatched)
+    em.dispatched = dispatched
     for a in sorted(em.dispatched - set(keys)):
         print('warning: %x (--dispatched) is not a function' % a)
     os.makedirs(args.outdir, exist_ok=True)
@@ -1087,11 +1256,15 @@ def main():
     with open(os.path.join(args.outdir, 'funcs.txt'), 'w') as f:
         for k in keys:
             f.write('%x\n' % k)
+    with open(os.path.join(args.outdir, 'hosted.txt'), 'w') as f:  # (label, its function, entry: for --lazy)
+        for t, h in sorted(an.hosted.items()):
+            f.write('%x %x %d\n' % (t, h, em.entry_points(h)[t & ~1]))
     # the others are reached only by direct calls and branches of the program's code (every caller is known)
     with open(os.path.join(args.outdir, 'pointed.txt'), 'w') as f:
         for k in keys:
             if k in an.pointed:
                 f.write('%x\n' % k)
+    em.stats['instructions_unique'] = len(em.emitted)
     print('functions: %d, entries: %d, files: %d' % (len(keys), len(em.entries), len(files)))
     for k, v in sorted(em.stats.items()):
         print('  %s: %d' % (k, v))
@@ -1124,7 +1297,15 @@ def lazy(args):
         known.add(int(line, 16))
     for k in known:
         an.funcs[k] = True
+    hosted_k = {}
+    path = os.path.join(args.outdir, 'hosted.txt')
+    if os.path.exists(path):
+        for line in open(path):
+            t, h, k = line.split()
+            an.hosted[int(t, 16)] = int(h, 16)
+            hosted_k[int(t, 16)] = int(k)
     root = int(args.lazy, 16)
+    an.hosted.pop(root, None)
     new = []
     queue = [root]
     an.funcs[root] = True
@@ -1133,10 +1314,12 @@ def lazy(args):
         new.append(f)
         insts, _ = an.explore(f)
         for i in insts.values():
-            if i.kind == CALL and i.target not in an.funcs and an.decode(i.target & ~1, i.target & 1):
+            if i.kind == CALL and i.target not in an.funcs and i.target not in an.hosted and \
+                    an.decode(i.target & ~1, i.target & 1):
                 an.funcs[i.target] = True
                 queue.append(i.target)
     em = Emitter(an, args.outdir)
+    em.hosted_k = hosted_k
     em.flag_opt = False
     em.dispatched = read_addresses(os.path.join(args.outdir, 'dispatched.txt'))
     srcs = [em.emit_function(k) for k in new]
