@@ -44,6 +44,16 @@ void rt_log(const char *fmt, ...) {
     }
 }
 
+#ifdef RECOMP_PGO_GENERATE
+extern "C" int __llvm_profile_write_file(void);
+#endif
+void rt_exit(int code) {
+#ifdef RECOMP_PGO_GENERATE
+    __llvm_profile_write_file();  // (_exit skips the exit handler that writes it)
+#endif
+    _exit(code);
+}
+
 void rt_fatal(const char *fmt, ...) {
     char msg[2048];
     va_list ap;

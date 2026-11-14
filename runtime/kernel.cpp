@@ -735,7 +735,7 @@ static void svc_locked(CPU *c, u32 imm, Lock &lk) {
     case 0x02: c->r[0] = svc_query_memory(c); break;
     case 0x03:
         LOG("[svc] ExitProcess\n");
-        _exit(0);
+        rt_exit(0);
     case 0x08: {  // CreateThread(prio=r0, entry=r1, arg=r2, stack=r3, core=r4)
         s32 prio = (s32)c->r[0];
         auto nt = create_thread(c->r[1], c->r[2], c->r[3], prio, true);

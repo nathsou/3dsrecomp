@@ -10,6 +10,8 @@
 
 void rt_log(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
 [[noreturn]] void rt_fatal(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+// Ends the process at once (_exit), writing the execution profile first in an instrumented build (tools/pgo.py).
+[[noreturn]] void rt_exit(int code);
 #define LOG(...) rt_log(__VA_ARGS__)
 #define FATAL(...) rt_fatal(__VA_ARGS__)
 // Also write the log to a file (truncated; the previous run's log is kept as <path>.prev).

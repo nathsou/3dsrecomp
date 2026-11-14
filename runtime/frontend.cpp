@@ -431,7 +431,7 @@ void frontend_quit() {
     store_geometry(window2);
     settings_save();
     cloud_quit();
-    _exit(0);
+    rt_exit(0);
 }
 
 // window pixels per 3DS pixel
@@ -1925,7 +1925,7 @@ void frontend_run() {
                     fwrite(gptr(mem::DSP_BASE), 1, mem::DSP_SIZE, f);
                     fclose(f);
                 }
-                _exit(0);
+                rt_exit(0);
             }
             if (det) det_frame_done();
             next_vblank += frame;

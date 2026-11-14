@@ -27,6 +27,22 @@ if(GAMES STREQUAL "all")
 endif()
 set(GEN_OPT -O2 CACHE STRING "optimisation of the generated code")
 set(GEN_FLAGS ${GEN_OPT} -w -ffp-contract=off -fno-strict-aliasing -std=gnu11)
+# Profile-guided optimisation of the generated code (tools/pgo.py): GEN_PROFILE=generate makes an instrumented
+# build whose runs write profiles ($LLVM_PROFILE_FILE); GEN_PROFILE=<file.profdata> optimises with one. Code the
+# profiled runs never reached is optimised as without a profile (-pgso=false: not for size), so the parts of a game
+# they did not play are not slower. (The runtime is left out: the profiled runs are headless, which takes paths of
+# its own, the screens going through the CPU.)
+set(GEN_PROFILE "" CACHE STRING "generate, or a .profdata file to optimise with")
+set(PGO_FLAGS "")
+if(GEN_PROFILE STREQUAL "generate")
+  set(PGO_FLAGS -fprofile-generate)
+  add_link_options(-fprofile-generate)
+  add_compile_definitions(RECOMP_PGO_GENERATE)
+elseif(GEN_PROFILE)
+  set(PGO_FLAGS -fprofile-use=${GEN_PROFILE} -Wno-profile-instr-unprofiled -Wno-profile-instr-out-of-date
+      -Wno-profile-instr-missing -Wno-backend-plugin "SHELL:-mllvm -pgso=false")
+endif()
+list(APPEND GEN_FLAGS ${PGO_FLAGS})
 
 # The runtime: portable C++, plus each system's own files. Apple: the .mm files (Metal, Core Text, NSURLSession, ...)
 # and AudioToolbox; elsewhere: runtime/platform_posix.cpp, FreeType text, libcurl and FFmpeg (if found).
@@ -138,6 +154,9 @@ endif()
 target_include_directories(${APP} PRIVATE third_party)
 target_compile_definitions(${APP} PRIVATE RECOMP_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 set_source_files_properties(${RT_SRC} PROPERTIES COMPILE_OPTIONS "")
+if(GEN_PROFILE AND NOT GEN_PROFILE STREQUAL "generate")
+  set_property(SOURCE ${GEN_SRC} APPEND PROPERTY OBJECT_DEPENDS ${GEN_PROFILE})  # (a new profile: rebuilt)
+endif()
 foreach(f ${RT_SRC})
   if(f MATCHES "\\.mm$")
     set_source_files_properties(${f} PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
