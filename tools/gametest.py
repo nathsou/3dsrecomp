@@ -29,6 +29,7 @@ import math
 import os
 import re
 import shutil
+import shlex
 import subprocess
 import sys
 import time
@@ -55,9 +56,12 @@ def find_games():
     return games
 
 
+BUILDS = 'build*'  # (--builds)
+
+
 def find_executable(name):
     """The build of data/<name>: a build directory configured with GAME=<name> holding the executable."""
-    for cache in sorted(glob.glob(os.path.join(ROOT, 'build*', 'CMakeCache.txt'))):
+    for cache in sorted(glob.glob(os.path.join(ROOT, BUILDS, 'CMakeCache.txt'))):
         d = os.path.dirname(cache)
         try:
             text = open(cache).read()
@@ -265,7 +269,8 @@ def run_test(spec, args, games):
                 os.makedirs(os.path.join(dst, d), exist_ok=True)
         with open(os.path.join(where, 'run.log'), 'w') as log:
             try:
-                return subprocess.run([exe, gamedir], cwd=where, env=env, stdout=log, stderr=subprocess.STDOUT,
+                wrap = [w.replace('{dir}', where) for w in shlex.split(args.wrap)] if args.wrap else []
+                return subprocess.run(wrap + [exe, gamedir], cwd=where, env=env, stdout=log, stderr=subprocess.STDOUT,
                                       timeout=timeout).returncode
             except subprocess.TimeoutExpired:
                 return None
@@ -389,9 +394,15 @@ def main():
                          'RECOMP_DETERMINISTIC: the same pictures every run, as fast as the machine goes)')
     ap.add_argument('--twice', action='store_true',
                     help='run each test a second time and check that every picture is the same (deterministic mode)')
+    ap.add_argument('--builds', default='build*',
+                    help='the build folders to look in for each game\'s build (a glob; default build*)')
+    ap.add_argument('--wrap', help='a command the game runs under, {dir} standing for the run\'s folder (profiling: '
+                    '"perf record -e cpu-clock:u -o {dir}/perf.data --")')
     ap.add_argument('-l', '--list', action='store_true', help='list the tests and whether they can run here')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
+    global BUILDS
+    BUILDS = args.builds
     tests = load_tests(args.select)
     games = find_games()
     if not tests:
