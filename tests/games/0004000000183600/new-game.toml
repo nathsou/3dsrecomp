@@ -1,0 +1,18 @@
+game = "kirbypr"
+description = "Kirby: Planet Robobot (all regions, played as EUR): title, StreetPass setup, a new file, the opening movie"
+frames = 4500
+input = ["A:6 every 300 from 600 to 4500", "T@160/120:8 every 300 from 750 to 4500"]
+known_unimplemented = ["act:u 0x00010084", "act:u 0x000600c2", "APT:A 0x00580002", "boss:U 0x00330042",
+                       "cfg:u 0x00080080", "fs:USER 0x08520100", "nfc:u 0x00010040", "nfc:u 0x00020040"]
+
+[[checkpoint]]
+frame = 1200
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 3600
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 4500
+screens = ["top"]

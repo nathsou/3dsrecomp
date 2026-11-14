@@ -1,0 +1,16 @@
+game = "metroid"
+description = "Metroid: Samus Returns (EUR): title, a new file, the opening story"
+frames = 4500
+input = ["A:6 every 300 from 600 to 4500", "T@160/120:8 every 300 from 750 to 4500"]
+
+[[checkpoint]]
+frame = 900
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 2400
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 4200
+screens = ["top", "bottom"]

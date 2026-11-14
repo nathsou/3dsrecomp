@@ -1,0 +1,17 @@
+game = "captaintoad"
+description = "Captain Toad: Treasure Tracker (EUR): save creation (its format checked), the first level, walking"
+frames = 4000
+input = ["A:6 every 250 from 600 to 1600", "1800:CUP:90,2000:CRIGHT:90,2200:CDOWN:90,2400:CLEFT:90"]
+known_unimplemented = ["act:u 0x00010084", "nfc:u 0x00010040", "nfc:u 0x000b0000", "nfc:u 0x000c0000"]
+
+[[checkpoint]]
+frame = 300
+screens = ["top"]
+
+[[checkpoint]]
+frame = 1500
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 4000
+screens = ["top", "bottom"]

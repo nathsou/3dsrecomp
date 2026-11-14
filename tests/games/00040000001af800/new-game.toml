@@ -1,0 +1,20 @@
+game = "pikmin"
+description = "Hey! Pikmin: first boot, title, a new file, the gameplay-sharing question (touch), the opening"
+frames = 7000
+input = [
+  "1000:T@160/120:8,1250:T@188/90:8,1500:T@230/164:8",
+  "T@160/120:8 every 200 from 1700 to 7000",
+  "A:6 every 200 from 1800 to 7000",
+]
+
+[[checkpoint]]
+frame = 1400
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 3500
+screens = ["top", "bottom"]
+
+[[checkpoint]]
+frame = 7000
+screens = ["top"]

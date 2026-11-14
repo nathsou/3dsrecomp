@@ -373,6 +373,29 @@ static std::string archive_dir(u32 id, const LowPath &p) {
     return "";
 }
 
+// What GetFormatInfo answers for an archive: what it was formatted with (a game may check its save's format against
+// the one it wants and format it again if they differ: Captain Toad: Treasure Tracker), kept next to it
+// (<dir>.format); the old fixed answer for an archive formatted before (or a Checkpoint backup's).
+struct FormatInfo {
+    u32 total_size = 0x20000, dirs = 0x10, files = 0x10, duplicate = 0;
+};
+static FormatInfo read_format_info(const std::string &dir) {
+    FormatInfo fi;
+    if (FILE *f = fopen((dir + ".format").c_str(), "rb")) {
+        FormatInfo r;
+        if (fread(&r, sizeof r, 1, f) == 1) fi = r;
+        fclose(f);
+    }
+    return fi;
+}
+static void write_format_info(const std::string &dir, u32 blocks, u32 dirs, u32 files, u32 duplicate) {
+    const FormatInfo fi{blocks * 512, dirs, files, duplicate & 0xFF};
+    if (FILE *f = fopen((dir + ".format").c_str(), "wb")) {
+        fwrite(&fi, sizeof fi, 1, f);
+        fclose(f);
+    }
+}
+
 // ---- file and directory sessions
 struct FileSession : Service {
     int fd = -1;
@@ -794,12 +817,15 @@ struct FsUser : Service {
             ipc.handles(2, {make_session(ds)}, true);
             break;
         }
-        case 0x080F:    // FormatThisUserSaveData
-        case 0x084C: {  // FormatSaveData
+        case 0x080F:    // FormatThisUserSaveData(blocks, dirs, files, dir buckets, file buckets, duplicate data)
+        case 0x084C: {  // FormatSaveData(archive id, path type, size, blocks, dirs, files, dir buckets, file buckets,
+                        //                duplicate data, path)
             std::string d = save_root() + "/savedata";
             std::error_code ec;
             fsys::remove_all(d, ec);
             fsys::create_directories(d);
+            const int at = (ipc[0] >> 16) == 0x080F ? 1 : 4;
+            write_format_info(d, ipc[at], ipc[at + 1], ipc[at + 2], ipc[at + 5]);
             LOG("[fs] formatted save data at %s\n", d.c_str());
             save_changed(d);
             ipc.ok();
@@ -821,11 +847,12 @@ struct FsUser : Service {
                 ipc.result(ERR_NOT_FORMATTED, 5);
                 break;
             }
+            const FormatInfo fi = read_format_info(d);
             ipc.ok(5);
-            ipc.set(2, 0x20000);  // total size
-            ipc.set(3, 0x10);     // dirs
-            ipc.set(4, 0x10);     // files
-            ipc.set(5, 0);        // duplicate data
+            ipc.set(2, fi.total_size);
+            ipc.set(3, fi.dirs);
+            ipc.set(4, fi.files);
+            ipc.set(5, fi.duplicate);
             break;
         }
         case 0x0851: {  // CreateExtSaveData(info[0..5 words], ...)

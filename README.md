@@ -19,7 +19,7 @@ is not an emulator: the game runs as a native program, rendered with Metal or Vu
 | Mario Kart 7 | EUR | `mk7` |
 | The Legend of Zelda: Ocarina of Time 3D | EUR | `oot3d` |
 | The Legend of Zelda: Majora's Mask 3D | EUR (eShop) | `mm3d` |
-| Metroid: Samus Returns | USA | `metroid` |
+| Metroid: Samus Returns | USA, EUR | `metroid` |
 | Animal Crossing: New Leaf – Welcome amiibo | USA, EUR (eShop) | `acnl` |
 | Tomodachi Life | USA, EUR | `tomodachi` |
 | Hey! Pikmin | EUR | `pikmin` |
@@ -29,6 +29,8 @@ is not an emulator: the game runs as a native program, rendered with Metal or Vu
 | Star Fox 64 3D | EUR | `starfox` |
 | The Legend of Zelda: A Link Between Worlds | EUR | `albw` |
 | Kirby: Triple Deluxe | EUR | `kirbytd` |
+| Kirby: Planet Robobot | all regions | `kirbypr` |
+| Captain Toad: Treasure Tracker | EUR | `captaintoad` |
 
 All of them run at full speed with music and sound. Online play, StreetPass, SpotPass, amiibo, QR codes and the
 camera are not supported. Homebrew (`.3dsx`, devkitARM + libctru) goes through the same pipeline.
